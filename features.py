@@ -1,0 +1,1032 @@
+"""
+Find curved surfaces in a triangle mesh so they can be rebuilt as true curves.
+
+The mesh is split into patches, each lying on one simple surface:
+
+  cylinder  round holes, pins, straight rounded edges (fillets)
+  cone      countersinks, chamfers around round edges, cone tips
+  sphere    domes, dimples, balls, rounded corners where three edges meet
+  torus     rounded edges that follow a curve (the corners of a rounded box lid,
+            a fillet around the base of a pin, a rounded rim on a hole)
+
+How a patch is found: take two or three neighbouring facets, work out the one
+surface they could lie on, then grow outwards while the facets' corners stay on
+that surface. Straight chamfers and flat faces need nothing: they are already
+exact planes.
+
+A patch is only accepted if its outline follows the surface's natural boundary
+lines (for a cylinder: the two end circles and the two straight sides). This
+rejects partial matches, holes crossed by other features, oblique cuts and so on;
+those areas simply stay faceted.
+
+Each accepted patch records its exact surface and its boundary lines; build.py
+turns it into one true curved face and stitches it to the flat faces around it.
+"""
+import math
+import struct
+from collections import Counter
+from dataclasses import dataclass
+from pathlib import Path
+
+import numpy as np
+
+TOL = 0.001          # mm: CAD exports put mesh corners on the true surface to within this
+FLOAT_TOL = 2e-7     # plus this fraction of the largest coordinate (STL stores 32-bit floats)
+NORMAL_DEG = 30      # a facet may tilt this far from the true surface normal (coarse meshes)
+SMOOTH_DEG = 40      # facets meeting at a gentler bend than this can be one curved surface
+COPLANAR_DEG = 0.05  # triangles closer to flat than this are merged into one facet
+MAX_SAG = 0.25       # mm: the middle of a facet may sit this far inside the curve (coarse meshes)
+BEND_SLACK_DEG = 8   # neighbouring facets must bend by what the surface predicts, within this
+MIN_SPAN_DEG = 15    # a partial patch must curve through at least this much
+CREASE_DEG = 20      # a one-ring cone must meet a neighbour at a crease at least this sharp
+MIN_CORNERS = {"cylinder": 8, "cone": 10, "sphere": 8, "torus": 12}
+# A patch whose outline doesn't follow its own boundary lines (e.g. a hole running
+# out through a sloped face, or a rounded knob cut by another feature) is accepted as
+# a "trimmed" patch. Without the outline check to lean on, it needs more evidence:
+TRIMMED_MIN_CORNERS = 12
+TRIMMED_MIN_FACETS = 6
+TRIMMED_MIN_TURN_DEG = 15   # the facets must face in directions at least this far apart
+
+# Loose pass (run last, on leftovers only; the approach of the stlToSolid project):
+# accept any patch the surface explains geometrically, without the outline and crease
+# rules. Accuracy is still guaranteed by the corner, interior and normal checks; the
+# strict passes run first so clean patches keep their exact natural boundaries.
+LOOSE_NORMAL_DEG = 8        # facet normal vs surface normal (plus the facet's own spread)
+LOOSE_MAX_GAP = 0.08        # mm: facet interiors (centres, edge midpoints) vs surface
+LOOSE_MIN_TURN_DEG = {"cylinder": 6, "cone": 6, "sphere": 20, "torus": 20}
+LOOSE_MIN_FACETS = {"cylinder": 3, "cone": 6, "sphere": 8, "torus": 8}
+_loose = False
+TWO_PI = 2 * math.pi
+
+
+# ---------------------------------------------------------------- mesh
+
+def load_stl(path):
+    """Return welded vertex array and triangle index array for a binary or ASCII STL."""
+    data = Path(path).read_bytes()
+    n = struct.unpack("<I", data[80:84])[0] if len(data) >= 84 else -1
+    if len(data) == 84 + 50 * n:
+        rec = np.frombuffer(data, offset=84, count=n, dtype=np.dtype(
+            [("n", "<f4", 3), ("v", "<f4", (3, 3)), ("a", "<u2")]))
+        verts = rec["v"].reshape(-1, 3).astype(float)
+    else:
+        lines = data.decode(errors="ignore").splitlines()
+        verts = np.array([l.split()[1:4] for l in lines if l.strip().startswith("vertex")], float)
+    key = np.round(verts * 1e4).astype(np.int64)
+    uniq, inv = np.unique(key, axis=0, return_inverse=True)
+    pts = np.zeros((len(uniq), 3))
+    pts[inv.ravel()] = verts
+    return pts, inv.reshape(-1, 3)
+
+
+def _labels(n, a, b):
+    """Connected-component label for each of n items linked by pairs (a[i], b[i])."""
+    parent = np.arange(n)
+
+    def root(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for i, j in zip(a, b):
+        ri, rj = root(i), root(j)
+        if ri != rj:
+            parent[ri] = rj
+    roots = np.array([root(i) for i in range(n)])
+    return np.unique(roots, return_inverse=True)[1]
+
+
+def _groups(labels):
+    order = np.argsort(labels, kind="stable")
+    return np.split(order, np.nonzero(np.diff(labels[order]))[0] + 1)
+
+
+def _edges(tris):
+    return np.sort(tris[:, [0, 1, 1, 2, 2, 0]].reshape(-1, 2), axis=1)
+
+
+class Mesh:
+    """Triangles grouped into flat facets, with which facets meet at a gentle bend."""
+
+    def __init__(self, pts, tris):
+        a, b, c = (pts[tris[:, k]] for k in range(3))
+        cross = np.cross(b - a, c - a)
+        size = np.linalg.norm(cross, axis=1)
+        keep = size > 1e-12
+        self.pts, self.tris = pts, tris[keep]
+        self.tn = cross[keep] / size[keep, None]
+        self.tarea = size[keep] / 2
+
+        edges = _edges(self.tris)
+        owner = np.repeat(np.arange(len(self.tris)), 3)
+        order = np.lexsort((edges[:, 1], edges[:, 0]))
+        edges, owner = edges[order], owner[order]
+        shared = np.nonzero(np.all(edges[1:] == edges[:-1], axis=1))[0]
+        t1, t2 = owner[shared], owner[shared + 1]
+        dot = np.einsum("ij,ij->i", self.tn[t1], self.tn[t2])
+        flat = dot > math.cos(math.radians(COPLANAR_DEG))
+
+        self.facet_of = _labels(len(self.tris), t1[flat], t2[flat])
+        nf = self.facet_of.max() + 1
+        self.ftris = _groups(self.facet_of)
+        self.farea = np.bincount(self.facet_of, self.tarea, nf)
+        fn = np.zeros((nf, 3))
+        np.add.at(fn, self.facet_of, self.tn * self.tarea[:, None])
+        self.fn = fn / np.linalg.norm(fn, axis=1)[:, None]
+        fc = np.zeros((nf, 3))
+        np.add.at(fc, self.facet_of, self.pts[self.tris].mean(axis=1) * self.tarea[:, None])
+        self.fcent = fc / self.farea[:, None]
+        self.fverts = [np.unique(self.tris[t]) for t in self.ftris]
+
+        f1, f2 = self.facet_of[t1[~flat]], self.facet_of[t2[~flat]]
+        ends = edges[shared[~flat]]
+        pairs = np.sort(np.c_[f1, f2], axis=1)
+        bend = np.einsum("ij,ij->i", self.fn[pairs[:, 0]], self.fn[pairs[:, 1]])
+        smooth = (pairs[:, 0] != pairs[:, 1]) & (bend > math.cos(math.radians(SMOOTH_DEG)))
+        self.edge_facets = {}   # (vertex, vertex), sorted -> facets using that edge
+        for (a, b), f in zip(edges, self.facet_of[owner]):
+            self.edge_facets.setdefault((a, b), []).append(f)
+        self.nbrs = [set() for _ in range(nf)]
+        self.shared = {}   # (facet, facet) -> list of shared edges (vertex id pairs)
+        for (x, y), e in zip(pairs[smooth], ends[smooth]):
+            self.nbrs[x].add(y)
+            self.nbrs[y].add(x)
+            self.shared.setdefault((x, y), []).append(e)
+
+    def smooth_regions(self):
+        nf = len(self.fn)
+        a = [x for x in range(nf) for y in self.nbrs[x] if x < y]
+        b = [y for x in range(nf) for y in self.nbrs[x] if x < y]
+        return [g for g in _groups(_labels(nf, a, b)) if len(g) >= 3]
+
+    def shared_direction(self, f, g):
+        """Direction of the (longest) edge shared by two facets."""
+        e = self.shared.get((min(f, g), max(f, g)))
+        if not e:
+            return None
+        vec = [self.pts[j] - self.pts[i] for i, j in e]
+        v = max(vec, key=np.linalg.norm)
+        return v / np.linalg.norm(v)
+
+
+# ---------------------------------------------------------------- surfaces
+
+def _frame(d):
+    d = np.asarray(d, float) / np.linalg.norm(d)
+    e1 = np.cross(d, [1.0, 0, 0] if abs(d[0]) < 0.9 else [0, 1.0, 0])
+    e1 /= np.linalg.norm(e1)
+    return d, e1, np.cross(d, e1)
+
+
+class Revolved:
+    """Surface of revolution: cylinder, cone, sphere or torus.
+
+    Around the axis (point a, direction d), a point has radius rho and height z.
+    The profile is a line rho = c0 + k*z (cylinder when k == 0, else cone) or a
+    circle of radius r centred at (rc, zc) (sphere when rc == 0, else torus).
+    """
+
+    def __init__(self, a, d, line=None, circle=None):
+        self.d, self.e1, self.e2 = _frame(d)
+        a = np.asarray(a, float)
+        self.a = a - (a @ self.d) * self.d
+        self.line, self.circle = line, circle
+        if line:
+            self.scale = max(abs(line[0]), 1.0)
+        else:
+            self.scale = circle[2]
+
+    @property
+    def kind(self):
+        if self.line:
+            return "cylinder" if self.line[1] == 0 else "cone"
+        return "sphere" if self.circle[0] == 0 else "torus"
+
+    def local(self, p):
+        v = np.atleast_2d(p) - self.a
+        z = v @ self.d
+        w = v - np.outer(z, self.d)
+        return np.linalg.norm(w, axis=1), z, w
+
+    def angle(self, w):
+        return np.arctan2(w @ self.e2, w @ self.e1)
+
+    def signed(self, p):
+        """Distance to the surface; positive = away from the axis (line) / tube centre (circle)."""
+        rho, z, _ = self.local(p)
+        if self.line:
+            c0, k = self.line
+            return (rho - c0 - k * z) / math.hypot(1, k)
+        rc, zc, r = self.circle
+        return np.hypot(rho - rc, z - zc) - r
+
+    def normal(self, p):
+        rho, z, w = self.local(p)
+        radial = w / np.maximum(rho, 1e-12)[:, None]
+        radial[rho < 1e-9] = 0
+        if self.line:
+            c0, k = self.line
+            nr = np.full(len(rho), 1 / math.hypot(1, k))
+            nz = np.full(len(rho), -k / math.hypot(1, k))
+        else:
+            rc, zc, r = self.circle
+            nr, nz = rho - rc, z - zc
+            size = np.maximum(np.hypot(nr, nz), 1e-12)
+            nr, nz = nr / size, nz / size
+        return radial * nr[:, None] + np.outer(nz, self.d)
+
+    def point(self, rho, z, u):
+        return self.a + z * self.d + rho * (math.cos(u) * self.e1 + math.sin(u) * self.e2)
+
+
+class Sphere:
+    def __init__(self, c, r):
+        self.c, self.r, self.scale = np.asarray(c, float), float(r), float(r)
+
+    kind = "sphere"
+
+    def signed(self, p):
+        return np.linalg.norm(np.atleast_2d(p) - self.c, axis=1) - self.r
+
+    def normal(self, p):
+        v = np.atleast_2d(p) - self.c
+        return v / np.maximum(np.linalg.norm(v, axis=1), 1e-12)[:, None]
+
+
+_mesh_tol = TOL
+
+
+def _tol(model=None):
+    return _mesh_tol
+
+
+# ---------------------------------------------------------------- fitting
+
+def _circle2d(x, y):
+    if len(np.unique(np.round(np.c_[x, y], 5), axis=0)) < 3:
+        return None
+    sol = np.linalg.lstsq(np.c_[x, y, np.ones_like(x)], x * x + y * y, rcond=None)[0]
+    cx, cy = sol[0] / 2, sol[1] / 2
+    r2 = sol[2] + cx * cx + cy * cy
+    return (cx, cy, math.sqrt(r2)) if r2 > 0 else None
+
+
+def _fits(model, P):
+    return model is not None and np.abs(model.signed(P)).max() <= _tol(model)
+
+
+def _cylinder(d, P):
+    d, e1, e2 = _frame(d)
+    c = _circle2d(P @ e1, P @ e2)
+    if c is None or c[2] > 1e4:
+        return None
+    return Revolved(c[0] * e1 + c[1] * e2, d, line=(c[2], 0))
+
+
+def _cone(N, P):
+    """Cone through facets whose normals N all make the same angle with the axis."""
+    if len(np.unique(np.round(N, 4), axis=0)) < 3:
+        return None
+    Nc = N - N.mean(axis=0)
+    d = np.linalg.eigh(Nc.T @ Nc)[1][:, 0]
+    return _line_on_direction(d, P)
+
+
+def _line_on_direction(d, P):
+    d, e1, e2 = _frame(d)
+    x, y, z = P @ e1, P @ e2, P @ d
+    sol = np.linalg.lstsq(np.c_[2 * x, 2 * y, np.ones_like(x), z, z * z], x * x + y * y, rcond=None)[0]
+    cx, cy = sol[0], sol[1]
+    rho = np.hypot(x - cx, y - cy)
+    if np.ptp(z) < 1e-6:
+        return None
+    k, c0 = np.polyfit(z, rho, 1)
+    if abs(k) > math.tan(math.radians(80)):
+        return None                     # nearly flat: leave it as a plane
+    if abs(k) < 1e-4:
+        k, c0 = 0, rho.mean()
+    return Revolved(cx * e1 + cy * e2, d, line=(c0, k))
+
+
+def _rings_refit(model, P):
+    """Refit a cylinder/cone from its circular vertex rings: much more precise than normals."""
+    rho, z, _ = model.local(P)
+    levels = np.round(z / 0.01)
+    centers, radii, heights, normals = [], [], [], []
+    for lv in np.unique(levels):
+        ring = P[levels == lv]
+        if len(ring) < 3:
+            continue
+        mid = ring.mean(axis=0)
+        n = np.linalg.svd(ring - mid)[2][2]
+        _, e1, e2 = _frame(n)
+        c = _circle2d((ring - mid) @ e1, (ring - mid) @ e2)
+        if c is None:
+            continue
+        centers.append(mid + c[0] * e1 + c[1] * e2)
+        radii.append(c[2])
+        heights.append(lv)
+        normals.append(n if n @ model.d > 0 else -n)
+    if len(centers) < 2:
+        return None
+    centers = np.array(centers)
+    lo, hi = np.argmin(heights), np.argmax(heights)
+    d = centers[hi] - centers[lo]
+    if np.linalg.norm(d) < 1e-6:
+        return None
+    d /= np.linalg.norm(d)
+    if model.line[1] == 0:
+        return _cylinder(d, P)
+    return _line_on_direction(d, P)
+
+
+def _sphere(P):
+    if len(P) < 4 or np.linalg.svd(P - P.mean(axis=0), compute_uv=False)[2] < 1e-6:
+        return None
+    sol = np.linalg.lstsq(np.c_[2 * P, np.ones(len(P))], (P * P).sum(axis=1), rcond=None)[0]
+    r2 = sol[3] + sol[:3] @ sol[:3]
+    return Sphere(sol[:3], math.sqrt(r2)) if 0 < r2 < 1e8 else None
+
+
+def _on_axis(axis, P):
+    """Cone/cylinder (line profile) or torus/sphere (circle profile) around a known axis."""
+    base = Revolved(axis[0], axis[1], line=(1.0, 0))
+    rho, z, _ = base.local(P)
+    if len(np.unique(np.round(np.c_[rho, z], 5), axis=0)) < 3:
+        return None
+    if np.ptp(z) > 1e-6:
+        k, c0 = np.polyfit(z, rho, 1)
+        if abs(k) < 1e-4:
+            k, c0 = 0, rho.mean()
+        line = Revolved(axis[0], axis[1], line=(c0, k))
+        if abs(k) < math.tan(math.radians(80)) and _fits(line, P):
+            return line
+    c = _circle2d(rho, z)
+    if c is None or c[2] > 1e4:
+        return None
+    rc = 0.0 if abs(c[0]) < TOL else c[0]
+    return Revolved(axis[0], axis[1], circle=(rc, c[1], c[2]))
+
+
+# ---------------------------------------------------------------- growing patches
+
+def _normal_spread(model, pts):
+    n = model.normal(pts)
+    return math.acos(max(-1.0, min(1.0, float((n @ n.T).min()))))
+
+
+class Region:
+    """A set of smoothly connected facets, with fast "which facets lie on this surface" tests."""
+
+    def __init__(self, mesh, facets):
+        self.mesh = mesh
+        self.facets = np.asarray(facets)
+        pos = {f: i for i, f in enumerate(self.facets)}
+        lists = [mesh.fverts[f] for f in self.facets]
+        lens = np.array([len(l) for l in lists])
+        self.vids, self.vinv = np.unique(np.concatenate(lists), return_inverse=True)
+        self.starts = np.r_[0, np.cumsum(lens)[:-1]]
+        self.fv = np.split(self.vinv, np.cumsum(lens)[:-1])
+        self.P = mesh.pts[self.vids]
+        self.n = mesh.fn[self.facets]
+        self.c = mesh.fcent[self.facets]
+        self.nbrs = [[pos[g] for g in mesh.nbrs[f] if g in pos] for f in self.facets]
+        self.size = np.array([np.ptp(self.P[v], axis=0).max() for v in self.fv])
+        # Needle-thin facets have unreliable plane normals even when their corners are exact.
+        self.sliver = mesh.farea[self.facets] < 0.05 * self.size ** 2
+        self.free = np.ones(len(self.facets), bool)
+        self.explored = np.zeros(len(self.facets), bool)
+
+    def points(self, idx):
+        return self.P[np.unique(np.concatenate([self.fv[i] for i in idx]))]
+
+    def _test(self, model, idx):
+        """For facets idx: does each lie on the surface, which way does it face, surface normals."""
+        lens = np.array([len(self.fv[i]) for i in idx])
+        verts = np.concatenate([self.fv[i] for i in idx])
+        worst = np.maximum.reduceat(np.abs(model.signed(self.P[verts])), np.r_[0, np.cumsum(lens)[:-1]])
+        surface_n = model.normal(self.c[idx])
+        facing = np.einsum("ij,ij->i", self.n[idx], surface_n)
+        if _loose:
+            # the surface normal's own spread over the facet is allowed on top
+            spread = np.array([_normal_spread(model, self.P[self.fv[i]]) for i in idx])
+            aligned = np.abs(facing) >= np.cos(np.minimum(np.radians(LOOSE_NORMAL_DEG) + spread,
+                                                          np.radians(60)))
+            gap = LOOSE_MAX_GAP
+        else:
+            aligned = (np.abs(facing) >= math.cos(math.radians(NORMAL_DEG))) | self.sliver[idx]
+            gap = MAX_SAG
+        ok = ((worst <= _tol(model)) & (np.abs(model.signed(self.c[idx])) <= gap)
+              & aligned & self.free[idx])
+        return ok, facing > 0, surface_n
+
+    def grow(self, model, seeds):
+        """Facets connected to the seeds that lie on the model surface, and whether it's convex.
+
+        A facet only joins if it bends away from its neighbour the way the surface
+        does. (A flat wall beside a rounded edge can have its corners on some huge
+        circle, but it meets the rounded edge without the bend that circle predicts.)
+        """
+        seeds = list(seeds)
+        ok, out, sn = self._test(model, seeds)
+        if not ok.all() or (out != out[0]).any():
+            return None, None
+        convex = bool(out[0])
+        slack = math.radians(BEND_SLACK_DEG)
+        small = 0.1 * model.scale
+        normal = dict(zip(seeds, sn))
+
+        def bends_right(i, j, nj):
+            if (self.size[i] < small and self.size[j] < small) or self.sliver[i] or self.sliver[j]:
+                return True             # tiny or needle-thin facets: the corner check is what counts
+            actual = math.acos(min(1.0, self.n[i] @ self.n[j]))
+            predicted = math.acos(min(1.0, normal[i] @ nj))
+            return abs(actual - predicted) <= slack
+
+        for a in seeds[1:]:
+            if not bends_right(seeds[0], a, normal[a]):
+                return None, None
+        # A facet that fails only the bend test is looked at again each time another
+        # of its neighbours joins, since the verdict depends on which neighbour it's
+        # compared with.
+        tested, frontier = {}, seeds
+        while frontier:
+            cand = sorted({j for i in frontier for j in self.nbrs[i]
+                           if j not in normal and tested.get(j, (True,))[0]})
+            new = [j for j in cand if j not in tested]
+            if new:
+                tested.update(zip(new, zip(*self._test(model, new))))
+            frontier = []
+            for j in cand:
+                good, o, nj = tested[j]
+                if good and o == convex and any(i in normal and bends_right(i, j, nj)
+                                                 for i in self.nbrs[j]):
+                    normal[j] = nj
+                    frontier.append(j)
+        return np.array(sorted(normal)), convex
+
+
+def _refit(model, P, axis_fixed):
+    if isinstance(model, Sphere):
+        return _sphere(P)
+    if axis_fixed:
+        return _on_axis((model.a, model.d), P)
+    if model.line:
+        return _rings_refit(model, P)
+    return None
+
+
+def _grow_refit(region, model, seeds, axis_fixed):
+    idx, convex = region.grow(model, seeds)
+    if idx is None:
+        return None
+    for _ in range(8):  # each refit uses more of the surface, so it can reach a little further
+        better = _refit(model, region.points(idx), axis_fixed)
+        if better is None or (not axis_fixed and better.kind != model.kind):
+            break
+        idx2, convex2 = region.grow(better, seeds)
+        if idx2 is None or len(idx2) < len(idx):
+            break
+        grew = len(idx2) > len(idx)
+        model, idx, convex = better, idx2, convex2
+        if not grew:
+            break
+    return model, idx, convex
+
+
+def _profile_param(model, P):
+    """Position of points along the profile: height for a line, angle round the tube for a circle."""
+    rho, z, _ = model.local(P)
+    if model.line:
+        return z, 1.0
+    rc, zc, r = model.circle
+    return np.arctan2(z - zc, rho - rc), r
+
+
+def _trim(region, model, idx):
+    """Drop facets that leaked past a patch's true end circles.
+
+    Where two surfaces meet tangentially, the first row of tiny facets on the
+    neighbour can sit within tolerance of this surface too. A real end circle
+    carries many mesh corners; a leaked sliver adds only a few stray ones, so the
+    ends are taken as the outermost well-populated levels.
+    """
+    tol = _tol(model)
+    for _ in range(3):
+        verts = [region.fv[i] for i in idx]
+        t, scale = _profile_param(model, region.P)
+        used = np.unique(np.concatenate(verts))
+        levels, counts = np.unique(np.round(t[used] * scale / tol), return_counts=True)
+        busy = levels[counts >= max(4, 0.2 * counts.max())] * tol / scale
+        if len(busy) == 0:
+            break
+        lo, hi = busy.min() - 2 * tol / scale, busy.max() + 2 * tol / scale
+        keep = np.array([((t[v] >= lo) & (t[v] <= hi)).all() for v in verts])
+        if keep.all():
+            break
+        idx = idx[keep]
+        if len(idx) < 3:
+            break
+    return idx
+
+
+def _candidate(mesh, region, model, seeds, axis_fixed=False):
+    """Grow a hypothesis into a patch; return (Feature, facet positions, area) or None.
+
+    Facets of a patch that grew but was rejected go into region.explored, so the
+    same surface isn't regrown (and rejected again) from each of its facets.
+    """
+    if model is None:
+        return None
+    grown = _grow_refit(region, model, seeds, axis_fixed)
+    if grown is None:
+        return None
+    model, idx, convex = grown
+    options = []
+    if isinstance(model, Revolved) and not (model.circle and model.circle[0] == 0):
+        cut = _trim(region, model, idx)
+        if len(cut) >= 3 and len(cut) < len(idx):
+            better = _refit(model, region.points(cut), axis_fixed)
+            if (better is not None and (axis_fixed or better.kind == model.kind)
+                    and region._test(better, cut)[0].all()):
+                options.append((better, cut))
+            else:
+                options.append((model, cut))
+    options.append((model, idx))
+    result = None
+    min_facets = 2 if _loose else 3
+    for m, ids in options:
+        if len(ids) < min_facets or len(np.unique(np.round(region.n[ids], 3), axis=0)) < min_facets:
+            continue
+        feature = _feature(mesh, m, region.facets[ids], convex)
+        if feature is None:
+            continue
+        found = (feature, ids, float(mesh.farea[region.facets[ids]].sum()))
+        if feature.kind != "trimmed":
+            return found                # a clean outline: take it
+        result = result or found
+    if result is None and len(idx) >= 6:
+        region.explored[idx] = True
+    return result
+
+
+def _best(candidates):
+    found = [c for c in candidates if c]
+    return max(found, key=lambda c: c[2]) if found else None
+
+
+def _seed_candidates(mesh, region, i, j):
+    """Every surface the facet pair (i, j) could belong to, grown as far as it goes."""
+    P = region.points([i, j])
+    near = [i, j] + [k for k in region.nbrs[i] + region.nbrs[j] if region.free[k]]
+    near_pts = region.points(near)
+    found = []
+    d = mesh.shared_direction(region.facets[i], region.facets[j])
+    if d is not None:
+        cyl = _cylinder(d, P)
+        if _fits(cyl, P):
+            found.append(_candidate(mesh, region, cyl, [i, j]))
+    for k in region.nbrs[j]:
+        if k != i and region.free[k]:
+            pts = region.points([i, j, k])
+            cone = _cone(region.n[[i, j, k]], pts)
+            if _fits(cone, pts):
+                found.append(_candidate(mesh, region, cone, [i, j, k]))
+            break
+    # The same axis may carry a torus or sphere that explains more than one ring of facets.
+    for c in [c for c in found if c]:
+        ring = _on_axis((c[0].model.a, c[0].model.d), near_pts)
+        if _fits(ring, near_pts) and ring.circle:
+            found.append(_candidate(mesh, region, ring, [i, j], axis_fixed=True))
+    for pts in (near_pts, P):
+        ball = _sphere(pts)
+        if _fits(ball, pts):
+            found.append(_candidate(mesh, region, ball, [i, j]))
+            break
+    return _best(found)
+
+
+def find_features(pts, tris):
+    """Return a Feature for every curved patch that can be rebuilt exactly."""
+    return analyze(pts, tris)[1]
+
+
+def analyze(pts, tris):
+    """Return (mesh, features, tolerance): the facet structure and every rebuildable patch."""
+    global _mesh_tol
+    _mesh_tol = TOL + FLOAT_TOL * float(np.abs(pts).max())
+    mesh = Mesh(pts, tris)
+    regions = [Region(mesh, g) for g in mesh.smooth_regions()]
+    features = []
+
+    # Pass 1: from each pair of neighbouring facets, work out what surface they're on.
+    for region in regions:
+        for i in range(len(region.facets)):
+            for j in region.nbrs[i][:3]:
+                if not (region.free[i] and region.free[j]) or region.explored[i]:
+                    continue
+                best = _seed_candidates(mesh, region, i, j)
+                if best:
+                    feature, idx, _ = best
+                    region.free[idx] = False
+                    features.append(feature)
+                    break
+
+    # Pass 2: tori (and anything missed) around the axes of the patches found so far.
+    # A curved rounded edge always shares its axis with a neighbouring hole, pin or
+    # rounded corner, so each new patch can unlock its neighbours.
+    tried = 0
+    while tried < len(features):
+        axes = _distinct_axes(features)
+        tried = len(features)
+        for region in regions:
+            region.explored[:] = False
+            for i in range(len(region.facets)):
+                near = [i] + [k for k in region.nbrs[i] if region.free[k]]
+                if not region.free[i] or region.explored[i] or len(near) < 2:
+                    continue
+                pts = region.points(near)
+                found = []
+                for axis in axes:
+                    model = _on_axis(axis, pts)
+                    if _fits(model, pts):
+                        found.append(_candidate(mesh, region, model, [i], axis_fixed=True))
+                best = _best(found)
+                if best:
+                    feature, idx, _ = best
+                    region.free[idx] = False
+                    features.append(feature)
+    features += _loose_pass(mesh, regions, features)
+    return mesh, _merge_same_surface(mesh, features), _mesh_tol
+
+
+def _loose_pass(mesh, regions, features):
+    """Pass 3: whatever curved facets are left, accept any surface that explains them."""
+    global _loose
+    axes = _distinct_axes(features)
+    found_all = []
+    _loose = True
+    try:
+        for region in regions:
+            region.explored[:] = False
+            for i in range(len(region.facets)):
+                for j in region.nbrs[i][:3]:
+                    if not (region.free[i] and region.free[j]) or region.explored[i]:
+                        continue
+                    found = [_seed_candidates(mesh, region, i, j)]
+                    near = [i, j] + [k for k in region.nbrs[i] + region.nbrs[j] if region.free[k]]
+                    pts = region.points(near)
+                    for axis in axes:
+                        m = _on_axis(axis, pts)
+                        if _fits(m, pts):
+                            found.append(_candidate(mesh, region, m, [i, j], axis_fixed=True))
+                    best = _best(found)
+                    if best:
+                        feature, idx, _ = best
+                        region.free[idx] = False
+                        found_all.append(feature)
+                        break
+    finally:
+        _loose = False
+    return found_all
+
+
+def _simple_outline(mesh, fids):
+    """True if no vertex appears more than once on the patch's outline loops."""
+    T = np.concatenate([mesh.tris[mesh.ftris[f]] for f in fids])
+    uniq, counts = np.unique(_edges(T), axis=0, return_counts=True)
+    rim = uniq[counts == 1].ravel()
+    return len(rim) == 0 or np.bincount(rim).max() <= 2
+
+
+def _merge_same_surface(mesh, features):
+    """Join neighbouring patches that lie on the same surface (a hole split in two by a
+    seam in the mesh, say), so each becomes one face."""
+    verts = [set(np.concatenate([mesh.fverts[f] for f in x.facets]).tolist()) for x in features]
+    merged = True
+    while merged:
+        merged = False
+        for i in range(len(features)):
+            for j in range(i + 1, len(features)):
+                a, b = features[i], features[j]
+                if a.convex != b.convex or not (verts[i] & verts[j]):
+                    continue
+                if (np.abs(a.model.signed(mesh.pts[list(verts[j])])).max() > _tol()
+                        or np.abs(b.model.signed(mesh.pts[list(verts[i])])).max() > _tol()):
+                    continue
+                fids = np.concatenate([a.facets, b.facets])
+                if not _simple_outline(mesh, fids):
+                    continue                # outline touches itself (e.g. equal holes crossing)
+                both = _feature(mesh, a.model, fids, a.convex)
+                if both is None:
+                    continue
+                features[i] = both
+                verts[i] |= verts.pop(j)
+                features.pop(j)
+                merged = True
+                break
+            if merged:
+                break
+    return features
+
+
+def _distinct_axes(features):
+    axes = []
+    for f in features:
+        m = f.model
+        if not isinstance(m, Revolved):
+            continue
+        if not any(abs(m.d @ d) > math.cos(math.radians(0.5)) and
+                   np.linalg.norm(np.cross(m.a - a, d)) < TOL * 4 for a, d in axes):
+            axes.append((m.a, m.d))
+    return axes
+
+
+# ---------------------------------------------------------------- features
+
+def _arc(angles, min_points=6):
+    """(start, span) of the arc covered by a set of angles; span 2*pi for a full ring."""
+    a = np.sort(np.mod(angles, TWO_PI))
+    a = a[np.r_[True, np.diff(a) > 1e-6]]   # merge repeats (the same angle on several rings)
+    if len(a) < 2:
+        return None
+    gaps = np.diff(np.r_[a, a[0] + TWO_PI])
+    g = gaps.argmax()
+    if len(a) >= min_points and gaps[g] <= math.radians(SMOOTH_DEG + 5):
+        return 0.0, TWO_PI
+    return a[(g + 1) % len(a)], TWO_PI - gaps[g]
+
+
+def _angle_gap(a, b):
+    return np.abs(np.mod(a - b + math.pi, TWO_PI) - math.pi)
+
+
+@dataclass
+class Feature:
+    model: object
+    label: str          # what it is, in plain words
+    detail: str
+    convex: bool
+    kind: str           # "revolve" (cylinder/cone/torus/sphere cap), "wedge" (sphere corner),
+                        # "ball", or "trimmed" (any of these surfaces, cut to an arbitrary outline)
+    facets: np.ndarray  # mesh facets this patch replaces
+    change: float       # volume the exact surface adds compared with the facets (mm^3)
+    tolerance: float    # how far the actual change may differ from that
+    worst: float        # largest gap between a facet and the true surface (mm)
+    u0: float = 0.0     # "revolve": angular range around the axis
+    span: float = TWO_PI
+    lo: float = 0.0     # "revolve": profile range (height for a line, tube angle for a circle)
+    hi: float = 0.0
+    planes: tuple = ()  # "wedge": planes through the centre bounding the corner
+
+    def describe(self):
+        return f"{self.label:<22} {self.detail}"
+
+
+def _feature(mesh, model, fids, convex):
+    tids = np.concatenate([mesh.ftris[f] for f in fids])
+    T = mesh.tris[tids]
+    P = mesh.pts[np.unique(T)]
+    uniq, counts = np.unique(_edges(T), axis=0, return_counts=True)
+    rim_edges = uniq[counts == 1]
+    rim = mesh.pts[np.unique(rim_edges)]
+
+    # How far each facet sits from the true surface, sampled at its edge midpoints
+    # (exact for the near-parabolic gap between a flat facet and a curved surface).
+    corners = mesh.pts[T]
+    s = model.signed(((corners + corners[:, [1, 2, 0]]) / 2).reshape(-1, 3)).reshape(-1, 3)
+    area = mesh.tarea[tids]
+    change = (-1 if convex else 1) * float((area * s.mean(axis=1)).sum())
+    gain = float((area * np.abs(s).mean(axis=1)).sum())
+    worst = float(np.abs(s).max())
+    if worst < 1e-5:
+        return None
+    if _loose and (worst > LOOSE_MAX_GAP or not _loose_support(mesh, fids, model.kind)):
+        return None
+    base = dict(convex=convex, change=change, tolerance=0.5 * gain + 1e-3, facets=np.asarray(fids),
+                worst=worst)
+
+    if isinstance(model, Sphere):
+        if len(rim) == 0:
+            label = "ball" if convex else "spherical cavity"
+            return Feature(model, label, f"dia {2 * model.r:.3f}", kind="ball", **base)
+        mid = rim.mean(axis=0)
+        n = np.linalg.svd(rim - mid)[2][2]
+        if np.abs((rim - mid) @ n).max() <= _tol(model):
+            # Flat circular edge: a dome, dimple or hemispherical tip, handled as a revolved cap.
+            if ((P - mid) @ n).mean() < 0:
+                n = -n
+            cap = Revolved(model.c, n, circle=(0.0, float(model.c @ n), model.r))
+            return _revolved_feature(mesh, cap, P, rim, rim_edges, base)
+        directions = (P - model.c) / model.r
+        spread = math.acos(max(-1.0, min(1.0, (directions @ directions.mean(axis=0)).min()
+                                         / np.linalg.norm(directions.mean(axis=0)))))
+        if not _loose and (len(P) < MIN_CORNERS["sphere"]
+                           or 2 * spread < math.radians(MIN_SPAN_DEG)):
+            return None
+        planes = _great_circles(model, P, mesh.pts, rim_edges)
+        if planes is None or len(planes) > 4:
+            if not _loose and not _enough_for_trimmed(mesh, fids, P, rim_edges):
+                return None
+            label = "rounded area (sphere)" if convex else "spherical hollow"
+            return Feature(model, label, f"sphere r {model.r:.3f}, cut to shape", kind="trimmed", **base)
+        return Feature(model, "rounded corner", f"sphere r {model.r:.3f}", kind="wedge",
+                       planes=tuple(planes), **base)
+    return _revolved_feature(mesh, model, P, rim, rim_edges, base)
+
+
+def _loose_support(mesh, fids, kind):
+    """stlToSolid-style minimum evidence: enough facets, turning through enough angle."""
+    n = mesh.fn[fids]
+    if len(np.unique(np.round(n, 3), axis=0)) < LOOSE_MIN_FACETS[kind]:
+        return False
+    return (n @ n.T).min() <= math.cos(math.radians(LOOSE_MIN_TURN_DEG[kind]))
+
+
+def _enough_for_trimmed(mesh, fids, P, free_edges):
+    """Is a patch with an outline off its natural edges believable?
+
+    Where it leaves those edges it must meet something else at a real crease (a hole
+    breaking out through a sloped face, a knob cut by another feature). A smooth
+    hand-over there means it's more likely a slice of some larger curved surface
+    (one ring of a torus, say, which lies exactly on a sphere).
+    """
+    if len(P) < TRIMMED_MIN_CORNERS or len(fids) < TRIMMED_MIN_FACETS:
+        return False
+    n = mesh.fn[fids]
+    if (n @ n.T).min() > math.cos(math.radians(TRIMMED_MIN_TURN_DEG)):
+        return False
+    # (Mostly, anyway: two equal holes crossing are tangent at a couple of points.)
+    inside = set(np.asarray(fids).tolist())
+    crease = math.cos(math.radians(CREASE_DEG))
+    smooth = total = 0.0
+    for a, b in free_edges:
+        sides = mesh.edge_facets.get((min(a, b), max(a, b)), [])
+        mine = [f for f in sides if f in inside]
+        other = [f for f in sides if f not in inside]
+        length = float(np.linalg.norm(mesh.pts[a] - mesh.pts[b]))
+        total += length
+        if mine and other and mesh.fn[mine[0]] @ mesh.fn[other[0]] > crease:
+            smooth += length
+    return smooth <= 0.25 * total
+
+
+def _great_circles(model, P, pts, rim_edges):
+    """Planes through the sphere centre that together make up a patch's outline."""
+    tol = _tol(model)
+    normals = []
+    for i, j in rim_edges:
+        m = np.cross(pts[i] - model.c, pts[j] - model.c)
+        if np.linalg.norm(m) < 1e-9:
+            continue
+        m /= np.linalg.norm(m)
+        if not any(abs(m @ q) > math.cos(math.radians(1)) for q in normals):
+            normals.append(m)
+    if not 1 <= len(normals) <= 8:
+        return None
+    # both ends of every outline edge must lie on the same plane
+    on = np.abs((pts[rim_edges] - model.c) @ np.array(normals).T) <= tol
+    if not (on[:, 0] & on[:, 1]).any(axis=1).all():
+        return None
+    planes = []
+    for m in normals:
+        side = (P - model.c) @ m
+        if side.min() >= -tol:
+            planes.append(m)
+        elif side.max() <= tol:
+            planes.append(-m)
+        else:
+            return None                 # patch is on both sides: not a simple corner
+    return planes
+
+
+def _revolved_feature(mesh, model, P, rim, rim_edges, base):
+    tol = _tol(model)
+    rho, z, w = model.local(P)
+    off_axis = rho > tol
+    around = _arc(model.angle(w[off_axis]))
+    if around is None:
+        return None
+    u0, span = around
+    r_rho, r_z, r_w = model.local(rim) if len(rim) else (np.zeros(0),) * 3
+    r_u = model.angle(r_w) if len(rim) else np.zeros(0)
+
+    if model.line:
+        lo, hi = z.min(), z.max()
+        at = lambda end: np.abs(r_z - end) <= tol
+        c0, k = model.line
+        if k != 0 and span >= TWO_PI:
+            # A pointed cone tip can be closed off by one flat facet with no corner at
+            # the tip itself; if the outline doesn't reach that end, run to the tip.
+            apex = -c0 / k
+            if abs(apex - lo) < abs(apex - hi) and not at(lo).any():
+                lo = apex
+            elif abs(apex - hi) < abs(apex - lo) and not at(hi).any():
+                hi = apex
+    else:
+        rc, zc, r = model.circle
+        ring = _arc(np.arctan2(z - zc, rho - rc))
+        if ring is None or ring[1] >= TWO_PI - 1e-9:
+            return None                 # a complete tube (O-ring): not handled
+        lo, hi = ring[0], ring[0] + ring[1]
+        v = np.arctan2(r_z - zc, r_rho - rc)
+        at = lambda end: _angle_gap(v, end) * r <= tol
+        if rc == 0 and span >= TWO_PI:
+            # Same for the pole of a dome or dimple closed off by one flat facet.
+            lo, hi = math.remainder(lo, TWO_PI), math.remainder(lo, TWO_PI) + (hi - lo)
+            if not at(hi).any() and hi > 0:
+                hi = math.pi / 2
+            if not at(lo).any() and lo < 0:
+                lo = -math.pi / 2
+
+    # Every outline edge must run along one of the patch's natural boundary lines
+    # (both of its ends on the same line), so the outline traces the patch exactly.
+    lines = [at(lo), at(hi)]
+    if span < TWO_PI:
+        on_axis = r_rho <= tol
+        lines += [(_angle_gap(r_u, u0) * r_rho <= tol) | on_axis,
+                  (_angle_gap(r_u, u0 + span) * r_rho <= tol) | on_axis]
+    trimmed = False
+    if len(rim_edges):
+        index = {v: i for i, v in enumerate(np.unique(rim_edges))}
+        a = np.array([index[i] for i in rim_edges[:, 0]])
+        b = np.array([index[j] for j in rim_edges[:, 1]])
+        along = np.any([line[a] & line[b] for line in lines], axis=0)
+        if not along.all():
+            # the outline leaves the natural edges: only OK as a well-supported trimmed patch
+            if not _loose and not _enough_for_trimmed(mesh, base["facets"], P, rim_edges[~along]):
+                return None
+            trimmed = True
+    if not _loose:
+        if len(P) < MIN_CORNERS[model.kind]:
+            return None                 # too few points to be sure of the shape
+        min_span = math.radians(MIN_SPAN_DEG)
+        if span < min_span or (not model.line and hi - lo < min_span):
+            return None
+        if model.kind == "cone" and not _creased(mesh, base["facets"], z, lo, hi, model, tol):
+            return None
+
+    if model.circle and any(model.circle[0] + model.circle[2] * math.cos(v) < -tol
+                            for v in np.linspace(lo, hi, 9)):
+        return None                     # profile would cross the axis
+    label, detail = _describe(model, base["convex"], span, lo, hi)
+    if trimmed:
+        detail += ", cut to shape"
+    return Feature(model, label, detail, kind="trimmed" if trimmed else "revolve",
+                   u0=u0, span=span, lo=lo, hi=hi, **base)
+
+
+def _creased(mesh, fids, z, lo, hi, model, tol):
+    """Does a one-ring cone meet a neighbour at a real crease?
+
+    A single ring of facets on any rounded surface is exactly a slice of a cone, so
+    a one-ring cone is only trusted if at least one of its end circles is a crease
+    (or an open edge) rather than a smooth continuation.
+    """
+    if ((np.abs(z - lo) > tol) & (np.abs(z - hi) > tol)).any():
+        return True                     # several rings of facets: a genuine cone
+    inside = set(fids.tolist())
+    soft = set()
+    for f in fids:
+        for g in mesh.nbrs[f]:
+            if g in inside:
+                continue
+            if math.degrees(math.acos(min(1.0, mesh.fn[f] @ mesh.fn[g]))) >= CREASE_DEG:
+                continue
+            for a, b in mesh.shared[(min(f, g), max(f, g))]:
+                ez = model.local(mesh.pts[[a, b]])[1]
+                for end in (lo, hi):
+                    if (np.abs(ez - end) <= tol).all():
+                        soft.add(end)
+    c0, k = model.line
+    ends = {end for end in (lo, hi) if c0 + k * end > tol}   # a pointed tip has no edge
+    return not ends <= soft
+
+
+def _describe(model, convex, span, lo, hi):
+    full = span >= TWO_PI
+    kind = model.kind
+    if kind == "cylinder":
+        r = model.line[0]
+        if full:
+            return ("pin" if convex else "hole"), f"dia {2 * r:.3f}, length {hi - lo:.2f}"
+        return "rounded edge", f"r {r:.3f}, {math.degrees(span):.0f} deg, length {hi - lo:.2f}"
+    if kind == "cone":
+        c0, k = model.line
+        angle = math.degrees(math.atan(abs(k)))
+        dias = f"dia {2 * (c0 + k * lo):.3f} -> {2 * (c0 + k * hi):.3f}"
+        if full:
+            return ("cone / chamfered pin" if convex else "countersink / chamfer"), f"{dias}, {angle:.1f} deg"
+        return "chamfer (cone)", f"{dias}, {angle:.1f} deg, {math.degrees(span):.0f} deg around"
+    if kind == "torus":
+        rc, zc, r = model.circle
+        return "rounded edge (curved)", f"r {r:.3f} around a {2 * rc:.3f} circle, {math.degrees(span):.0f} deg"
+    r = model.circle[2]
+    height = r * (math.sin(hi) - math.sin(lo))
+    return ("dome" if convex else "dimple"), f"sphere dia {2 * r:.3f}, height {height:.2f}"
+
+
+def summarize(features):
+    counts = Counter(f.label for f in features)
+    return ", ".join(f"{label} x{n}" for label, n in counts.most_common())

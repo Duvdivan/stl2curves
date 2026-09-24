@@ -1,0 +1,334 @@
+"""
+stl2curves - convert STL mesh files into solid STEP files for Fusion / any CAD.
+
+What it does:
+  1. Reads the STL triangles and groups them into flat facets.
+  2. Finds curved areas and works out the exact surface each lies on: holes, pins,
+     rounded edges (fillets), chamfers/countersinks around round edges, cones,
+     domes, dimples, balls and rounded corners.
+  3. Builds a real solid from exact faces: one flat face per flat region (a box
+     wall is one face you can select, offset, sketch on, press/pull...) and one
+     true curved face per curved area, so Fusion sees real circular edges you can
+     select, measure, dimension and fillet.
+  4. Writes a .step file next to the STL (or into --out folder).
+
+Straight chamfers and flat faces are exact already. Curved areas that don't match
+one of the recognised shapes cleanly (freeform surfaces, variable-radius blends,
+odd corner blends) stay as small flat facets.
+
+Usage:
+  python stl2curves.py file1.stl [file2.stl ...] [--out FOLDER] [--merge NAME]
+  python stl2curves.py some_folder            (converts every .stl in it)
+
+  --merge NAME     also write all inputs together into one NAME.step
+  --tol X          sewing tolerance in mm (default 0.01)
+  --no-fuse        keep overlapping bodies within one STL as separate bodies
+  --no-curves      skip curve detection (leave everything faceted)
+  --details        list every rebuilt feature with its size
+"""
+import argparse
+import os
+import sys
+import time
+from pathlib import Path
+
+import numpy as np
+from OCP.TopoDS import TopoDS, TopoDS_Compound
+from OCP.BRep import BRep_Builder, BRep_Tool
+from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeSolid
+from OCP.BRepClass3d import BRepClass3d_SolidClassifier
+from OCP.ShapeUpgrade import ShapeUpgrade_UnifySameDomain
+from OCP.ShapeFix import ShapeFix_Solid, ShapeFix_Shape
+from OCP.BRepCheck import BRepCheck_Analyzer
+from OCP.BRepGProp import BRepGProp
+from OCP.GProp import GProp_GProps
+from OCP.TopExp import TopExp_Explorer
+from OCP.TopAbs import TopAbs_FACE, TopAbs_SHELL, TopAbs_SOLID, TopAbs_VERTEX, TopAbs_IN
+from OCP.STEPControl import STEPControl_Writer, STEPControl_AsIs
+from OCP.Interface import Interface_Static
+from OCP.IFSelect import IFSelect_RetDone
+from OCP.BRepAlgoAPI import BRepAlgoAPI_Fuse
+from OCP.collections import List_TopoDS_Shape
+
+from features import load_stl, analyze, summarize, Mesh, TOL
+from build import build_faces, sew
+
+
+def count(shape, kind):
+    n, ex = 0, TopExp_Explorer(shape, kind)
+    while ex.More():
+        n += 1
+        ex.Next()
+    return n
+
+
+def volume(shape):
+    props = GProp_GProps()
+    BRepGProp.VolumeProperties_s(shape, props)
+    return props.Mass()
+
+
+def fixed(solid):
+    fix = ShapeFix_Solid(solid)
+    fix.Perform()
+    return fix.Solid()
+
+
+def compound(shapes):
+    comp = TopoDS_Compound()
+    b = BRep_Builder()
+    b.MakeCompound(comp)
+    for s in shapes:
+        b.Add(comp, s)
+    return comp
+
+
+def boolean(op, args, tools):
+    lst = lambda xs: (l := List_TopoDS_Shape(), [l.Append(x) for x in xs])[0]
+    algo = op()
+    algo.SetArguments(lst(args))
+    algo.SetTools(lst(tools))
+    algo.SetFuzzyValue(1e-5)
+    algo.SetRunParallel(True)
+    algo.SetUseOBB(True)
+    algo.Build()
+    if not algo.IsDone():
+        raise RuntimeError("boolean operation failed")
+    return algo.Shape()
+
+
+def mesh_volume(mesh):
+    a, b, c = (mesh.pts[mesh.tris[:, k]] for k in range(3))
+    return float(np.einsum("ij,ij->i", a, np.cross(b, c)).sum() / 6)
+
+
+def solids_from_shells(sewn, fuse):
+    """Turn sewn shells into solids. A shell inside another is a cavity, the rest are bodies.
+
+    Returns (shape, number of bodies, number of cavities, total volume of material).
+    """
+    shells = []
+    ex = TopExp_Explorer(sewn, TopAbs_SHELL)
+    while ex.More():
+        shell = TopoDS.Shell(ex.Current())
+        solid = fixed(BRepBuilderAPI_MakeSolid(shell).Solid())   # oriented outwards
+        v = volume(solid)
+        if v < 0:
+            solid = TopoDS.Solid(solid.Reversed())
+            v = -v
+        shells.append((shell, solid, v))
+        ex.Next()
+    if not shells:
+        raise RuntimeError("no closed body found")
+    shells.sort(key=lambda x: -x[2])        # biggest first: an enclosing shell comes first
+
+    def points_of(shape, most=24):
+        # corners and face centres (a rib spanning wall to wall has every corner buried
+        # in the walls, but the middle of its top face is out in the open)
+        pts, ex = [], TopExp_Explorer(shape, TopAbs_FACE)
+        while ex.More():
+            props = GProp_GProps()
+            BRepGProp.SurfaceProperties_s(ex.Current(), props)
+            pts.append(props.CentreOfMass())
+            ex.Next()
+        ex = TopExp_Explorer(shape, TopAbs_VERTEX)
+        while ex.More():
+            pts.append(BRep_Tool.Pnt_s(TopoDS.Vertex(ex.Current())))
+            ex.Next()
+        return pts[::max(1, len(pts) // most)]
+
+    def inside(solid, pts):
+        return all(BRepClass3d_SolidClassifier(solid, p, 1e-6).State() == TopAbs_IN for p in pts)
+
+    # A cavity lies wholly inside its host; an overlapping body (a rib sunk into a
+    # floor, say) has some corners outside, and gets fused on instead.
+    bodies, cavities, total = [], [], 0.0      # bodies: [outer solid, [cavity solids]]
+    for shell, solid, v in shells:
+        pts = points_of(shell)
+        host = next((b for b in bodies if inside(b[0], pts)), None)
+        if host is None:
+            bodies.append([solid, []])
+            total += v
+        else:
+            host[1].append(solid)
+            cavities.append(solid)
+            total -= v
+    solids = []
+    for outer, holes in bodies:
+        if not holes:
+            solids.append(outer)
+            continue
+        maker = BRepBuilderAPI_MakeSolid(TopoDS.Shell(TopExp_Explorer(outer, TopAbs_SHELL).Current()))
+        for h in holes:
+            inner = TopoDS.Shell(TopExp_Explorer(h, TopAbs_SHELL).Current())
+            maker.Add(TopoDS.Shell(inner.Reversed()))
+        solids.append(fixed(maker.Solid()))
+    solid = solids[0]
+    if fuse and len(solids) > 1:
+        solid = boolean(BRepAlgoAPI_Fuse, solids[:1], solids[1:])
+    elif len(solids) > 1:
+        solid = compound(solids)
+    return solid, len(solids), len(cavities), total
+
+
+def attempt(mesh, features, mesh_tol, tol, fuse, faceted_volume):
+    """Build and sew the part with these features; return (shape, stats) or None if it fails the checks."""
+    comp, shells, failed = build_faces(mesh, features, mesh_tol)
+    if failed:
+        return None, failed
+    worst = max((f.worst for f in features), default=0.0)
+    sewn, free = sew(comp, max(tol, min(0.2, 1.5 * worst)), shells)
+    if free:
+        return None, []
+    try:
+        shape, nb, nv, signed = solids_from_shells(sewn, fuse)
+    except RuntimeError:
+        return None, []
+    expected = faceted_volume + sum(f.change for f in features)
+    allowed = sum(f.tolerance for f in features) + 1e-6 * abs(faceted_volume) + 1e-3
+    if abs(signed - expected) > allowed or not BRepCheck_Analyzer(shape).IsValid():
+        return None, []
+    return (shape, nb, nv), []
+
+
+def stl_to_solid(path, tol, fuse=True, curves=True):
+    pts, tris = load_stl(path)
+    if curves:
+        mesh, features, mesh_tol = analyze(pts, tris)
+    else:
+        mesh, features, mesh_tol = Mesh(pts, tris), [], TOL
+    faceted_volume = mesh_volume(mesh)
+    info = {"triangles": len(mesh.tris), "restored": [], "skipped": []}
+
+    def good(subset):
+        result, failed = attempt(mesh, subset, mesh_tol, tol, fuse, faceted_volume)
+        while failed:  # patches whose face couldn't be built: drop them and retry
+            info["skipped"] += [subset[k] for k in failed]
+            subset = [f for k, f in enumerate(subset) if k not in failed]
+            result, failed = attempt(mesh, subset, mesh_tol, tol, fuse, faceted_volume)
+        return result, subset
+
+    result, used = good(features)
+    if result is None and used:
+        # Find the troublemakers by halving: keep every half that builds cleanly.
+        accepted = []
+
+        def search(group):
+            nonlocal result
+            if not group:
+                return
+            trial, kept = good(accepted + group)
+            if trial is not None:
+                accepted[:] = kept
+                result = trial
+                return
+            if len(group) == 1:
+                info["skipped"].append(group[0])
+                return
+            half = len(group) // 2
+            search(group[:half])
+            search(group[half:])
+
+        search(used)
+        used = accepted
+        if result is None:
+            result, used = good([])
+    if result is None:
+        raise RuntimeError("could not build a closed solid from this mesh")
+    shape, nb, nv = result
+    info["restored"] = used
+
+    unify = ShapeUpgrade_UnifySameDomain(shape, True, False, False)  # merge edges only
+    unify.Build()
+    sf = ShapeFix_Shape(unify.Shape())
+    sf.Perform()
+    shape = sf.Shape()
+
+    info["bodies"], info["voids"] = nb, nv
+    info["faces"] = count(shape, TopAbs_FACE)
+    info["volume"] = volume(shape)
+    info["valid"] = BRepCheck_Analyzer(shape).IsValid()
+    return shape, info
+
+
+def write_step(shape, path):
+    Interface_Static.SetCVal_s("write.step.unit", "MM")
+    Interface_Static.SetCVal_s("write.step.schema", "AP214IS")
+    # OpenCascade prints a wall of transfer statistics to stdout; silence it.
+    sys.stdout.flush()
+    saved, devnull = os.dup(1), os.open(os.devnull, os.O_WRONLY)
+    os.dup2(devnull, 1)
+    try:
+        w = STEPControl_Writer()
+        w.Transfer(shape, STEPControl_AsIs)
+        status = w.Write(str(path))
+    finally:
+        os.dup2(saved, 1)
+        os.close(devnull)
+        os.close(saved)
+    if status != IFSelect_RetDone:
+        raise RuntimeError(f"failed writing {path}")
+
+
+def describe_features(info, details=False):
+    text = ""
+    if info["restored"]:
+        text = f"  rebuilt as true curves: {summarize(info['restored'])}"
+    if info["skipped"]:
+        text += f"\n  left faceted (failed checks): {summarize(info['skipped'])}"
+    if details:
+        for f in info["restored"]:
+            text += f"\n    {f.describe()}"
+        for f in info["skipped"]:
+            text += f"\n    SKIPPED {f.describe()}"
+    return text.lstrip("\n")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("inputs", nargs="+")
+    ap.add_argument("--out", help="output folder (default: next to each STL)")
+    ap.add_argument("--merge", help="also write all parts into one STEP with this name")
+    ap.add_argument("--tol", type=float, default=0.01)
+    ap.add_argument("--no-fuse", action="store_true",
+                    help="keep separate/overlapping bodies in a file separate instead of unioning them")
+    ap.add_argument("--no-curves", action="store_true",
+                    help="don't rebuild curved areas as true curves")
+    ap.add_argument("--details", action="store_true", help="list every rebuilt feature")
+    args = ap.parse_args()
+
+    files = []
+    for p in map(Path, args.inputs):
+        files += sorted(f for f in p.iterdir() if f.suffix.lower() == ".stl") if p.is_dir() else [p]
+    if not files:
+        sys.exit("No STL files found.")
+
+    shapes = []
+    for f in files:
+        t = time.time()
+        print(f"{f.name}: converting...", flush=True)
+        shape, info = stl_to_solid(f, args.tol, not args.no_fuse, not args.no_curves)
+        out_dir = Path(args.out) if args.out else f.parent
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out = out_dir / (f.stem + ".step")
+        write_step(shape, out)
+        shapes.append(shape)
+        nb, nv = info["bodies"], info["voids"]
+        extra = f" ({nb} bodies{', ' + str(nv) + ' cavities' if nv else ''})" if nb + nv > 1 else ""
+        print(f"  {info['triangles']} triangles -> {info['faces']} faces{extra}, "
+              f"volume {info['volume']:,.1f} mm^3, "
+              f"{'valid solid' if info['valid'] else 'WARNING: check geometry'}, "
+              f"{time.time() - t:.1f}s -> {out}")
+        if info["restored"] or info["skipped"]:
+            print(describe_features(info, args.details))
+
+    if args.merge:
+        comp = compound(shapes)
+        out_dir = Path(args.out) if args.out else files[0].parent
+        out = out_dir / (Path(args.merge).stem + ".step")
+        write_step(comp, out)
+        print(f"Combined file -> {out}")
+
+
+if __name__ == "__main__":
+    main()
