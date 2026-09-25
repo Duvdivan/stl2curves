@@ -667,34 +667,72 @@ def analyze(pts, tris):
     return mesh, _merge_same_surface(mesh, features), _mesh_tol
 
 
-def _band_tori(mesh, regions, features):
-    """Replace chains of short cylinder strips by the torus they approximate.
+def _tube_fit(P, model):
+    """Least-squares torus (or cylinder) through points P, starting from `model`."""
+    from scipy.optimize import least_squares
+    if model.line:
+        a, d, r = model.a, model.d, model.line[0]
+        x0 = np.r_[a, d, r]
 
-    A rounded edge that follows a curve, with no neighbouring hole or pin to supply
-    its axis, comes out of the permissive pass as a chain of short cylinders of equal
-    radius. Each strip's axis is a tangent of the torus's centre circle, so a circle
-    through points on those axes gives the torus (the idea of the stlToSolid project).
+        def res(x):
+            d = x[3:6] / np.linalg.norm(x[3:6])
+            v = P - x[:3]
+            return np.linalg.norm(v - np.outer(v @ d, d), axis=1) - x[6]
+    else:
+        rc, zc, r = model.circle
+        x0 = np.r_[model.a + zc * model.d, model.d, rc, r]
+
+        def res(x):
+            d = x[3:6] / np.linalg.norm(x[3:6])
+            v = P - x[:3]
+            z = v @ d
+            rho = np.linalg.norm(v - np.outer(z, d), axis=1)
+            return np.hypot(rho - x[6], z) - x[7]
+    try:
+        x = least_squares(res, x0, x_scale="jac").x
+    except Exception:
+        return None
+    d = x[3:6] / np.linalg.norm(x[3:6])
+    if model.line:
+        return Revolved(x[:3], d, line=(abs(x[6]), 0))
+    c = x[:3]
+    return Revolved(c, d, circle=(abs(x[6]), float(c @ d), abs(x[7])))
+
+
+def _band_tori(mesh, regions, features):
+    """Replace chains of small pieces by the torus (or cylinder) they approximate.
+
+    A rounded edge that follows a curve, with no neighbouring hole or pin to supply its
+    axis, is easily cut into many small pieces of the fillet radius: short cylinder
+    strips (the idea of the stlToSolid project) or, on coarse meshes, little "spheres"
+    (a short stretch of a torus fits a sphere of its tube radius too). The pieces' centres
+    run along the torus's centre circle, so consecutive pieces are fitted as one torus,
+    and the run is regrown as a single patch.
     """
     global _loose
 
-    def is_band(f):
+    def piece(f):
+        """(radius, point on the tube's centre line) for a small piece, else None."""
         m = f.model
-        if not (isinstance(m, Revolved) and m.line and m.line[1] == 0 and f.span < TWO_PI):
-            return False
-        return f.hi - f.lo <= 4 * m.line[0]
+        if isinstance(m, Sphere):
+            P = mesh.pts[np.unique(np.concatenate([mesh.fverts[x] for x in f.facets]))]
+            return (m.r, m.c) if np.ptp(P, axis=0).max() <= 2.5 * m.r else None
+        if isinstance(m, Revolved) and m.line and m.line[1] == 0 and f.span < TWO_PI:
+            if f.hi - f.lo <= 4 * m.line[0]:
+                return m.line[0], m.a + (f.lo + f.hi) / 2 * m.d
+        return None
 
-    bands = [k for k, f in enumerate(features) if is_band(f)]
-    if len(bands) < 3:
+    small = {k: piece(f) for k, f in enumerate(features)}
+    small = {k: v for k, v in small.items() if v is not None}
+    if len(small) < 3:
         return features
-    verts = {k: set(np.concatenate([mesh.fverts[x] for x in features[k].facets]).tolist()) for k in bands}
-    link = {k: [] for k in bands}
-    for i, a in enumerate(bands):
-        for b in bands[i + 1:]:
-            ma, mb = features[a].model, features[b].model
-            ra, rb = ma.line[0], mb.line[0]
-            turn = abs(ma.d @ mb.d)
-            if (abs(ra - rb) <= max(0.1 * ra, 2 * _tol()) and math.cos(math.radians(60)) <= turn
-                    <= math.cos(math.radians(0.5)) and verts[a] & verts[b]):
+    keys = list(small)
+    verts = {k: set(np.concatenate([mesh.fverts[x] for x in features[k].facets]).tolist()) for k in keys}
+    link = {k: [] for k in keys}
+    for i, a in enumerate(keys):
+        for b in keys[i + 1:]:
+            ra, rb = small[a][0], small[b][0]
+            if abs(ra - rb) <= max(0.05 * ra, 2 * _tol()) and verts[a] & verts[b]:
                 link[a].append(b)
                 link[b].append(a)
     region_of = {}
@@ -702,9 +740,53 @@ def _band_tori(mesh, regions, features):
         for pos, f in enumerate(region.facets):
             region_of[int(f)] = (region, pos)
 
+    def ordered(chain):
+        """The chain's pieces in order along it (a walk from one end)."""
+        members = set(chain)
+        ends = [k for k in chain if len([j for j in link[k] if j in members]) <= 1]
+        k = ends[0] if ends else chain[0]
+        out, seen = [k], {k}
+        while True:
+            nxt = [j for j in link[k] if j in members and j not in seen]
+            if not nxt:
+                break
+            # the nearest neighbour keeps the walk on the chain where it branches
+            k = min(nxt, key=lambda j: np.linalg.norm(small[j][1] - small[out[-1]][1]))
+            out.append(k)
+            seen.add(k)
+        return out
+
+    def points(ks):
+        return mesh.pts[np.unique(np.concatenate([mesh.fverts[x] for k in ks for x in features[k].facets]))]
+
+    def tube(ks):
+        """The torus or cylinder through these pieces, if their mesh corners lie on it."""
+        C = np.array([small[k][1] for k in ks])
+        r = float(np.mean([small[k][0] for k in ks]))
+        mid = C.mean(axis=0)
+        vt = np.linalg.svd(C - mid)[2]
+        guesses = [Revolved(mid, vt[0], line=(r, 0))]           # a straight fillet
+        if len(ks) >= 3:
+            _, e1, e2 = _frame(vt[2])
+            c = _circle2d((C - mid) @ e1, (C - mid) @ e2)
+            if c is not None and c[2] < 1e3 * r:
+                centre = mid + c[0] * e1 + c[1] * e2
+                guesses.append(Revolved(centre, vt[2], circle=(c[2], float(centre @ _frame(vt[2])[0]), r)))
+        P = points(ks)
+        fitted = [m for m in (_tube_fit(P, g) for g in guesses) if m is not None]
+        fitted = [(np.abs(m.signed(P)).max(), k, m) for k, m in enumerate(fitted)]
+        if not fitted:
+            return None
+        err, _, model = min(fitted)
+        if err > 2 * _tol():
+            return None
+        if model.circle and model.circle[0] <= model.circle[2]:
+            return None                                    # not a tube round a hole in the middle
+        return model
+
     drop, added, seen = set(), [], set()
-    for start in bands:
-        if start in seen:
+    for start in keys:
+        if start in seen or len(link[start]) == 0:
             continue
         chain, stack = [], [start]
         seen.add(start)
@@ -717,42 +799,44 @@ def _band_tori(mesh, regions, features):
                     stack.append(j)
         if len(chain) < 3:
             continue
-        # a point on each strip's axis, level with the middle of the strip
-        centres = []
-        for k in chain:
-            m, f = features[k].model, features[k]
-            centres.append(m.a + (f.lo + f.hi) / 2 * m.d)
-        centres = np.array(centres)
-        mid = centres.mean(axis=0)
-        normal = np.linalg.svd(centres - mid)[2][2]
-        _, e1, e2 = _frame(normal)
-        c = _circle2d((centres - mid) @ e1, (centres - mid) @ e2)
-        if c is None:
-            continue
-        centre = mid + c[0] * e1 + c[1] * e2
-        r = float(np.mean([features[k].model.line[0] for k in chain]))
-        torus = Revolved(centre, normal, circle=(c[2], float(centre @ normal / np.linalg.norm(normal)), r))
-        # free the strips and regrow the area as one torus
-        facets = np.concatenate([features[k].facets for k in chain])
-        if int(facets[0]) not in region_of:
-            continue
-        region, seed = region_of[int(facets[0])]
-        positions = [region_of[int(f)][1] for f in facets if int(f) in region_of and region_of[int(f)][0] is region]
-        region.free[positions] = True
-        _loose = True
-        try:
-            got = _candidate(mesh, region, torus, [seed], axis_fixed=True)
-        finally:
-            _loose = False
-        area = float(mesh.farea[facets].sum())
-        if got and got[0].model.kind == "torus" and got[2] >= 0.9 * area:
-            feature, idx, _ = got
+        run_order = ordered(chain)
+        i = 0
+        while i + 3 <= len(run_order):
+            # the longest run from i that one tube explains
+            j, model = i + 3, tube(run_order[i:i + 3])
+            if model is None:
+                i += 1
+                continue
+            while j < len(run_order):
+                better = tube(run_order[i:j + 1])
+                if better is None:
+                    break
+                model, j = better, j + 1
+            run = run_order[i:j]
+            i = j
+            facets = np.concatenate([features[k].facets for k in run])
+            if int(facets[0]) not in region_of:
+                continue
+            region, seed = region_of[int(facets[0])]
+            positions = [region_of[int(f)][1] for f in facets
+                         if int(f) in region_of and region_of[int(f)][0] is region]
             region.free[positions] = True
-            region.free[idx] = False
-            drop.update(chain)
-            added.append(feature)
-        else:
-            region.free[positions] = False
+            _loose = True
+            try:
+                got = _candidate(mesh, region, model, [seed], axis_fixed=True)
+            finally:
+                _loose = False
+            area = float(mesh.farea[facets].sum())
+            if got and got[0].model.kind == model.kind and got[2] >= 0.9 * area:
+                feature, idx, _ = got
+                region.free[idx] = False
+                drop.update(run)
+                # pieces the new patch swallowed whole go too
+                taken = set(region.facets[idx].tolist())
+                drop.update(k for k in keys if set(features[k].facets.tolist()) <= taken)
+                added.append(feature)
+            else:
+                region.free[positions] = False
     if not added:
         return features
     return [f for k, f in enumerate(features) if k not in drop] + added

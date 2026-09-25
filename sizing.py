@@ -61,9 +61,16 @@ class SizeGuess:
                 f"Use --true-size to rebuild at that size.")
 
 
-def measurements(mesh, features):
-    """(values, weights): radii of curved patches, and gaps between big parallel flat faces."""
+def measurements(parts):
+    """(values, weights): radii of curved patches, and gaps between big parallel flat faces,
+    over all (mesh, features) parts of a file."""
     values, weights = [], []
+    for mesh, features in parts:
+        _measure(mesh, features, values, weights)
+    return _distinct(values, weights)
+
+
+def _measure(mesh, features, values, weights):
     for f in features:
         m = f.model
         r = getattr(m, "r", None)
@@ -81,7 +88,10 @@ def measurements(mesh, features):
             if mesh.fn[a] @ mesh.fn[b] < -0.99999:
                 values.append(abs((mesh.fcent[b] - mesh.fcent[a]) @ mesh.fn[a]))
                 weights.append(math.sqrt(min(mesh.farea[a], mesh.farea[b])))
-    # one vote per distinct value
+
+
+def _distinct(values, weights):
+    """One vote per distinct value."""
     order = np.argsort(values)
     v_out, w_out = [], []
     for k in order:
@@ -93,9 +103,11 @@ def measurements(mesh, features):
     return np.array(v_out), np.array(w_out)
 
 
-def guess_size(mesh, features):
-    size = float(np.ptp(mesh.pts, axis=0).max())
-    values, weights = measurements(mesh, features)
+def guess_size(parts):
+    """The design size of a file from its (mesh, features) parts."""
+    P = np.concatenate([mesh.pts[np.unique(mesh.tris)] for mesh, _ in parts])
+    size = float(np.ptp(P, axis=0).max())
+    values, weights = measurements(parts)
     if len(values) < 3:
         return None
     w = weights / weights.sum()

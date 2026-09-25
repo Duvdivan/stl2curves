@@ -56,6 +56,7 @@ from OCP.collections import List_TopoDS_Shape
 from features import load_stl, analyze, summarize, snap, Mesh, TOL
 from sizing import guess_size
 from build import build_faces, sew, features_near
+from bodies import split_bodies
 
 
 def count(shape, kind):
@@ -202,20 +203,9 @@ def attempt(mesh, features, mesh_tol, tol, fuse, faceted_volume):
     return (shape, nb, nv), []
 
 
-def stl_to_solid(path, tol, fuse=True, curves=True, true_size=False):
-    pts, tris = load_stl(path)
-    info = {"triangles": len(tris), "restored": [], "skipped": [], "size": None, "snapped": 0}
-    if curves:
-        mesh, features, mesh_tol = analyze(pts, tris)
-        info["size"] = guess = guess_size(mesh, features)
-        round_unit = None
-        if true_size and guess is not None:
-            round_unit = guess.unit
-            if guess.factor != 1.0:
-                mesh, features, mesh_tol = analyze(pts * guess.factor, tris)
-        info["snapped"] = snap(mesh, features, round_unit)
-    else:
-        mesh, features, mesh_tol = Mesh(pts, tris), [], TOL
+def _build(mesh, features, mesh_tol, tol, fuse, info):
+    """Build and check one group of bodies, leaving faceted any feature that spoils it.
+    Returns (shape, bodies, cavities)."""
     faceted_volume = mesh_volume(mesh)
 
     def good(subset):
@@ -253,8 +243,36 @@ def stl_to_solid(path, tol, fuse=True, curves=True, true_size=False):
             result, used = good([])
     if result is None:
         raise RuntimeError("could not build a closed solid from this mesh")
-    shape, nb, nv = result
-    info["restored"] = used
+    info["restored"] += used
+    return result
+
+
+def stl_to_solid(path, tol, fuse=True, curves=True, true_size=False):
+    pts, tris = load_stl(path)
+    info = {"triangles": len(tris), "restored": [], "skipped": [], "size": None, "snapped": 0}
+    groups = split_bodies(pts, tris)          # bodies touching at an edge are built apart
+    if curves:
+        parts = [analyze(pts, g) for g in groups]
+        info["size"] = guess = guess_size([p[:2] for p in parts])
+        round_unit = None
+        if true_size and guess is not None:
+            round_unit = guess.unit
+            if guess.factor != 1.0:
+                parts = [analyze(pts * guess.factor, g) for g in groups]
+        for mesh, features, _ in parts:
+            info["snapped"] += snap(mesh, features, round_unit)
+    else:
+        parts = [(Mesh(pts, g), [], TOL) for g in groups]
+    shapes, nb, nv = [], 0, 0
+    for mesh, features, mesh_tol in parts:
+        shape, b, v = _build(mesh, features, mesh_tol, tol, fuse, info)
+        shapes.append(shape)
+        nb, nv = nb + b, nv + v
+    shape = shapes[0]
+    if len(shapes) > 1:
+        # bodies that met at an edge were built apart; join them now
+        shape = boolean(BRepAlgoAPI_Fuse, shapes[:1], shapes[1:]) if fuse else compound(shapes)
+        nb = count(shape, TopAbs_SOLID)
 
     unify = ShapeUpgrade_UnifySameDomain(shape, True, False, False)  # merge edges only
     unify.Build()
