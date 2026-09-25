@@ -582,8 +582,18 @@ def _seed_candidates(mesh, region, i, j):
     near = [i, j] + [k for k in region.nbrs[i] + region.nbrs[j] if region.free[k]]
     near_pts = region.points(near)
     found = []
-    d = mesh.shared_direction(region.facets[i], region.facets[j])
-    if d is not None:
+    # The cylinder's axis: along the edge the two facets share (a strip cut straight
+    # across), or square to both their normals (every facet of a cylinder faces straight
+    # out from the axis, however the strip is cut into triangles).
+    axes = [mesh.shared_direction(region.facets[i], region.facets[j])]
+    cross = np.cross(region.n[i], region.n[j])
+    if np.linalg.norm(cross) > math.sin(math.radians(1)):
+        cross /= np.linalg.norm(cross)
+        if axes[0] is None or abs(cross @ axes[0]) < math.cos(math.radians(0.5)):
+            axes.append(cross)
+    for d in axes:
+        if d is None:
+            continue
         cyl = _cylinder(d, P)
         if _fits(cyl, P):
             found.append(_candidate(mesh, region, cyl, [i, j]))
@@ -594,6 +604,16 @@ def _seed_candidates(mesh, region, i, j):
             if _fits(cone, pts):
                 found.append(_candidate(mesh, region, cone, [i, j, k]))
             break
+    if not any(found) and len(near) >= 3:
+        # Irregular triangles (a round whose edges run at different heights) fool both
+        # quick guesses: estimate the axis from the whole neighbourhood's normals and
+        # let a least-squares fit through the corners settle it.
+        axis = np.linalg.svd(region.n[near])[2][2]
+        cyl = _cylinder(axis, near_pts)
+        if cyl is not None:
+            cyl = _tube_fit(near_pts, cyl)
+            if _fits(cyl, near_pts) and cyl.line[0] < 1e3:
+                found.append(_candidate(mesh, region, cyl, [i, j]))
     # The same axis may carry a torus or sphere that explains more than one ring of facets.
     for c in [c for c in found if c]:
         ring = _on_axis((c[0].model.a, c[0].model.d), near_pts)
@@ -639,7 +659,7 @@ def analyze(pts, tris):
     done = []
     while True:
         # each round only tries the axes found since the last one
-        axes = [x for x in _distinct_axes(features)
+        axes = [x for x in _distinct_axes(features, mesh)
                 if not any(abs(x[1] @ d) > math.cos(math.radians(0.5))
                            and np.linalg.norm(np.cross(x[0] - a, d)) < TOL * 4 for a, d, _ in done)]
         if not axes:
@@ -667,36 +687,58 @@ def analyze(pts, tris):
     return mesh, _merge_same_surface(mesh, features), _mesh_tol
 
 
-def _tube_fit(P, model):
-    """Least-squares torus (or cylinder) through points P, starting from `model`."""
-    from scipy.optimize import least_squares
-    if model.line:
-        a, d, r = model.a, model.d, model.line[0]
-        x0 = np.r_[a, d, r]
+def _tube_fit(P, model, steps=30):
+    """Least-squares torus (or cylinder) through points P, starting from `model`.
 
-        def res(x):
-            d = x[3:6] / np.linalg.norm(x[3:6])
-            v = P - x[:3]
-            return np.linalg.norm(v - np.outer(v @ d, d), axis=1) - x[6]
-    else:
+    Gauss-Newton on the fewest parameters: the axis tilted by two small angles, the
+    centre moved across it (and along it for a torus), and the radii.
+    """
+    torus = not model.line
+    d0, e1, e2 = _frame(model.d)
+    if torus:
         rc, zc, r = model.circle
-        x0 = np.r_[model.a + zc * model.d, model.d, rc, r]
+        c0, x = model.a + zc * d0, np.array([0, 0, 0, 0, 0, rc, r], float)
+    else:
+        c0, x = model.a, np.array([0, 0, 0, 0, model.line[0]], float)
 
-        def res(x):
-            d = x[3:6] / np.linalg.norm(x[3:6])
-            v = P - x[:3]
-            z = v @ d
-            rho = np.linalg.norm(v - np.outer(z, d), axis=1)
-            return np.hypot(rho - x[6], z) - x[7]
-    try:
-        x = least_squares(res, x0, x_scale="jac").x
-    except Exception:
+    def res(x):
+        d = d0 + x[0] * e1 + x[1] * e2
+        d /= np.linalg.norm(d)
+        c = c0 + x[2] * e1 + x[3] * e2 + (x[4] * d0 if torus else 0)
+        v = P - c
+        z = v @ d
+        rho = np.linalg.norm(v - np.outer(z, d), axis=1)
+        return np.hypot(rho - x[5], z) - x[6] if torus else rho - x[4]
+
+    f = res(x)
+    for _ in range(steps):
+        J = np.empty((len(P), len(x)))
+        for k in range(len(x)):
+            h = 1e-7 * max(1.0, abs(x[k]))
+            dx = x.copy()
+            dx[k] += h
+            J[:, k] = (res(dx) - f) / h
+        step = np.linalg.lstsq(J, -f, rcond=None)[0]
+        x2 = x + step
+        f2 = res(x2)
+        while f2 @ f2 > f @ f and np.abs(step).max() > 1e-14:
+            step /= 2
+            x2 = x + step
+            f2 = res(x2)
+        if f2 @ f2 > f @ f:
+            break
+        x, f = x2, f2
+        if np.abs(step).max() < 1e-12:
+            break
+    if not np.all(np.isfinite(x)):
         return None
-    d = x[3:6] / np.linalg.norm(x[3:6])
-    if model.line:
-        return Revolved(x[:3], d, line=(abs(x[6]), 0))
-    c = x[:3]
-    return Revolved(c, d, circle=(abs(x[6]), float(c @ d), abs(x[7])))
+    d = d0 + x[0] * e1 + x[1] * e2
+    d /= np.linalg.norm(d)
+    c = c0 + x[2] * e1 + x[3] * e2
+    if torus:
+        c = c + x[4] * d0
+        return Revolved(c, d, circle=(abs(x[5]), float(c @ d), abs(x[6])))
+    return Revolved(c, d, line=(abs(x[4]), 0))
 
 
 def _band_tori(mesh, regions, features):
@@ -845,7 +887,7 @@ def _band_tori(mesh, regions, features):
 def _loose_pass(mesh, regions, features):
     """Pass 3: whatever curved facets are left, accept any surface that explains them."""
     global _loose
-    axes = _distinct_axes(features)
+    axes = _distinct_axes(features, mesh)
     found_all = []
     _loose = True
     try:
@@ -1043,21 +1085,36 @@ def _merge_same_surface(mesh, features):
     return features
 
 
-def _distinct_axes(features):
+def _distinct_axes(features, mesh=None):
     """[(point, direction, reach)]: each distinct axis, and how far from it a neighbouring
-    rounded edge could plausibly lie (a few times the largest radius on that axis)."""
-    axes = []
+    rounded edge could plausibly lie (a few times the largest radius on that axis).
+
+    A dome or ball contributes an axis through its centre square to each flat face it
+    borders: a rounded edge between the two is a torus on that axis."""
+    found = []
     for f in features:
         m = f.model
-        if not isinstance(m, Revolved):
-            continue
-        size = m.line[0] + abs(m.line[1]) * 10 if m.line else m.circle[0] + m.circle[2]
-        for k, (a, d, reach) in enumerate(axes):
-            if abs(m.d @ d) > math.cos(math.radians(0.5)) and np.linalg.norm(np.cross(m.a - a, d)) < TOL * 4:
-                axes[k] = (a, d, max(reach, 2 * size + 3))
+        if isinstance(m, Revolved):
+            size = m.line[0] + abs(m.line[1]) * 10 if m.line else m.circle[0] + m.circle[2]
+            found.append((m.a, m.d, size))
+        elif isinstance(m, Sphere) and mesh is not None:
+            inside = set(f.facets.tolist())
+            P = mesh.pts[np.unique(np.concatenate([mesh.fverts[x] for x in f.facets]))]
+            if np.ptp(P, axis=0).max() < m.r:
+                continue                      # a small piece of something else
+            border = {g for x in f.facets for g in mesh.nbrs[x] if g not in inside}
+            big = [g for g in border if mesh.farea[g] > 0.05 * m.r * m.r]
+            for g in big:
+                found.append((m.c, mesh.fn[g], m.r))
+    axes = []
+    for a, d, size in found:
+        a = a - (a @ d) * d
+        for k, (b, e, reach) in enumerate(axes):
+            if abs(d @ e) > math.cos(math.radians(0.5)) and np.linalg.norm(np.cross(a - b, e)) < TOL * 4:
+                axes[k] = (b, e, max(reach, 2 * size + 3))
                 break
         else:
-            axes.append((m.a, m.d, 2 * size + 3))
+            axes.append((a, d, 2 * size + 3))
     return axes
 
 
