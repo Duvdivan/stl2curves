@@ -18,6 +18,7 @@ from OCP.BRepPrimAPI import BRepPrimAPI_MakeRevol, BRepPrimAPI_MakeSphere, BRepP
 from OCP.BRepAlgoAPI import BRepAlgoAPI_Common, BRepAlgoAPI_Splitter
 from OCP.BRepExtrema import BRepExtrema_DistShapeShape
 from OCP.BRepCheck import BRepCheck_Analyzer
+from OCP.BRepAdaptor import BRepAdaptor_Curve
 from OCP.BRepGProp import BRepGProp
 from OCP.GProp import GProp_GProps
 from OCP.GeomAPI import GeomAPI_Interpolate
@@ -620,16 +621,37 @@ def build_faces(mesh, features, tol):
 
 
 def sew(shape, tol, shells=()):
-    """Sew the faces into shells; closed shells made elsewhere (whole spheres) are added as they are."""
+    """Sew the faces into shells; closed shells made elsewhere (whole spheres) are added as
+    they are. Returns (shape, midpoints of the edges left unmatched)."""
     s = BRepBuilderAPI_Sewing(tol)
     s.Add(shape)
     s.Perform()
+    free = []
+    for i in range(1, s.NbFreeEdges() + 1):
+        c = BRepAdaptor_Curve(s.FreeEdge(i))
+        p = c.Value((c.FirstParameter() + c.LastParameter()) / 2)
+        free.append((p.X(), p.Y(), p.Z()))
     if not shells:
-        return s.SewedShape(), s.NbFreeEdges()
+        return s.SewedShape(), free
     comp = TopoDS_Compound()
     builder = BRep_Builder()
     builder.MakeCompound(comp)
     builder.Add(comp, s.SewedShape())
     for shell in shells:
         builder.Add(comp, shell)
-    return comp, s.NbFreeEdges()
+    return comp, free
+
+
+def features_near(mesh, features, points, reach=0.5):
+    """Indices of the features whose facets come within `reach` mm of any of the points."""
+    if not points:
+        return []
+    points = np.asarray(points)
+    out = []
+    for k, f in enumerate(features):
+        P = mesh.pts[np.unique(np.concatenate([mesh.fverts[x] for x in f.facets]))]
+        lo, hi = P.min(axis=0) - reach, P.max(axis=0) + reach
+        near = points[np.all((points >= lo) & (points <= hi), axis=1)]
+        if len(near) and (np.linalg.norm(near[:, None] - P[None], axis=2).min() <= reach):
+            out.append(k)
+    return out

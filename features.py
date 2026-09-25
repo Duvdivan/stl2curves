@@ -636,10 +636,15 @@ def analyze(pts, tris):
     # Pass 2: tori (and anything missed) around the axes of the patches found so far.
     # A curved rounded edge always shares its axis with a neighbouring hole, pin or
     # rounded corner, so each new patch can unlock its neighbours.
-    tried = 0
-    while tried < len(features):
-        axes = _distinct_axes(features)
-        tried = len(features)
+    done = []
+    while True:
+        # each round only tries the axes found since the last one
+        axes = [x for x in _distinct_axes(features)
+                if not any(abs(x[1] @ d) > math.cos(math.radians(0.5))
+                           and np.linalg.norm(np.cross(x[0] - a, d)) < TOL * 4 for a, d, _ in done)]
+        if not axes:
+            break
+        done += axes
         for region in regions:
             region.explored[:] = False
             for i in range(len(region.facets)):
@@ -648,7 +653,7 @@ def analyze(pts, tris):
                     continue
                 pts = region.points(near)
                 found = []
-                for axis in axes:
+                for axis in _near(axes, pts):
                     model = _on_axis(axis, pts)
                     if _fits(model, pts):
                         found.append(_candidate(mesh, region, model, [i], axis_fixed=True))
@@ -658,7 +663,99 @@ def analyze(pts, tris):
                     region.free[idx] = False
                     features.append(feature)
     features += _loose_pass(mesh, regions, features)
+    features = _band_tori(mesh, regions, features)
     return mesh, _merge_same_surface(mesh, features), _mesh_tol
+
+
+def _band_tori(mesh, regions, features):
+    """Replace chains of short cylinder strips by the torus they approximate.
+
+    A rounded edge that follows a curve, with no neighbouring hole or pin to supply
+    its axis, comes out of the permissive pass as a chain of short cylinders of equal
+    radius. Each strip's axis is a tangent of the torus's centre circle, so a circle
+    through points on those axes gives the torus (the idea of the stlToSolid project).
+    """
+    global _loose
+
+    def is_band(f):
+        m = f.model
+        if not (isinstance(m, Revolved) and m.line and m.line[1] == 0 and f.span < TWO_PI):
+            return False
+        return f.hi - f.lo <= 4 * m.line[0]
+
+    bands = [k for k, f in enumerate(features) if is_band(f)]
+    if len(bands) < 3:
+        return features
+    verts = {k: set(np.concatenate([mesh.fverts[x] for x in features[k].facets]).tolist()) for k in bands}
+    link = {k: [] for k in bands}
+    for i, a in enumerate(bands):
+        for b in bands[i + 1:]:
+            ma, mb = features[a].model, features[b].model
+            ra, rb = ma.line[0], mb.line[0]
+            turn = abs(ma.d @ mb.d)
+            if (abs(ra - rb) <= max(0.1 * ra, 2 * _tol()) and math.cos(math.radians(60)) <= turn
+                    <= math.cos(math.radians(0.5)) and verts[a] & verts[b]):
+                link[a].append(b)
+                link[b].append(a)
+    region_of = {}
+    for region in regions:
+        for pos, f in enumerate(region.facets):
+            region_of[int(f)] = (region, pos)
+
+    drop, added, seen = set(), [], set()
+    for start in bands:
+        if start in seen:
+            continue
+        chain, stack = [], [start]
+        seen.add(start)
+        while stack:
+            k = stack.pop()
+            chain.append(k)
+            for j in link[k]:
+                if j not in seen:
+                    seen.add(j)
+                    stack.append(j)
+        if len(chain) < 3:
+            continue
+        # a point on each strip's axis, level with the middle of the strip
+        centres = []
+        for k in chain:
+            m, f = features[k].model, features[k]
+            centres.append(m.a + (f.lo + f.hi) / 2 * m.d)
+        centres = np.array(centres)
+        mid = centres.mean(axis=0)
+        normal = np.linalg.svd(centres - mid)[2][2]
+        _, e1, e2 = _frame(normal)
+        c = _circle2d((centres - mid) @ e1, (centres - mid) @ e2)
+        if c is None:
+            continue
+        centre = mid + c[0] * e1 + c[1] * e2
+        r = float(np.mean([features[k].model.line[0] for k in chain]))
+        torus = Revolved(centre, normal, circle=(c[2], float(centre @ normal / np.linalg.norm(normal)), r))
+        # free the strips and regrow the area as one torus
+        facets = np.concatenate([features[k].facets for k in chain])
+        if int(facets[0]) not in region_of:
+            continue
+        region, seed = region_of[int(facets[0])]
+        positions = [region_of[int(f)][1] for f in facets if int(f) in region_of and region_of[int(f)][0] is region]
+        region.free[positions] = True
+        _loose = True
+        try:
+            got = _candidate(mesh, region, torus, [seed], axis_fixed=True)
+        finally:
+            _loose = False
+        area = float(mesh.farea[facets].sum())
+        if got and got[0].model.kind == "torus" and got[2] >= 0.9 * area:
+            feature, idx, _ = got
+            region.free[positions] = True
+            region.free[idx] = False
+            drop.update(chain)
+            added.append(feature)
+        else:
+            region.free[positions] = False
+    if not added:
+        return features
+    return [f for k, f in enumerate(features) if k not in drop] + added
 
 
 def _loose_pass(mesh, regions, features):
@@ -677,7 +774,7 @@ def _loose_pass(mesh, regions, features):
                     found = [_seed_candidates(mesh, region, i, j)]
                     near = [i, j] + [k for k in region.nbrs[i] + region.nbrs[j] if region.free[k]]
                     pts = region.points(near)
-                    for axis in axes:
+                    for axis in _near(axes, pts):
                         m = _on_axis(axis, pts)
                         if _fits(m, pts):
                             found.append(_candidate(mesh, region, m, [i, j], axis_fixed=True))
@@ -698,6 +795,137 @@ def _simple_outline(mesh, fids):
     uniq, counts = np.unique(_edges(T), axis=0, return_counts=True)
     rim = uniq[counts == 1].ravel()
     return len(rim) == 0 or np.bincount(rim).max() <= 2
+
+
+# ---------------------------------------------------------------- snapping
+
+def _circle_fixed_r(x, y, r, cx, cy):
+    """Centre of the radius-r circle best fitting points (x, y), starting from (cx, cy)."""
+    for _ in range(30):
+        dx, dy = x - cx, y - cy
+        d = np.maximum(np.hypot(dx, dy), 1e-12)
+        step = np.linalg.lstsq(np.c_[-dx / d, -dy / d], -(d - r), rcond=None)[0]
+        cx, cy = cx + step[0], cy + step[1]
+        if np.abs(step).max() < 1e-13:
+            break
+    return cx, cy
+
+
+def _with_radius(model, P, r):
+    """The same kind of surface with radius r, repositioned to fit points P best."""
+    if isinstance(model, Sphere):
+        c = model.c
+        for _ in range(30):
+            v = P - c
+            d = np.maximum(np.linalg.norm(v, axis=1), 1e-12)
+            step = np.linalg.lstsq(-v / d[:, None], -(d - r), rcond=None)[0]
+            c = c + step
+            if np.abs(step).max() < 1e-13:
+                break
+        return Sphere(c, r)
+    if model.line and model.line[1] == 0:           # cylinder: keep the direction
+        x, y = P @ model.e1, P @ model.e2
+        cx, cy = _circle_fixed_r(x, y, r, model.a @ model.e1, model.a @ model.e2)
+        return Revolved(cx * model.e1 + cy * model.e2, model.d, line=(r, 0))
+    if model.circle:                                # torus or cap: keep the axis
+        rho, z, _ = model.local(P)
+        rc, zc, _ = model.circle
+        if rc == 0:                                 # sphere cap: slide the centre along the axis
+            for _ in range(30):
+                d = np.maximum(np.hypot(rho, z - zc), 1e-12)
+                J = (-(z - zc) / d)[:, None]
+                step = float(np.linalg.lstsq(J, -(d - r), rcond=None)[0][0])
+                zc += step
+                if abs(step) < 1e-13:
+                    break
+            return Revolved(model.a, model.d, circle=(0.0, zc, r))
+        rc, zc = _circle_fixed_r(rho, z, r, rc, zc)
+        return Revolved(model.a, model.d, circle=(rc, zc, r))
+    return None
+
+
+def _radius(model):
+    if isinstance(model, Sphere):
+        return model.r
+    if model.line:
+        return model.line[0] if model.line[1] == 0 else None
+    return model.circle[2]
+
+
+def _rebuilt(mesh, feature, model):
+    """The feature on a new surface, if that surface still explains its facets."""
+    global _loose
+    for loose in (False, True):
+        _loose = loose
+        try:
+            f = _feature(mesh, model, feature.facets, feature.convex)
+        finally:
+            _loose = False
+        if f is not None:
+            return f
+    return None
+
+
+def snap(mesh, features, round_unit=None):
+    """Design intent: equal radii made exactly equal, near-axis-aligned axes made exact,
+    and (with round_unit "mm" or "inch") radii set to round values. Each change is kept
+    only if the patch's mesh corners still lie on the surface; otherwise it is undone."""
+    from sizing import roundness, INCH
+    tol = 2 * _tol()
+    points = [mesh.pts[np.unique(np.concatenate([mesh.fverts[f] for f in x.facets]))] for x in features]
+    changed = 0
+
+    def fits(model, P):
+        return model is not None and np.abs(model.signed(P)).max() <= tol
+
+    # axes within a hair of X, Y or Z become exactly X, Y or Z
+    for k, f in enumerate(features):
+        m = f.model
+        if not isinstance(m, Revolved):
+            continue
+        axis = np.eye(3)[np.argmax(np.abs(m.d))] * np.sign(m.d[np.argmax(np.abs(m.d))])
+        if abs(m.d @ axis) >= 1 - 1e-12 or abs(m.d @ axis) < math.cos(math.radians(0.1)):
+            continue
+        if m.line and m.line[1] == 0:
+            new = _cylinder(axis, points[k])
+            new = _with_radius(new, points[k], m.line[0]) if new else None
+        else:
+            new = Revolved(m.a, axis, line=m.line, circle=m.circle)
+        if fits(new, points[k]):
+            g = _rebuilt(mesh, f, new)
+            if g:
+                features[k], changed = g, changed + 1
+
+    # radii: group equal ones, then optionally round the group's value
+    radii = [(k, _radius(f.model)) for k, f in enumerate(features)]
+    radii = sorted([(r, k) for k, r in radii if r], key=lambda x: x[0])
+    groups, current = [], []
+    for r, k in radii:
+        if current and r - current[-1][0] > 2e-3 * r:
+            groups.append(current)
+            current = []
+        current.append((r, k))
+    if current:
+        groups.append(current)
+    for group in groups:
+        weights = np.array([mesh.farea[features[k].facets].sum() for _, k in group])
+        target = float(np.average([r for r, _ in group], weights=weights))
+        if round_unit:
+            scale = INCH if round_unit == "inch" else 1.0
+            for step in ((1 / 16, 0.05, 1 / 64, 0.01) if round_unit == "inch" else (0.5, 0.1)):
+                nice = round(target / scale / step) * step * scale
+                if nice > 0 and roundness(nice, round_unit) and abs(nice - target) <= 2e-3 * target:
+                    target = nice
+                    break
+        for r, k in group:
+            if r == target:
+                continue
+            new = _with_radius(features[k].model, points[k], target)
+            if fits(new, points[k]):
+                g = _rebuilt(mesh, features[k], new)
+                if g:
+                    features[k], changed = g, changed + 1
+    return changed
 
 
 def _merge_same_surface(mesh, features):
@@ -732,15 +960,27 @@ def _merge_same_surface(mesh, features):
 
 
 def _distinct_axes(features):
+    """[(point, direction, reach)]: each distinct axis, and how far from it a neighbouring
+    rounded edge could plausibly lie (a few times the largest radius on that axis)."""
     axes = []
     for f in features:
         m = f.model
         if not isinstance(m, Revolved):
             continue
-        if not any(abs(m.d @ d) > math.cos(math.radians(0.5)) and
-                   np.linalg.norm(np.cross(m.a - a, d)) < TOL * 4 for a, d in axes):
-            axes.append((m.a, m.d))
+        size = m.line[0] + abs(m.line[1]) * 10 if m.line else m.circle[0] + m.circle[2]
+        for k, (a, d, reach) in enumerate(axes):
+            if abs(m.d @ d) > math.cos(math.radians(0.5)) and np.linalg.norm(np.cross(m.a - a, d)) < TOL * 4:
+                axes[k] = (a, d, max(reach, 2 * size + 3))
+                break
+        else:
+            axes.append((m.a, m.d, 2 * size + 3))
     return axes
+
+
+def _near(axes, pts):
+    """Only the axes that pass close enough to these points to matter."""
+    c = pts.mean(axis=0)
+    return [(a, d) for a, d, reach in axes if np.linalg.norm(np.cross(c - a, d)) <= reach]
 
 
 # ---------------------------------------------------------------- features
@@ -748,6 +988,8 @@ def _distinct_axes(features):
 def _arc(angles, min_points=6):
     """(start, span) of the arc covered by a set of angles; span 2*pi for a full ring."""
     a = np.sort(np.mod(angles, TWO_PI))
+    if len(a) < 2:
+        return None
     a = a[np.r_[True, np.diff(a) > 1e-6]]   # merge repeats (the same angle on several rings)
     if len(a) < 2:
         return None

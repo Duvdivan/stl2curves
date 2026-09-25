@@ -37,6 +37,7 @@ python stl2curves.py part.stl                    # -> part.step next to it
 python stl2curves.py some_folder --out STEP      # every .stl in a folder
 python stl2curves.py a.stl b.stl --merge all     # also one combined STEP
 python stl2curves.py part.stl --details          # list every rebuilt feature
+python stl2curves.py part.stl --true-size        # rebuild at the apparent design size
 python render.py part.step                       # PNG preview coloured by surface type
 ```
 
@@ -46,6 +47,17 @@ On Windows, `stl2curves.bat` accepts drag-and-drop (or put a shortcut to it in
 Options: `--tol` sewing tolerance (mm), `--no-fuse` keep overlapping bodies separate,
 `--no-curves` flat faces only.
 
+### Design size
+
+People design with round numbers (a 5 mm hole, a 0.5 mm fillet, a 1/4" slot), but an
+STL is often off by one overall factor: scaled to 99% in a slicer for fit, exported in
+inches or centimetres, and so on. Every conversion reports the size the part appears to
+have been designed at: the single scale factor that turns the most of its radii and
+wall thicknesses into round numbers (0.5 mm or 0.1 mm steps, 1/16" for inch designs),
+e.g. `looks scaled to 99% (x1.01 gives round mm: 0.495 -> 0.5, 2.97 -> 3 ...)`.
+`--true-size` rebuilds the part at that size with radii snapped to the round values.
+Without it the size is left alone (a slight scale is often deliberate, for fit).
+
 ## How it works
 
 1. **Facets** — triangles are grouped into flat facets (coplanar pieces).
@@ -53,13 +65,18 @@ Options: `--tol` sewing tolerance (mm), `--no-fuse` keep overlapping bodies sepa
    cone, sphere; tori on axes already found), which is grown while mesh corners stay
    within a micron of it. Strict passes first (a patch must follow its surface's natural
    boundary lines, or meet its neighbours at creases), then a permissive pass for what
-   is left, then neighbouring patches on the same surface are merged.
+   is left, then neighbouring patches on the same surface are merged, chains of short
+   cylinder strips are replaced by the torus they approximate, and equal radii and
+   near-axis-aligned axes are snapped to exact values (each snap kept only if the patch
+   still lies on the mesh).
 3. **Build** (`build.py`) — one exact face per patch and one planar face per flat
    area, with shared edges (exact lines/arcs where a patch's boundary follows its
    natural lines, splines through the mesh points otherwise), sewn into a solid.
 4. **Checks** — every result must be a valid closed solid whose volume matches the
    mesh plus the predicted change from the curves; features that fail are left
-   faceted instead of spoiling the part.
+   faceted instead of spoiling the part. Patches next to gaps left by sewing are
+   dropped individually; if the volume check fails, the feature list is halved to
+   find the culprits.
 
 ## Tests
 
@@ -73,7 +90,8 @@ design (volume, validity, face count).
 
 ## Credits
 
-The permissive final pass and the outline-polygon fallback face builder follow ideas
+The permissive final pass, the outline-polygon fallback face builder, torus-from-strips
+and radius/axis snapping follow ideas
 from [stlToSolid](https://github.com/Crypto69/stlToSolid) (no code copied). Built on
 [OpenCascade](https://dev.opencascade.org/) via
 [cadquery-ocp](https://pypi.org/project/cadquery-ocp/).

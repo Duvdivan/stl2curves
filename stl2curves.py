@@ -24,6 +24,9 @@ Usage:
   --tol X          sewing tolerance in mm (default 0.01)
   --no-fuse        keep overlapping bodies within one STL as separate bodies
   --no-curves      skip curve detection (leave everything faceted)
+  --true-size      rebuild at the size the part appears to have been designed at
+                   (undoing e.g. a 99% slicer scale or an inch/cm export), with radii
+                   snapped to round values
   --details        list every rebuilt feature with its size
 """
 import argparse
@@ -50,8 +53,9 @@ from OCP.IFSelect import IFSelect_RetDone
 from OCP.BRepAlgoAPI import BRepAlgoAPI_Fuse
 from OCP.collections import List_TopoDS_Shape
 
-from features import load_stl, analyze, summarize, Mesh, TOL
-from build import build_faces, sew
+from features import load_stl, analyze, summarize, snap, Mesh, TOL
+from sizing import guess_size
+from build import build_faces, sew, features_near
 
 
 def count(shape, kind):
@@ -112,6 +116,12 @@ def solids_from_shells(sewn, fuse):
     while ex.More():
         shell = TopoDS.Shell(ex.Current())
         solid = fixed(BRepBuilderAPI_MakeSolid(shell).Solid())   # oriented outwards
+        if solid.ShapeType() != TopAbs_SOLID:
+            ex2 = TopExp_Explorer(solid, TopAbs_SOLID)
+            if not ex2.More():
+                ex.Next()
+                continue                    # not a closed piece: ignore it
+            solid = TopoDS.Solid(ex2.Current())
         v = volume(solid)
         if v < 0:
             solid = TopoDS.Solid(solid.Reversed())
@@ -179,7 +189,8 @@ def attempt(mesh, features, mesh_tol, tol, fuse, faceted_volume):
     worst = max((f.worst for f in features), default=0.0)
     sewn, free = sew(comp, max(tol, min(0.2, 1.5 * worst)), shells)
     if free:
-        return None, []
+        # patches whose faces left gaps: drop just those and try again
+        return None, features_near(mesh, features, free) or []
     try:
         shape, nb, nv, signed = solids_from_shells(sewn, fuse)
     except RuntimeError:
@@ -191,14 +202,21 @@ def attempt(mesh, features, mesh_tol, tol, fuse, faceted_volume):
     return (shape, nb, nv), []
 
 
-def stl_to_solid(path, tol, fuse=True, curves=True):
+def stl_to_solid(path, tol, fuse=True, curves=True, true_size=False):
     pts, tris = load_stl(path)
+    info = {"triangles": len(tris), "restored": [], "skipped": [], "size": None, "snapped": 0}
     if curves:
         mesh, features, mesh_tol = analyze(pts, tris)
+        info["size"] = guess = guess_size(mesh, features)
+        round_unit = None
+        if true_size and guess is not None:
+            round_unit = guess.unit
+            if guess.factor != 1.0:
+                mesh, features, mesh_tol = analyze(pts * guess.factor, tris)
+        info["snapped"] = snap(mesh, features, round_unit)
     else:
         mesh, features, mesh_tol = Mesh(pts, tris), [], TOL
     faceted_volume = mesh_volume(mesh)
-    info = {"triangles": len(mesh.tris), "restored": [], "skipped": []}
 
     def good(subset):
         result, failed = attempt(mesh, subset, mesh_tol, tol, fuse, faceted_volume)
@@ -295,6 +313,8 @@ def main():
     ap.add_argument("--no-curves", action="store_true",
                     help="don't rebuild curved areas as true curves")
     ap.add_argument("--details", action="store_true", help="list every rebuilt feature")
+    ap.add_argument("--true-size", action="store_true",
+                    help="rebuild at the apparent design size, with radii snapped to round values")
     args = ap.parse_args()
 
     files = []
@@ -307,7 +327,7 @@ def main():
     for f in files:
         t = time.time()
         print(f"{f.name}: converting...", flush=True)
-        shape, info = stl_to_solid(f, args.tol, not args.no_fuse, not args.no_curves)
+        shape, info = stl_to_solid(f, args.tol, not args.no_fuse, not args.no_curves, args.true_size)
         out_dir = Path(args.out) if args.out else f.parent
         out_dir.mkdir(parents=True, exist_ok=True)
         out = out_dir / (f.stem + ".step")
@@ -321,6 +341,11 @@ def main():
               f"{time.time() - t:.1f}s -> {out}")
         if info["restored"] or info["skipped"]:
             print(describe_features(info, args.details))
+        if info["size"] is not None:
+            note = info["size"].describe()
+            if args.true_size and info["size"].factor != 1.0:
+                note = note.split(" Use --true-size")[0] + " Rebuilt at that size."
+            print("  " + note)
 
     if args.merge:
         comp = compound(shapes)
