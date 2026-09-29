@@ -243,16 +243,15 @@ def attempt(mesh, features, mesh_tol, tol, fuse, faceted_volume):
 
 
 def _mesh_defective(mesh, tol, fuse):
-    """Is the mesh, built from bare facets, already not a valid solid (or not one with
-    the mesh's volume)? Sets mesh.bare_volume to the volume the bare facets give."""
+    """Is the mesh, built from bare facets, already not a valid solid? Sets
+    mesh.bare_volume to the volume the bare facets give."""
     if "defective" not in mesh.__dict__:
         comp, shells, _ = build_faces(mesh, [], TOL)
         sewn, free = sew(comp, tol, shells)
         mesh.bare_volume = None
         try:
             shape, _, _, mesh.bare_volume = solids_from_shells(sewn, fuse)
-            off = abs(mesh.bare_volume - mesh_volume(mesh)) > 1e-6 * abs(mesh_volume(mesh)) + 1e-3
-            mesh.defective = bool(free) or off or not BRepCheck_Analyzer(shape).IsValid()
+            mesh.defective = bool(free) or not BRepCheck_Analyzer(shape).IsValid()
         except RuntimeError:
             mesh.defective = True
     return mesh.defective
