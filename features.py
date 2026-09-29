@@ -573,8 +573,16 @@ def _candidate(mesh, region, model, seeds, axis_fixed=False):
 
 
 def _best(candidates):
+    """The candidate covering the most area; among those covering about as much, the one
+    fitting its facets far more closely (two rings of points lie on a cone and on a
+    sphere alike; only the true surface also runs close between them)."""
     found = [c for c in candidates if c]
-    return max(found, key=lambda c: c[2]) if found else None
+    if not found:
+        return None
+    best = max(found, key=lambda c: c[2])
+    close = [c for c in found if c[2] >= 0.99 * best[2]]
+    tight = min(close, key=lambda c: c[0].worst)
+    return tight if tight[0].worst < 0.5 * best[0].worst else best
 
 
 def _seed_candidates(mesh, region, i, j):
@@ -605,10 +613,12 @@ def _seed_candidates(mesh, region, i, j):
             if _fits(cone, pts):
                 found.append(_candidate(mesh, region, cone, [i, j, k]))
             break
-    if not any(found) and len(near) >= 3:
+    sv = np.linalg.svd(region.n[near], compute_uv=False) if len(near) >= 3 else None
+    if not any(found) and sv is not None and sv[2] <= 0.1 * sv[0]:
         # Irregular triangles (a round whose edges run at different heights) fool both
         # quick guesses: estimate the axis from the whole neighbourhood's normals and
-        # let a least-squares fit through the corners settle it.
+        # let a least-squares fit through the corners settle it. (Only where the normals
+        # all lie square to one direction, as on a cylinder; not on doubly curved areas.)
         axis = np.linalg.svd(region.n[near])[2][2]
         cyl = _cylinder(axis, near_pts)
         if cyl is not None:
@@ -1132,10 +1142,23 @@ def _distinct_axes(features, mesh=None):
     return axes
 
 
-def _near(axes, pts):
-    """Only the axes that pass close enough to these points to matter."""
-    c = pts.mean(axis=0)
-    return [(a, d) for a, d, reach in axes if np.linalg.norm(np.cross(c - a, d)) <= reach]
+def _near(axes, pts, most=6):
+    """Only the axes that pass close enough to these points to matter (the nearest few)."""
+    if not axes:
+        return []
+    key = id(axes)
+    if _near.cache.get("key") != key:
+        _near.cache = {"key": key, "A": np.array([a for a, _, _ in axes]),
+                       "D": np.array([d for _, d, _ in axes]), "R": np.array([r for _, _, r in axes]),
+                       "axes": axes}
+    c = _near.cache
+    dist = np.linalg.norm(np.cross(pts.mean(axis=0) - c["A"], c["D"]), axis=1)
+    ok = np.nonzero(dist <= c["R"])[0]
+    ok = ok[np.argsort(dist[ok])][:most]
+    return [(c["A"][k], c["D"][k]) for k in ok]
+
+
+_near.cache = {}
 
 
 # ---------------------------------------------------------------- features

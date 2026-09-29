@@ -4,11 +4,11 @@ Smooth blends: curved areas that no cylinder, cone, sphere or torus explains.
 Where fillets meet at a corner, or a fillet follows a spline-shaped edge, the mesh
 has a dense patch of small facets that detection either leaves flat or covers with
 small mismatched pieces. Each such area becomes one smooth freeform face instead:
-a surface fitted through the patch's mesh corners, kept tangent to the faces it
-rolls into, and trimmed to the patch's outline (shared exactly with its neighbours).
+an N-sided patch spanning the area's outline (shared exactly with its neighbours) and
+passing through its mesh corners.
 """
 import math
-from dataclasses import replace
+from collections import deque
 
 import numpy as np
 
@@ -18,6 +18,7 @@ SMOOTH_DEG = 50       # facets bending less than this meet smoothly
 SPREAD_DEG = 40       # one blend face turns at most this far from its first facet and its mean direction
 TANGENT_DEG = 35      # a neighbour this close in direction is rolled into tangentially
 MIN_BEND_DEG = 2      # an unrecognised facet must turn at least this far against a neighbour
+MAX_FACETS = 60       # a bigger smooth area is covered by several blends (each a manageable fit)
 CORNER_SIZE = 1.5     # mm: a blend no bigger across than this is a corner...
 CORNER_SPREAD_DEG = 85  # ...and may turn this far
 MAX_SPLITS = 2        # a blend whose face won't fit is cut in two, at most this many times over
@@ -130,15 +131,16 @@ def add_blends(mesh, features):
         seed_unit = unit(max(free, key=lambda a: mesh.farea[a]))
         seed_n = mesh.fn[seed_unit].T @ mesh.farea[seed_unit]
         seed_n = seed_n / np.linalg.norm(seed_n)
-        region, stack, normal = list(seed_unit), list(seed_unit), seed_n * mesh.farea[seed_unit].sum()
+        region, normal = list(seed_unit), seed_n * mesh.farea[seed_unit].sum()
+        stack = deque(seed_unit)        # breadth first: compact regions
         free.difference_update(seed_unit)
         while stack:
-            a = stack.pop()
+            a = stack.popleft()
             for b in mesh.nbrs[a]:
                 if b not in free or _bend(mesh, a, b) >= SMOOTH_DEG:
                     continue
                 u = unit(b)
-                if any(x not in free for x in u):
+                if any(x not in free for x in u) or len(region) + len(u) > MAX_FACETS:
                     continue
                 mean = normal / np.linalg.norm(normal)
                 turn = max(max(angle(mesh.fn[x], seed_n), angle(mesh.fn[x], mean)) for x in u)

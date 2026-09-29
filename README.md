@@ -69,8 +69,12 @@ Without it the size is left alone (a slight scale is often deliberate, for fit).
 2. **Detection** (`features.py`) — neighbouring facets propose a surface (cylinder,
    cone, sphere; tori on axes already found), which is grown while mesh corners stay
    within a micron of it. Strict passes first (a patch must follow its surface's natural
-   boundary lines, or meet its neighbours at creases), then a permissive pass for what
-   is left, then neighbouring patches on the same surface are merged, chains of short
+   boundary lines, or meet its neighbours at creases), then fillets between flat faces
+   (`fillets.py`: two faces meeting at an angle, rounded off, give a cylinder touching
+   both, so only the radius is unknown and every strip corner pins it down; this finds
+   fillets however coarsely or irregularly they were cut into triangles), then a
+   permissive pass for what is left, then neighbouring patches on the same surface are
+   merged, chains of short
    cylinder strips or sphere bits are replaced by the torus they approximate, and equal
    radii and near-axis-aligned axes are snapped to exact values (each snap kept only if
    the patch still lies on the mesh).
@@ -78,18 +82,26 @@ Without it the size is left alone (a slight scale is often deliberate, for fit).
    small pieces that only stand in for a surface they don't really fit) are grouped
    into regions that each turn no more than one smooth face can follow.
 4. **Build** (`build.py`) — one exact face per patch, one smooth N-sided patch per
-   blend (through the mesh corners, tangent to the faces it rolls into) and one planar
-   face per flat area, with shared edges (exact lines/arcs where a patch's boundary
+   blend (through the mesh corners; blends are built on their own first, a blend that
+   won't fit is cut in two and retried) and one planar face per flat area, with shared
+   edges (exact lines/arcs where a patch's boundary
    follows its natural lines, splines through the mesh points otherwise, split at sharp
    corners), sewn into a solid. Bodies that touch along an edge (`bodies.py`) are built
    separately and fused.
 5. **Checks** — every result must be a valid closed solid whose volume matches the
    mesh plus the predicted change from the curves; features that fail are left
    faceted instead of spoiling the part (a blend that fails gives back the pieces it
-   replaced). A blend must pass within 0.02 mm of every mesh corner and may not bulge
-   between them more than a smooth surface could. Patches next to gaps or invalid faces
-   left by sewing are dropped individually; if the volume check fails, the feature list
-   is halved to find the culprits.
+   replaced; an exact patch whose face can't be cut to shape is tried as a blend). A
+   blend must pass within 0.02 mm of every mesh corner and may not bow away from a facet
+   more than a circular arc through its corners would. Patches next to gaps or invalid
+   faces left by sewing are dropped individually (blends first, then the nearest patch);
+   if the volume check fails, the feature list is halved to find the culprits. A final
+   tidy-up is kept only if the solid is still valid.
+
+Limits: large freeform areas (organic shells, variable-radius rounds over big areas)
+mostly stay faceted: the smooth patch fitter manages small blends and corners, but not
+yet whole freeform surfaces. Such parts also convert slowly (tens of minutes at ~17k
+triangles).
 
 ## Tests
 

@@ -55,9 +55,9 @@ from OCP.collections import List_TopoDS_Shape
 
 from features import load_stl, analyze, summarize, snap, Mesh, TOL
 from sizing import guess_size
-from build import build_faces, sew, features_near
+from build import build_faces, sew, features_near, settle_blends
 from bodies import split_bodies
-from blends import add_blends, split as split_blend
+from blends import add_blends, split as split_blend, _blend as as_blend
 
 
 def count(shape, kind):
@@ -263,6 +263,7 @@ def _build(mesh, features, mesh_tol, tol, fuse, info):
     """Build and check one group of bodies, leaving faceted any feature that spoils it.
     Returns (shape, bodies, cavities)."""
     faceted_volume = mesh_volume(mesh)
+    features = settle_blends(mesh, features, mesh_tol, split_blend, info["skipped"])
 
     def good(subset):
         result, failed = attempt(mesh, subset, mesh_tol, tol, fuse, faceted_volume)
@@ -274,12 +275,22 @@ def _build(mesh, features, mesh_tol, tol, fuse, info):
             # that (or if it was only blamed), it gives back the pieces it replaced
             back = []
             for k in failed:
-                halves = None if attempt.blamed or subset[k].kind != "blend" else split_blend(mesh, subset[k])
+                f = subset[k]
+                if attempt.blamed:
+                    halves = None
+                elif f.kind == "blend":
+                    halves = split_blend(mesh, f)
+                else:
+                    # an exact surface whose face couldn't be built: try a smooth blend
+                    # over its facets rather than leaving them flat
+                    halves = [as_blend(mesh, f.facets, ())] if len(f.facets) >= 3 else None
                 if halves:
                     back += halves
+                    if f.kind != "blend":
+                        info["skipped"].append(f)
                 else:
-                    info["skipped"].append(subset[k])
-                    back += list(subset[k].parts)
+                    info["skipped"].append(f)
+                    back += list(f.parts)
             subset = [f for k, f in enumerate(subset) if k not in failed] + back
             result, failed = attempt(mesh, subset, mesh_tol, tol, fuse, faceted_volume)
         # A blend dropped for trouble nearby may have been innocent: once the part
@@ -352,11 +363,25 @@ def stl_to_solid(path, tol, fuse=True, curves=True, true_size=False, blends=True
         shape = boolean(BRepAlgoAPI_Fuse, shapes[:1], shapes[1:]) if fuse else compound(shapes)
         nb = count(shape, TopAbs_SOLID)
 
-    unify = ShapeUpgrade_UnifySameDomain(shape, True, False, False)  # merge edges only
-    unify.Build()
-    sf = ShapeFix_Shape(unify.Shape())
-    sf.Perform()
-    shape = sf.Shape()
+    # Tidy up (merge edges split along one line), but only keep the result if it is still
+    # a valid solid; otherwise hand over the checked shape as it was built
+    checked = shape
+    try:
+        unify = ShapeUpgrade_UnifySameDomain(shape, True, False, False)  # merge edges only
+        unify.Build()
+        sf = ShapeFix_Shape(unify.Shape())
+        sf.Perform()
+        shape = sf.Shape()
+    except Exception:
+        shape = checked
+    if not BRepCheck_Analyzer(shape).IsValid():
+        if BRepCheck_Analyzer(checked).IsValid():
+            shape = checked
+        else:
+            sf = ShapeFix_Shape(checked)
+            sf.Perform()
+            if BRepCheck_Analyzer(sf.Shape()).IsValid():
+                shape = sf.Shape()
 
     info["bodies"], info["voids"] = nb, nv
     info["faces"] = count(shape, TopAbs_FACE)

@@ -493,20 +493,61 @@ def _trimmed_face(feature, k, bound, mesh, owner, bounds, edge_tri, edges, tol):
     loops = _loops(tris)
     if not loops:
         return None
-    tools = []
+    tools, per_loop = [], []
     for loop in loops:
         tags = _loop_tags(mesh, loop, owner, bounds, edge_tri, patch=k)
         runs = [(tags[0], loop + [loop[0]])] if all(t == tags[0] for t in tags) else _runs(loop, tags)
+        per_loop.append([])
         for tag, run in _split_sharp(runs, mesh.pts):
             edge = _run_edge(edges, bounds, tag, run, patch_side=True)
             if edge is None:
                 return None
             tools.append(edge)
+            per_loop[-1].append(edge)
     base = _generous_surface(feature, bound, mesh)
     if base is None:
         return None
     face = _split_face(feature, mesh, base, tools, loops, tol)
+    if face is None:
+        face = _outline_face(feature, mesh, base, loops, per_loop)
     return face if face is not None else _polygon_face(feature, mesh, base, loops)
+
+
+def _outline_face(feature, mesh, base, loops, per_loop):
+    """Fallback: the patch's own outline edges (shared with its neighbours) laid on its
+    surface as wires, the face fitted to them by ShapeFix."""
+    surface = BRep_Tool.Surface_s(TopoDS.Face(TopExp_Explorer(base, TopAbs_FACE).Current()))
+    target = float(mesh.farea[feature.facets].sum())
+    normal = mesh.fn[feature.facets].T @ mesh.farea[feature.facets]
+    pts = mesh.pts
+    area = lambda loop: abs(sum(np.cross(pts[loop[i]], pts[loop[(i + 1) % len(loop)]]) @ normal
+                                for i in range(len(loop))))
+    order = sorted(range(len(loops)), key=lambda i: -area(loops[i]))
+    wires = []
+    for i in order:
+        w = BRepBuilderAPI_MakeWire()
+        for e in per_loop[i]:
+            w.Add(e)
+        if not w.IsDone():
+            return None
+        wires.append(w.Wire())
+    for flip in (False, True):
+        ws = [TopoDS.Wire(w.Reversed()) for w in wires] if flip else wires
+        maker = BRepBuilderAPI_MakeFace(surface, ws[0], False)
+        for w in ws[1:]:
+            maker.Add(w)
+        if not maker.IsDone():
+            continue
+        fix = ShapeFix_Face(maker.Face())
+        fix.Perform()
+        face = fix.Face()
+        if not BRepCheck_Analyzer(face).IsValid():
+            continue
+        props = GProp_GProps()
+        BRepGProp.SurfaceProperties_s(face, props)
+        if abs(props.Mass() - target) <= 0.05 * target + 1e-3:
+            return face
+    return None
 
 
 def _polygon_face(feature, mesh, base, loops):
@@ -619,10 +660,11 @@ def _repaired(face):
 
 # degree, points per boundary curve, iterations, anisotropy, 2d/3d/angular/curvature
 # tolerances, max degree, max segments
-USE_GUIDES = __import__("os").environ.get("S2C_GUIDES", "0") == "1"   # guide points past the outline: off (they pull against the real points where the neighbour is curved)
+USE_GUIDES = False   # guide points past the outline pull against the real points where the neighbour is curved
 BULGE_FACTOR = 1.0   # how far past a circular arc's sag a blend may bow over a facet
 FILL_SETTINGS = (3, 15, 2, False, 1e-5, 1e-4, 1e-2, 0.1, 8, 9)
 FINE_FILL_SETTINGS = (3, 30, 3, False, 1e-5, 1e-5, 1e-2, 0.1, 8, 20)
+FINE_BLENDS = 150       # a part with more blends than this is mostly freeform: skip the finer (slower) refits
 
 
 def _blend_face(feature, k, mesh, owner, bounds, edge_tri, edges):
@@ -694,7 +736,7 @@ def _blend_face(feature, k, mesh, owner, bounds, edge_tri, edges):
 
     # a quick patch first; if it follows its outline loosely, a finer (slower) one
     face = filled(FILL_SETTINGS)
-    if face is None or _edge_gap(face) > MAX_EDGE_GAP / 4:
+    if (face is None or _edge_gap(face) > MAX_EDGE_GAP / 4) and mesh.__dict__.get("blend_count", 0) <= FINE_BLENDS:
         finer = filled(FINE_FILL_SETTINGS)
         if finer is not None and (face is None or _edge_gap(finer) < _edge_gap(face)):
             face = finer
@@ -811,6 +853,7 @@ def _hugs_mesh(face, mesh, tids):
     nodes = np.array([[tri.Node(i).X(), tri.Node(i).Y(), tri.Node(i).Z()] for i in range(1, tri.NbNodes() + 1)])
     ft = np.array([[tri.Triangle(i).Value(j) for j in (1, 2, 3)] for i in range(1, tri.NbTriangles() + 1)]) - 1
     samples = np.vstack([nodes, nodes[ft].mean(axis=1)])
+    samples = samples[::max(1, len(samples) // 4000)]
     T = mesh.pts[mesh.tris[tids]]
     d, k = _point_triangle_distance(samples, T)
     # corner normals from the blend's own triangles only (averaging in a face across a
@@ -867,6 +910,41 @@ def _wedge_face(feature, bound, mesh):
             return None
         shape = common.Shape()
     return shape
+
+
+def settle_blends(mesh, features, tol, split, skipped):
+    """Build every blend's face on its own first (each depends only on its own outline),
+    cutting in two any that won't fit and giving back the pieces of any that can't be
+    cut further, so the whole part is then built and sewn just once or twice."""
+    features = list(features)
+    mesh.blend_count = sum(f.kind == "blend" for f in features)
+    for _ in range(4):
+        owner = np.full(len(mesh.fn), -1)
+        for k, f in enumerate(features):
+            owner[f.facets] = k
+        bounds = [Boundary(f, 10 * tol) for f in features]
+        edge_tri = {}
+        for t, (a, b, c) in enumerate(mesh.tris):
+            edge_tri[(a, b)] = t
+            edge_tri[(b, c)] = t
+            edge_tri[(c, a)] = t
+        edges = Edges(mesh.pts)
+        out, changed = [], False
+        for k, f in enumerate(features):
+            if f.kind != "blend" or _blend_face(f, k, mesh, owner, bounds, edge_tri, edges) is not None:
+                out.append(f)
+                continue
+            changed = True
+            halves = split(mesh, f)
+            if halves:
+                out += halves
+            else:
+                skipped.append(f)
+                out += list(f.parts)
+        features = out
+        if not changed:
+            break
+    return features
 
 
 def build_faces(mesh, features, tol):
