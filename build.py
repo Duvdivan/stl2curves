@@ -259,6 +259,9 @@ def _run_edge(edges, bounds, tag, ids, patch_side=False):
     if label is None:
         return edges.get(ids, edges.spline)
     bound = bounds[k]
+    if label in ("lo", "hi") and len(ids) > 3 and ids[0] == ids[-1] and bound.f.kind != "wedge":
+        # a whole natural boundary circle: the exact circle (as the face beside it uses)
+        return bound.full_circle(label)
     return edges.get(ids, lambda canon: bound.edge(label, edges.pts[canon]))
 
 
