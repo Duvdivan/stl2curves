@@ -78,8 +78,10 @@ def count(shape, kind):
 
 
 def volume(shape):
+    # adaptive integration: the default's fixed sample points undercount long spline
+    # faces (a thread flank winding five turns came out ~80 mm^3 short)
     props = GProp_GProps()
-    BRepGProp.VolumeProperties_s(shape, props)
+    BRepGProp.VolumeProperties_s(shape, props, 1e-6)
     return props.Mass()
 
 
