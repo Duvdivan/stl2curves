@@ -508,6 +508,161 @@ def _generous_surface(feature, bound, mesh):
     return _revolved_face(bound, lo, hi, u0, span)
 
 
+THREAD_SAMPLES = 48     # points a turn on a thread's helices (a B-spline through them is
+                        # well under a micron off)
+
+
+def _thread_surface(feature, m):
+    """A piece of a thread's profile (threads.Flank) swept along its helix, reaching a
+    little past the patch each way: the ruled surface between the helices at the
+    piece's two ends (exact for a straight piece), as a B-spline surface whose
+    parameters are the model's own (U, s): helix angle, and distance along the piece."""
+    from OCP.Geom import Geom_BSplineSurface
+    from OCP.collections import Array1_double, Array1_int, Array2_gp_Pnt, HArray1_double
+    grow = 0.2 * (feature.hi - feature.lo) + 0.02
+    lo, hi = feature.lo - grow, feature.hi + grow
+    if min(m.p[1] + lo * m.t[1], m.p[1] + hi * m.t[1]) <= 0:
+        return None                     # would cross the axis
+    margin = math.radians(10)
+    U = np.linspace(feature.u0 - margin, feature.u0 + feature.span + margin,
+                    max(8, int(math.ceil((feature.span + 2 * margin) / TWO_PI * THREAD_SAMPLES)) + 1))
+    params = HArray1_double(1, len(U))
+    for i, u in enumerate(U):
+        params.SetValue(i + 1, float(u))
+    curves = []
+    for s in (lo, hi):
+        arr = HArray1_gp_Pnt(1, len(U))
+        for i, p in enumerate(m.point(np.full(len(U), s), U)):
+            arr.SetValue(i + 1, _pnt(p))
+        interp = GeomAPI_Interpolate(arr, params, False, 1e-9)
+        interp.Perform()
+        if not interp.IsDone():
+            return None
+        curves.append(interp.Curve())
+    a, b = curves                       # (the same parameters: the same knots)
+    poles = Array2_gp_Pnt(1, a.NbPoles(), 1, 2)
+    for i in range(1, a.NbPoles() + 1):
+        poles.SetValue(i, 1, a.Pole(i))
+        poles.SetValue(i, 2, b.Pole(i))
+    uk, um = Array1_double(1, a.NbKnots()), Array1_int(1, a.NbKnots())
+    for i in range(1, a.NbKnots() + 1):
+        uk.SetValue(i, a.Knot(i))
+        um.SetValue(i, a.Multiplicity(i))
+    vk, vm = Array1_double(1, 2), Array1_int(1, 2)
+    vk.SetValue(1, lo)
+    vk.SetValue(2, hi)
+    vm.SetValue(1, 2)
+    vm.SetValue(2, 2)
+    return Geom_BSplineSurface(poles, uk, vk, um, vm, a.Degree(), 1)
+
+
+def _thread_face(feature, k, mesh, owner, bounds, edge_tri):
+    """A thread piece's face, built in its surface's own parameters: each outline corner
+    is placed on the piece as (U, s) and the outline drawn there, so its edges lie on
+    the surface exactly. (Splines through the corners themselves, a few microns off the
+    true thread, won't cut a long helical surface, and neither will their projections.)
+    Where the outline follows the piece's own ends (a crest or root edge) it runs along
+    s = its end exactly: a helix, the same one the next piece has."""
+    from OCP.BRepLib import BRepLib
+    from OCP.Geom2dAPI import Geom2dAPI_Interpolate
+    from OCP.collections import HArray1_gp_Pnt2d
+    from OCP.gp import gp_Pnt2d
+    from threads import ON_TOL
+    m = feature.model
+    surface = _thread_surface(feature, m)
+    if surface is None:
+        return None
+    loops = _loops(np.concatenate([mesh.tris[mesh.ftris[f]] for f in feature.facets]))
+    if not loops:
+        return None
+    snap = ON_TOL + mesh.noise
+    wires, spans = [], []
+    for loop in loops:
+        tags = _loop_tags(mesh, loop, owner, bounds, edge_tri, patch=k)
+        runs = [(tags[0], loop + [loop[0]])] if all(t == tags[0] for t in tags) else _runs(loop, tags)
+        wire = BRepBuilderAPI_MakeWire()
+        uv = []
+        for _, run in _split_sharp(runs, mesh.pts):
+            s, _, U = m.place(mesh.pts[run])
+            s = np.where(np.abs(s) <= snap, 0.0, np.where(np.abs(s - m.length) <= snap, m.length, s))
+            pieces = [slice(0, len(run) // 2 + 1), slice(len(run) // 2, len(run))] \
+                if run[0] == run[-1] else [slice(0, len(run))]
+            for part in pieces:
+                pts = HArray1_gp_Pnt2d(1, len(run[part]))
+                for i, (u, v) in enumerate(zip(U[part], s[part])):
+                    pts.SetValue(i + 1, gp_Pnt2d(float(u), float(v)))
+                interp = Geom2dAPI_Interpolate(pts, False, 1e-9)
+                interp.Perform()
+                if not interp.IsDone():
+                    return None
+                edge = BRepBuilderAPI_MakeEdge(interp.Curve(), surface).Edge()
+                BRepLib.BuildCurve3d_s(edge)
+                wire.Add(edge)
+            uv += list(zip(U, s))
+        if not wire.IsDone():
+            return None
+        wires.append(wire.Wire())
+        P = np.array(uv)
+        spans.append(abs(np.sum(P[:, 0] * np.roll(P[:, 1], -1) - np.roll(P[:, 0], -1) * P[:, 1])))
+    order = np.argsort(spans)[::-1]         # the outer loop first
+    maker = BRepBuilderAPI_MakeFace(surface, wires[order[0]], True)
+    for i in order[1:]:
+        maker.Add(wires[i])
+    if not maker.IsDone():
+        return None
+    fix = ShapeFix_Face(maker.Face())
+    fix.Perform()
+    face = fix.Face()
+    if not BRepCheck_Analyzer(face).IsValid():
+        return None
+    # facing out of the material, as the facets do (sewing doesn't always turn a small
+    # face round, and one facing in spoils the volume)
+    big = feature.facets[np.argsort(mesh.farea[feature.facets])[::-1][:9]]
+    s, _, U = m.place(mesh.fcent[big])
+    votes = []
+    for u, v, f in zip(U, s, big):
+        props = GeomLProp_SLProps(surface, float(u), float(np.clip(v, 0, m.length)), 1, 1e-9)
+        if props.IsNormalDefined():
+            n = props.Normal()
+            votes.append(np.array([n.X(), n.Y(), n.Z()]) @ mesh.fn[f])
+    if votes and (np.median(votes) < 0) != (face.Orientation() == TopAbs_REVERSED):
+        face = TopoDS.Face(face.Reversed())
+    # and all of it must face the way the mesh does there (an outline that touches
+    # itself, a slit at a run-out, can leave a face spanning a gap, part of it facing
+    # the wrong way: sewing then turns the whole face round)
+    if _facing_against(face, mesh) > 0.05:
+        return None
+    props = GProp_GProps()
+    BRepGProp.SurfaceProperties_s(face, props)
+    target = float(mesh.farea[feature.facets].sum())
+    # (moving the outline onto the piece's ends shifts it by up to `snap` all along: on
+    # a narrow crest or root band that is a good share of its area)
+    rim = sum(float(np.linalg.norm(np.diff(mesh.pts[loop + loop[:1]], axis=0), axis=1).sum()) for loop in loops)
+    return face if abs(props.Mass() - target) <= 0.05 * target + snap * rim / 2 else None
+
+
+def _facing_against(face, mesh):
+    """Share of the face's area whose normal points against the nearest mesh triangle's."""
+    from scipy.spatial import cKDTree
+    BRepMesh_IncrementalMesh(face, 0.005, False, 0.2, True)
+    loc = TopLoc_Location()
+    tri = BRep_Tool.Triangulation_s(face, loc)
+    if tri is None:
+        return 1.0
+    nodes = np.array([[tri.Node(i).X(), tri.Node(i).Y(), tri.Node(i).Z()] for i in range(1, tri.NbNodes() + 1)])
+    ft = np.array([tri.Triangle(i).Get() for i in range(1, tri.NbTriangles() + 1)]) - 1
+    if face.Orientation() == TopAbs_REVERSED:
+        ft = ft[:, [0, 2, 1]]
+    a, b, c = nodes[ft[:, 0]], nodes[ft[:, 1]], nodes[ft[:, 2]]
+    n = np.cross(b - a, c - a)
+    area = np.linalg.norm(n, axis=1)
+    if "tri_tree" not in mesh.__dict__:
+        mesh.tri_tree = cKDTree(mesh.pts[mesh.tris].mean(axis=1))
+    _, k = mesh.tri_tree.query((a + b + c) / 3)
+    against = np.einsum("ij,ij->i", n, mesh.tn[k]) < 0
+    return float(area[against].sum() / max(area.sum(), 1e-300))
+
+
 def _trimmed_face(feature, k, bound, mesh, owner, bounds, edge_tri, edges, tol):
     """A patch cut to an arbitrary outline: split a generous piece of its surface along
     the outline edges and keep the piece the patch's facets lie on."""
@@ -998,7 +1153,9 @@ def build_faces(mesh, features, tol):
     failed, shells = [], []
     edges = Edges(mesh.pts)
     for k, (f, bound) in enumerate(zip(features, bounds)):
-        if f.kind == "trimmed":
+        if f.model.kind == "thread":
+            faces = [_thread_face(f, k, mesh, owner, bounds, edge_tri)]
+        elif f.kind == "trimmed":
             faces = [_trimmed_face(f, k, bound, mesh, owner, bounds, edge_tri, edges, tol)]
         elif f.kind == "blend":
             faces = [_blend_face(f, k, mesh, owner, bounds, edge_tri, edges)]

@@ -840,9 +840,19 @@ def analyze(pts, tris):
     for region in regions:
         region.free &= ~np.isin(region.facets, claimed)
     features += rolled
+    # Pass 4: screw threads, among the curved facets still unexplained (before the loose
+    # pass, which would take pieces of them for cylinders and cones)
+    import threads
+    free = [region.facets[region.free] for region in regions]
+    screws = []
+    for thread, fids in threads.find(mesh, np.concatenate(free) if free else np.zeros(0, int)):
+        screws += threads.patches(mesh, thread, fids)
+    claimed = [int(f) for x in screws for f in x.facets]
+    for region in regions:
+        region.free &= ~np.isin(region.facets, claimed)
     features += _loose_pass(mesh, regions, features)
     features = _band_tori(mesh, regions, features)
-    return mesh, _merge_same_surface(mesh, features), _mesh_tol
+    return mesh, _merge_same_surface(mesh, features) + screws, _mesh_tol
 
 
 def _tube_fit(P, model, steps=30):
