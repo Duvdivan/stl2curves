@@ -9,6 +9,7 @@ faces are then sewn together.
 """
 import itertools
 import math
+import time
 
 import numpy as np
 from OCP.BRep import BRep_Builder, BRep_Tool
@@ -376,6 +377,11 @@ def _planar_face(mesh, fid, owner, bounds, edge_tri, edges):
     loops = _loops(tris)
     if loops is None:
         return None
+    # an outline that touches itself (a pinched facet) makes an invalid face: the
+    # facet's own triangles are used instead
+    ring = [v for loop in loops for v in loop]
+    if len(ring) != len(set(ring)):
+        return None
     pts = mesh.pts
     # outer boundary first: the loop enclosing the most area
     normal = mesh.fn[fid]
@@ -667,6 +673,7 @@ USE_GUIDES = False   # guide points past the outline pull against the real point
 BULGE_FACTOR = 1.0   # how far past a circular arc's sag a blend may bow over a facet
 FILL_SETTINGS = (3, 15, 2, False, 1e-5, 1e-4, 1e-2, 0.1, 8, 9)
 FINE_FILL_SETTINGS = (3, 30, 3, False, 1e-5, 1e-5, 1e-2, 0.1, 8, 20)
+BLEND_SECONDS = 300     # time allowed for fitting blends; the rest keep their exact pieces or facets
 FINE_BLENDS = 150       # a part with more blends than this is mostly freeform: skip the finer (slower) refits
 
 
@@ -716,6 +723,8 @@ def _blend_face(feature, k, mesh, owner, bounds, edge_tri, edges):
             return None
         face, feature.change, feature.tolerance, feature.worst, feature.detail = cache[key]
         return face
+    if mesh.__dict__.get("blends_only_cached"):
+        return None                 # the time for fitting blends is used up
     cache[key] = None
     outline = []
     for tag, run in runs:
@@ -921,6 +930,7 @@ def settle_blends(mesh, features, tol, split, skipped):
     cut further, so the whole part is then built and sewn just once or twice."""
     features = list(features)
     mesh.blend_count = sum(f.kind == "blend" for f in features)
+    start = time.time()
     for _ in range(4):
         owner = np.full(len(mesh.fn), -1)
         for k, f in enumerate(features):
@@ -934,11 +944,17 @@ def settle_blends(mesh, features, tol, split, skipped):
         edges = Edges(mesh.pts)
         out, changed = [], False
         for k, f in enumerate(features):
-            if f.kind != "blend" or _blend_face(f, k, mesh, owner, bounds, edge_tri, edges) is not None:
+            if f.kind != "blend":
+                out.append(f)
+                continue
+            if time.time() - start > BLEND_SECONDS:
+                # out of time: keep only blends already known to fit (their faces are cached)
+                mesh.blends_only_cached = True
+            if _blend_face(f, k, mesh, owner, bounds, edge_tri, edges) is not None:
                 out.append(f)
                 continue
             changed = True
-            halves = split(mesh, f)
+            halves = None if mesh.__dict__.get("blends_only_cached") else split(mesh, f)
             if halves:
                 out += halves
             else:

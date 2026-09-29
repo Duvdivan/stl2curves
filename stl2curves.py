@@ -213,8 +213,25 @@ def attempt(mesh, features, mesh_tol, tol, fuse, faceted_volume):
             shape = fix.Shape()
         else:
             # patches next to faces that came out invalid: drop just those and try again
-            return None, culprits(mesh, features, invalid_face_points(shape))
+            blame = culprits(mesh, features, invalid_face_points(shape))
+            if blame or not _mesh_defective(mesh, tol, fuse):
+                return None, blame
+            # nothing to blame and the mesh as bare facets fails the same way: the
+            # defect is in the mesh itself (it touches itself, say), not in the curves
     return (shape, nb, nv), []
+
+
+def _mesh_defective(mesh, tol, fuse):
+    """Is the mesh, built from bare facets, already not a valid solid?"""
+    if "defective" not in mesh.__dict__:
+        comp, shells, _ = build_faces(mesh, [], TOL)
+        sewn, free = sew(comp, tol, shells)
+        try:
+            shape = solids_from_shells(sewn, fuse)[0]
+            mesh.defective = bool(free) or not BRepCheck_Analyzer(shape).IsValid()
+        except RuntimeError:
+            mesh.defective = True
+    return mesh.defective
 
 
 def culprits(mesh, features, points):
@@ -357,6 +374,7 @@ def stl_to_solid(path, tol, fuse=True, curves=True, true_size=False, blends=True
         shape, b, v = _build(mesh, features, mesh_tol, tol, fuse, info)
         shapes.append(shape)
         nb, nv = nb + b, nv + v
+        info["mesh_defects"] = info.get("mesh_defects", False) or mesh.__dict__.get("defective", False)
     shape = shapes[0]
     if len(shapes) > 1:
         # bodies that met at an edge were built apart; join them now
@@ -461,7 +479,7 @@ def main():
         extra = f" ({nb} bodies{', ' + str(nv) + ' cavities' if nv else ''})" if nb + nv > 1 else ""
         print(f"  {info['triangles']} triangles -> {info['faces']} faces{extra}, "
               f"volume {info['volume']:,.1f} mm^3, "
-              f"{'valid solid' if info['valid'] else 'WARNING: check geometry'}, "
+              f"{'valid solid' if info['valid'] else 'WARNING: check geometry' + (' (the STL itself is not a clean solid: it touches or crosses itself)' if info.get('mesh_defects') else '')}, "
               f"{time.time() - t:.1f}s -> {out}")
         if info["restored"] or info["skipped"]:
             print(describe_features(info, args.details))
