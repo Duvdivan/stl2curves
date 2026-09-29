@@ -1016,6 +1016,28 @@ def _rebuilt(mesh, feature, model):
     return None
 
 
+def half_rings(mesh, feature):
+    """A patch that runs all the way round its axis but is cut to shape (its outline
+    wraps the surface's seam) as two half rings on the same surface, or None."""
+    model = feature.model
+    if feature.kind != "trimmed" or not isinstance(model, Revolved) or feature.span < TWO_PI:
+        return None
+    centres = np.array([mesh.pts[np.unique(mesh.fverts[f])].mean(axis=0) for f in feature.facets])
+    u = model.angle(model.local(centres)[2])
+    global _loose, _anchored
+    out = []
+    for side in (np.cos(u) >= 0, np.cos(u) < 0):
+        _loose, _anchored = True, True     # the whole ring has already passed the checks
+        try:
+            half = _feature(mesh, model, feature.facets[side], feature.convex) if side.any() else None
+        finally:
+            _loose, _anchored = False, False
+        if half is None:
+            return None
+        out.append(half)
+    return out
+
+
 def snap(mesh, features, round_unit=None):
     """Design intent: equal radii made exactly equal, near-axis-aligned axes made exact,
     and (with round_unit "mm" or "inch") radii set to round values. Each change is kept

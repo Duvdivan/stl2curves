@@ -53,11 +53,13 @@ from OCP.IFSelect import IFSelect_RetDone
 from OCP.BRepAlgoAPI import BRepAlgoAPI_Fuse
 from OCP.collections import List_TopoDS_Shape
 
-from features import load_stl, analyze, summarize, snap, Mesh, TOL
+from features import load_stl, analyze, summarize, snap, half_rings, Mesh, TOL
 from sizing import guess_size
 from build import build_faces, sew, features_near, settle_blends
 from bodies import split_bodies
 from blends import add_blends, split as split_blend, _blend as as_blend
+
+SEARCH_SECONDS = 600    # time allowed for hunting down patches that spoil the solid
 
 
 def count(shape, kind):
@@ -293,6 +295,12 @@ def _build(mesh, features, mesh_tol, tol, fuse, info):
             back = []
             for k in failed:
                 f = subset[k]
+                rings = half_rings(mesh, f)
+                if rings:
+                    # a whole ring cut to shape often fails where its outline crosses
+                    # the surface's seam; the same surface as two half rings doesn't
+                    back += rings
+                    continue
                 if attempt.blamed:
                     halves = None
                 elif f.kind == "blend":
@@ -324,10 +332,14 @@ def _build(mesh, features, mesh_tol, tol, fuse, info):
     if result is None and used:
         # Find the troublemakers by halving: keep every half that builds cleanly.
         accepted = []
+        start = time.time()
 
         def search(group):
             nonlocal result
             if not group:
+                return
+            if time.time() - start > SEARCH_SECONDS:
+                info["skipped"] += group      # out of time: leave the rest faceted
                 return
             trial, kept = good(accepted + group)
             if trial is not None:
