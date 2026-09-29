@@ -973,6 +973,8 @@ def _with_radius(model, P, r):
 def _radius(model):
     if isinstance(model, Sphere):
         return model.r
+    if not isinstance(model, Revolved):
+        return None
     if model.line:
         return model.line[0] if model.line[1] == 0 else None
     return model.circle[2]
@@ -1152,7 +1154,8 @@ class Feature:
     detail: str
     convex: bool
     kind: str           # "revolve" (cylinder/cone/torus/sphere cap), "wedge" (sphere corner),
-                        # "ball", or "trimmed" (any of these surfaces, cut to an arbitrary outline)
+                        # "ball", "trimmed" (any of these surfaces, cut to an arbitrary outline)
+                        # or "blend" (a smooth freeform face where no simple surface fits)
     facets: np.ndarray  # mesh facets this patch replaces
     change: float       # volume the exact surface adds compared with the facets (mm^3)
     tolerance: float    # how far the actual change may differ from that
@@ -1162,6 +1165,7 @@ class Feature:
     lo: float = 0.0     # "revolve": profile range (height for a line, tube angle for a circle)
     hi: float = 0.0
     planes: tuple = ()  # "wedge": planes through the centre bounding the corner
+    parts: tuple = ()   # "blend": the pieces it replaced (put back if it can't be built)
 
     def describe(self):
         return f"{self.label:<22} {self.detail}"

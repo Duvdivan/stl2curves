@@ -25,13 +25,18 @@ from OCP.GeomAPI import GeomAPI_Interpolate
 from OCP.collections import HArray1_gp_Pnt
 from OCP.collections import List_TopoDS_Shape
 from OCP.GC import GC_MakeArcOfCircle
-from OCP.ShapeFix import ShapeFix_Face
-from OCP.TopAbs import TopAbs_FACE, TopAbs_SHELL
+from OCP.GeomAPI import GeomAPI_ProjectPointOnSurf
+from OCP.GeomLProp import GeomLProp_SLProps
+from OCP.BRepFill import BRepFill_Filling
+from OCP.GeomAbs import GeomAbs_C0
+from OCP.ShapeFix import ShapeFix_Face, ShapeFix_Shape
+from OCP.TopAbs import TopAbs_EDGE, TopAbs_FACE, TopAbs_SHELL, TopAbs_REVERSED
 from OCP.TopExp import TopExp_Explorer
 from OCP.TopoDS import TopoDS, TopoDS_Compound
 from OCP.gp import gp_Ax1, gp_Ax2, gp_Circ, gp_Dir, gp_Pln, gp_Pnt
 
 from features import TWO_PI, _angle_gap, _frame, Revolved, Sphere
+from blends import TANGENT_DEG, MAX_DEVIATION, MAX_BULGE, MAX_EDGE_GAP
 
 
 def _pnt(p):
@@ -242,7 +247,7 @@ def _run_edge(edges, bounds, tag, ids, patch_side=False):
     """
     k, label = tag[0], tag[1]
     if label is None and len(ids) == 2:
-        if not patch_side:
+        if not patch_side or bounds[k].f.kind == "blend":
             return _line(edges.pts[ids[0]], edges.pts[ids[1]])
         m = bounds[k].m
         a, b = edges.pts[ids[0]], edges.pts[ids[1]]
@@ -280,6 +285,47 @@ def _runs(loop, tags):
     return out
 
 
+SHARP_DEG = 30   # a run of mesh vertices turning this sharply at a vertex is split there
+
+
+def _split_sharp(runs, pts):
+    """Split free-form runs (splines through mesh points) at sharp corners: a smooth curve
+    forced through a hairpin overshoots wildly. Depends only on the vertex chain, so both
+    faces beside a run split it the same way."""
+    out = []
+    for tag, run in runs:
+        if tag is None or tag[1] is not None or len(run) < 3:
+            out.append((tag, run))
+            continue
+        closed = run[0] == run[-1]
+        ring = run[:-1] if closed else run
+        n = len(ring)
+
+        def sharp(i):
+            a, b, c = pts[ring[i - 1]], pts[ring[i]], pts[ring[(i + 1) % n]]
+            u, v = b - a, c - b
+            nu, nv = np.linalg.norm(u), np.linalg.norm(v)
+            return nu > 0 and nv > 0 and u @ v < math.cos(math.radians(SHARP_DEG)) * nu * nv
+
+        corners = [i for i in (range(n) if closed else range(1, n - 1)) if sharp(i)]
+        if not corners:
+            out.append((tag, run))
+            continue
+        if closed:
+            # start at the corner with the lowest vertex id, so both sides agree
+            start = min(corners, key=lambda i: ring[i])
+            ring = ring[start:] + ring[:start]
+            corners = sorted((i - start) % n for i in corners)
+            ring = ring + [ring[0]]
+            cuts = corners + [n]
+        else:
+            ring = list(ring)
+            cuts = [0] + corners + [n - 1]
+        for i, j in zip(cuts, cuts[1:]):
+            out.append((tag, ring[i:j + 1]))
+    return out
+
+
 def _loop_tags(mesh, loop, owner, bounds, edge_tri, patch=None):
     """Tag each edge of a boundary loop.
 
@@ -307,7 +353,7 @@ def _loop_tags(mesh, loop, owner, bounds, edge_tri, patch=None):
 def _wire(mesh, loop, tags, edges, bounds):
     wire = BRepBuilderAPI_MakeWire()
     pts = mesh.pts
-    for tag, run in _runs(loop, tags):
+    for tag, run in _split_sharp(_runs(loop, tags), pts):
         if tag is None:
             wire.Add(_line(pts[run[0]], pts[run[1]]))
             continue
@@ -346,10 +392,15 @@ def _planar_face(mesh, fid, owner, bounds, edge_tri, edges):
             wires.append(w.Wire())
             continue
         if whole:
-            edge = _run_edge(edges, bounds, tags[0], loop + [loop[0]])
-            if edge is None:
+            w = BRepBuilderAPI_MakeWire()
+            for tag, run in _split_sharp([(tags[0], loop + [loop[0]])], pts):
+                edge = _run_edge(edges, bounds, tag, run)
+                if edge is None:
+                    return None
+                w.Add(edge)
+            if not w.IsDone():
                 return None
-            wires.append(BRepBuilderAPI_MakeWire(edge).Wire())
+            wires.append(w.Wire())
             continue
         wire = _wire(mesh, loop, tags, edges, bounds)
         if wire is None:
@@ -444,7 +495,7 @@ def _trimmed_face(feature, k, bound, mesh, owner, bounds, edge_tri, edges, tol):
     for loop in loops:
         tags = _loop_tags(mesh, loop, owner, bounds, edge_tri, patch=k)
         runs = [(tags[0], loop + [loop[0]])] if all(t == tags[0] for t in tags) else _runs(loop, tags)
-        for tag, run in runs:
+        for tag, run in _split_sharp(runs, mesh.pts):
             edge = _run_edge(edges, bounds, tag, run, patch_side=True)
             if edge is None:
                 return None
@@ -544,6 +595,176 @@ def _split_face(feature, mesh, base, tools, loops, tol):
     return comp
 
 
+def _repaired(face):
+    """The face if valid, else the first standard repair that makes it valid (edge
+    tolerances widened to the real gap, at most twice the allowed deviation)."""
+    if BRepCheck_Analyzer(face).IsValid():
+        return face
+    fix = ShapeFix_Face(face)
+    fix.Perform()
+    if BRepCheck_Analyzer(fix.Face()).IsValid():
+        return fix.Face()
+    fix = ShapeFix_Shape(face)
+    fix.SetMaxTolerance(2 * MAX_DEVIATION)
+    fix.Perform()
+    ex = TopExp_Explorer(fix.Shape(), TopAbs_FACE)
+    if not ex.More():
+        return None
+    out = TopoDS.Face(ex.Current())
+    ex.Next()
+    return out if not ex.More() and BRepCheck_Analyzer(out).IsValid() else None
+
+
+# degree, points per boundary curve, iterations, anisotropy, 2d/3d/angular/curvature
+# tolerances, max degree, max segments
+FILL_SETTINGS = (3, 15, 2, False, 1e-5, 1e-4, 1e-2, 0.1, 8, 9)
+FINE_FILL_SETTINGS = (3, 30, 3, False, 1e-5, 1e-5, 1e-2, 0.1, 8, 20)
+
+
+def _blend_face(feature, k, mesh, owner, bounds, edge_tri, edges):
+    """A smooth freeform face for a blend: an N-sided patch spanning the blend's outline
+    (the same edges its neighbours use) through the mesh corners inside it, plus a few
+    guide points just past the outline so it rolls tangentially into the faces beside
+    it. Sets the feature's volume change and fit on the way."""
+    facets = feature.facets
+    inside = set(facets.tolist())
+    tids = np.concatenate([mesh.ftris[f] for f in facets])
+    tris = mesh.tris[tids]
+    loops = _loops(tris)
+    if not loops or len(loops) != 1:
+        return None                 # one outline only (a ring-shaped area is left as it was)
+    loop = loops[0]
+    pts = mesh.pts
+    V = np.unique(tris)
+    rim = set(loop)
+    # typical facet width, to place the guide points
+    ab = np.linalg.norm(pts[tris[:, 1]] - pts[tris[:, 0]], axis=1)
+    width = float(np.median(2 * mesh.tarea[tids] / np.maximum(ab, 1e-9)))
+    guides = []
+    for a, b in zip(loop, loop[1:] + loop[:1]):
+        t_out, t_in = edge_tri.get((b, a)), edge_tri.get((a, b))
+        if t_out is None or t_in is None:
+            continue
+        f_in, f_out = mesh.facet_of[t_in], mesh.facet_of[t_out]
+        if mesh.fn[f_in] @ mesh.fn[f_out] < math.cos(math.radians(TANGENT_DEG)):
+            continue                # a crease: nothing to roll into
+        e = pts[b] - pts[a]
+        e = e / np.linalg.norm(e)
+        mid = (pts[a] + pts[b]) / 2
+        away = np.cross(mesh.fn[f_out], e)
+        if away @ (pts[mesh.tris[t_in]].mean(axis=0) - mid) > 0:
+            away = -away
+        guides.append(mid + 0.35 * max(width, 0.05) * away)
+
+    tags = _loop_tags(mesh, loop, owner, bounds, edge_tri, patch=k)
+    runs = [(tags[0], loop + [loop[0]])] if all(t == tags[0] for t in tags) else _runs(loop, tags)
+    runs = _split_sharp(runs, pts)
+    # The same outline gives the same face: reuse it from an earlier attempt at the part
+    cache = mesh.__dict__.setdefault("blend_cache", {})
+    key = (facets.tobytes(), tuple(tuple(int(v) for v in run) for _, run in runs))
+    if key in cache:
+        if cache[key] is None:
+            return None
+        face, feature.change, feature.tolerance, feature.worst, feature.detail = cache[key]
+        return face
+    cache[key] = None
+    outline = []
+    for tag, run in runs:
+        edge = _run_edge(edges, bounds, tag, run, patch_side=True)
+        if edge is None:
+            return None
+        outline.append(edge)
+    inner = [pts[v] for v in V if v not in rim] + guides
+
+    def filled(settings):
+        fill = BRepFill_Filling(*settings)
+        for edge in outline:
+            fill.Add(edge, GeomAbs_C0, True)
+        for q in inner:
+            fill.Add(_pnt(q))
+        try:
+            fill.Build()
+            return _repaired(fill.Face()) if fill.IsDone() else None
+        except Exception:
+            return None
+
+    # a quick patch first; if it follows its outline loosely, a finer (slower) one
+    face = filled(FILL_SETTINGS)
+    if face is None or _edge_gap(face) > MAX_EDGE_GAP / 4:
+        finer = filled(FINE_FILL_SETTINGS)
+        if finer is not None and (face is None or _edge_gap(finer) < _edge_gap(face)):
+            face = finer
+    if face is None or _edge_gap(face) > MAX_EDGE_GAP:
+        return None     # a loose outline would force a loose sewing tolerance on the whole part
+    surface = BRep_Tool.Surface_s(face)
+    proj = GeomAPI_ProjectPointOnSurf()
+    proj.Init(surface, *surface.Bounds())
+
+    def along(p, n):
+        """Signed distance from p to the surface, measured along direction n."""
+        proj.Perform(_pnt(p))
+        if not proj.IsDone() or not proj.NbPoints():
+            return None
+        q = proj.NearestPoint()
+        return float((np.array([q.X(), q.Y(), q.Z()]) - p) @ n)
+
+    # how far the surface strays from the mesh corners, and the volume it adds
+    worst, change, spread = 0.0, 0.0, 0.0
+    for t in tids:
+        n_t = mesh.tn[t]
+        corners = pts[mesh.tris[t]]
+        for p in corners:
+            d = along(p, n_t)
+            if d is None:
+                return None
+            worst = max(worst, abs(d))
+        s_mid = [along(p, n_t) for p in (corners + corners[[1, 2, 0]]) / 2]
+        # between the corners a smooth surface bows away from a flat facet only a little
+        # (about a tenth of the facet's size even for a fillet cut into two strips);
+        # more than that is the fit overshooting
+        centre = corners.mean(axis=0)
+        s_in = [along(p, n_t) for p in [centre] + list((corners + centre) / 2)]
+        if any(d is None for d in s_mid + s_in):
+            return None
+        size = float(np.linalg.norm(corners - corners[[1, 2, 0]], axis=1).max())
+        if max(abs(d) for d in s_mid + s_in) > max(MAX_DEVIATION, MAX_BULGE * size):
+            return None
+        change += mesh.tarea[t] * float(np.mean(s_mid))
+        spread += mesh.tarea[t] * float(np.mean(np.abs(s_mid)))
+    if worst > MAX_DEVIATION:
+        return None
+    gp = GProp_GProps()
+    BRepGProp.SurfaceProperties_s(face, gp)
+    target = float(mesh.farea[facets].sum())
+    if abs(gp.Mass() - target) > 0.15 * target + 1e-3:
+        return None
+    # face the same way as the mesh
+    proj.Perform(_pnt(mesh.fcent[facets[0]]))
+    u, v = proj.LowerDistanceParameters()
+    props = GeomLProp_SLProps(surface, u, v, 1, 1e-9)
+    if props.IsNormalDefined():
+        n = props.Normal()
+        n = np.array([n.X(), n.Y(), n.Z()]) * (-1 if face.Orientation() == TopAbs_REVERSED else 1)
+        if n @ mesh.fn[facets[0]] < 0:
+            face = TopoDS.Face(face.Reversed())
+    feature.change = change
+    feature.tolerance = 0.5 * spread + 1e-4 * target
+    # its outline is shared with its neighbours, so the gap sewing must close is just
+    # how far the face's own edges stray (not how far it lies from the mesh corners)
+    feature.worst = _edge_gap(face)
+    feature.detail = feature.detail.split(", within")[0] + f", within {worst:.3f} mm of the mesh"
+    cache[key] = (face, feature.change, feature.tolerance, feature.worst, feature.detail)
+    return face
+
+
+def _edge_gap(face):
+    gap, ex = 0.0, TopExp_Explorer(face, TopAbs_EDGE)
+    while ex.More():
+        gap = max(gap, BRep_Tool.Tolerance_s(TopoDS.Edge(ex.Current())))
+        ex.Next()
+    return gap
+
+
 def _shapes(items):
     out = List_TopoDS_Shape()
     for x in items:
@@ -595,6 +816,8 @@ def build_faces(mesh, features, tol):
     for k, (f, bound) in enumerate(zip(features, bounds)):
         if f.kind == "trimmed":
             faces = [_trimmed_face(f, k, bound, mesh, owner, bounds, edge_tri, edges, tol)]
+        elif f.kind == "blend":
+            faces = [_blend_face(f, k, mesh, owner, bounds, edge_tri, edges)]
         else:
             faces = _patch_faces(f, bound, mesh)
         if any(x is None for x in faces):

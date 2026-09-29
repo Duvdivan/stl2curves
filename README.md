@@ -15,12 +15,16 @@ works out which surface each part of the mesh really lies on and rebuilds it exa
 | cones | countersinks, chamfers around round edges, cone tips |
 | spheres | domes, dimples, ball ends, corners where three rounded edges meet |
 | tori | rounded edges that follow a curve (rounded box corners, fillets round a pin) |
+| smooth blends | where rounded edges meet at a corner, fillets along spline-shaped edges |
 
 Surfaces can be cut to any outline (a hole running out through a sloped face, two
-holes crossing), and overlapping bodies in one STL are fused automatically.
+holes crossing), and overlapping bodies in one STL are fused automatically, as are
+bodies that only touch along an edge.
 
-Areas that don't match any of these surfaces (freeform shapes, variable fillets)
-stay as small flat facets, so the result always matches the mesh.
+Curved areas that none of the exact surfaces fit (corner blends, rounded edges
+following a spline) become one smooth freeform face each, fitted through the mesh
+corners and rolling tangentially into the faces beside them. Anything else stays as
+flat facets, so the result always matches the mesh.
 
 ## Install
 
@@ -45,7 +49,8 @@ On Windows, `stl2curves.bat` accepts drag-and-drop (or put a shortcut to it in
 `shell:sendto` for a right-click "Send to" entry).
 
 Options: `--tol` sewing tolerance (mm), `--no-fuse` keep overlapping bodies separate,
-`--no-curves` flat faces only.
+`--no-curves` flat faces only, `--no-blends` no smooth freeform faces (exact surfaces
+and flat facets only).
 
 ### Design size
 
@@ -66,17 +71,25 @@ Without it the size is left alone (a slight scale is often deliberate, for fit).
    within a micron of it. Strict passes first (a patch must follow its surface's natural
    boundary lines, or meet its neighbours at creases), then a permissive pass for what
    is left, then neighbouring patches on the same surface are merged, chains of short
-   cylinder strips are replaced by the torus they approximate, and equal radii and
-   near-axis-aligned axes are snapped to exact values (each snap kept only if the patch
-   still lies on the mesh).
-3. **Build** (`build.py`) — one exact face per patch and one planar face per flat
-   area, with shared edges (exact lines/arcs where a patch's boundary follows its
-   natural lines, splines through the mesh points otherwise), sewn into a solid.
-4. **Checks** — every result must be a valid closed solid whose volume matches the
+   cylinder strips or sphere bits are replaced by the torus they approximate, and equal
+   radii and near-axis-aligned axes are snapped to exact values (each snap kept only if
+   the patch still lies on the mesh).
+3. **Blends** (`blends.py`) — dense curved areas left over (unrecognised facets, and
+   small pieces that only stand in for a surface they don't really fit) are grouped
+   into regions that each turn no more than one smooth face can follow.
+4. **Build** (`build.py`) — one exact face per patch, one smooth N-sided patch per
+   blend (through the mesh corners, tangent to the faces it rolls into) and one planar
+   face per flat area, with shared edges (exact lines/arcs where a patch's boundary
+   follows its natural lines, splines through the mesh points otherwise, split at sharp
+   corners), sewn into a solid. Bodies that touch along an edge (`bodies.py`) are built
+   separately and fused.
+5. **Checks** — every result must be a valid closed solid whose volume matches the
    mesh plus the predicted change from the curves; features that fail are left
-   faceted instead of spoiling the part. Patches next to gaps left by sewing are
-   dropped individually; if the volume check fails, the feature list is halved to
-   find the culprits.
+   faceted instead of spoiling the part (a blend that fails gives back the pieces it
+   replaced). A blend must pass within 0.02 mm of every mesh corner and may not bulge
+   between them more than a smooth surface could. Patches next to gaps or invalid faces
+   left by sewing are dropped individually; if the volume check fails, the feature list
+   is halved to find the culprits.
 
 ## Tests
 

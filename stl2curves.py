@@ -57,6 +57,7 @@ from features import load_stl, analyze, summarize, snap, Mesh, TOL
 from sizing import guess_size
 from build import build_faces, sew, features_near
 from bodies import split_bodies
+from blends import add_blends
 
 
 def count(shape, kind):
@@ -183,24 +184,79 @@ def solids_from_shells(sewn, fuse):
 
 
 def attempt(mesh, features, mesh_tol, tol, fuse, faceted_volume):
-    """Build and sew the part with these features; return (shape, stats) or None if it fails the checks."""
+    """Build and sew the part with these features. Returns (result, to_drop): result is
+    (shape, bodies, cavities), or None if it fails the checks; to_drop lists the patches
+    to leave out next time (faces that couldn't be built, or those blamed for a gap or an
+    invalid face), and attempt.blamed says whether they were only blamed."""
+    attempt.blamed = False
     comp, shells, failed = build_faces(mesh, features, mesh_tol)
     if failed:
         return None, failed
+    attempt.blamed = True
     worst = max((f.worst for f in features), default=0.0)
     sewn, free = sew(comp, max(tol, min(0.2, 1.5 * worst)), shells)
     if free:
         # patches whose faces left gaps: drop just those and try again
-        return None, features_near(mesh, features, free) or []
+        return None, culprits(mesh, features, free)
     try:
         shape, nb, nv, signed = solids_from_shells(sewn, fuse)
     except RuntimeError:
         return None, []
     expected = faceted_volume + sum(f.change for f in features)
     allowed = sum(f.tolerance for f in features) + 1e-6 * abs(faceted_volume) + 1e-3
-    if abs(signed - expected) > allowed or not BRepCheck_Analyzer(shape).IsValid():
+    if abs(signed - expected) > allowed:
         return None, []
+    if not BRepCheck_Analyzer(shape).IsValid():
+        fix = ShapeFix_Shape(shape)
+        fix.Perform()
+        if BRepCheck_Analyzer(fix.Shape()).IsValid() and abs(volume(fix.Shape()) - expected) <= allowed:
+            shape = fix.Shape()
+        else:
+            # patches next to faces that came out invalid: drop just those and try again
+            return None, culprits(mesh, features, invalid_face_points(shape))
     return (shape, nb, nv), []
+
+
+def culprits(mesh, features, points):
+    """Which patches to drop for trouble at these points: the smooth blends right there if
+    any (they give back the exact pieces they replaced), else just the patch nearest to
+    each trouble spot (the next attempt shows whether that was enough)."""
+    near = features_near(mesh, features, points)
+    if not near:
+        return []
+    P = np.asarray(points)
+    dist = {}
+    for k in near:
+        V = mesh.pts[np.unique(np.concatenate([mesh.fverts[x] for x in features[k].facets]))]
+        dist[k] = np.linalg.norm(P[:, None] - V[None], axis=2).min(axis=1)   # per trouble spot
+    # blends are the likeliest cause and the cheapest loss: blame one nearby first
+    blends = [k for k in near if features[k].kind == "blend"]
+    out = set()
+    for i in range(len(P)):
+        pool = [k for k in blends if dist[k][i] <= 0.5] or near
+        k = min(pool, key=lambda k: dist[k][i])
+        if dist[k][i] <= 0.5:
+            out.add(k)
+    return sorted(out)
+
+
+def invalid_face_points(shape):
+    """A point on each face of the shape that fails the validity check."""
+    out, ex = [], TopExp_Explorer(shape, TopAbs_FACE)
+    while ex.More():
+        face = ex.Current()
+        if not BRepCheck_Analyzer(face).IsValid():
+            props = GProp_GProps()
+            BRepGProp.SurfaceProperties_s(face, props)
+            c = props.CentreOfMass()
+            out.append((c.X(), c.Y(), c.Z()))
+            vx = TopExp_Explorer(face, TopAbs_VERTEX)
+            while vx.More():
+                p = BRep_Tool.Pnt_s(TopoDS.Vertex(vx.Current()))
+                out.append((p.X(), p.Y(), p.Z()))
+                vx.Next()
+        ex.Next()
+    return out
 
 
 def _build(mesh, features, mesh_tol, tol, fuse, info):
@@ -210,10 +266,23 @@ def _build(mesh, features, mesh_tol, tol, fuse, info):
 
     def good(subset):
         result, failed = attempt(mesh, subset, mesh_tol, tol, fuse, faceted_volume)
+        blamed = []
         while failed:  # patches whose face couldn't be built: drop them and retry
+            if attempt.blamed:
+                blamed += [subset[k] for k in failed if subset[k].kind == "blend"]
             info["skipped"] += [subset[k] for k in failed]
-            subset = [f for k, f in enumerate(subset) if k not in failed]
+            # a smooth blend that failed gives back the pieces it replaced
+            back = [p for k in failed for p in subset[k].parts]
+            subset = [f for k, f in enumerate(subset) if k not in failed] + back
             result, failed = attempt(mesh, subset, mesh_tol, tol, fuse, faceted_volume)
+        # A blend dropped for trouble nearby may have been innocent: once the part
+        # builds, give each one a second chance on its own.
+        for b in blamed[:6] if result is not None else []:
+            trial = [f for f in subset if all(f is not p for p in b.parts)] + [b]
+            got, again = attempt(mesh, trial, mesh_tol, tol, fuse, faceted_volume)
+            if got is not None and not again:
+                result, subset = got, trial
+                info["skipped"] = [f for f in info["skipped"] if f is not b]
         return result, subset
 
     result, used = good(features)
@@ -247,7 +316,7 @@ def _build(mesh, features, mesh_tol, tol, fuse, info):
     return result
 
 
-def stl_to_solid(path, tol, fuse=True, curves=True, true_size=False):
+def stl_to_solid(path, tol, fuse=True, curves=True, true_size=False, blends=True):
     pts, tris = load_stl(path)
     info = {"triangles": len(tris), "restored": [], "skipped": [], "size": None, "snapped": 0}
     groups = split_bodies(pts, tris)          # bodies touching at an edge are built apart
@@ -261,6 +330,8 @@ def stl_to_solid(path, tol, fuse=True, curves=True, true_size=False):
                 parts = [analyze(pts * guess.factor, g) for g in groups]
         for mesh, features, _ in parts:
             info["snapped"] += snap(mesh, features, round_unit)
+        if blends:
+            parts = [(mesh, add_blends(mesh, features), t) for mesh, features, t in parts]
     else:
         parts = [(Mesh(pts, g), [], TOL) for g in groups]
     shapes, nb, nv = [], 0, 0
@@ -331,6 +402,8 @@ def main():
     ap.add_argument("--no-curves", action="store_true",
                     help="don't rebuild curved areas as true curves")
     ap.add_argument("--details", action="store_true", help="list every rebuilt feature")
+    ap.add_argument("--no-blends", action="store_true",
+                    help="don't turn curved areas no simple surface fits into smooth freeform faces")
     ap.add_argument("--true-size", action="store_true",
                     help="rebuild at the apparent design size, with radii snapped to round values")
     args = ap.parse_args()
@@ -345,7 +418,8 @@ def main():
     for f in files:
         t = time.time()
         print(f"{f.name}: converting...", flush=True)
-        shape, info = stl_to_solid(f, args.tol, not args.no_fuse, not args.no_curves, args.true_size)
+        shape, info = stl_to_solid(f, args.tol, not args.no_fuse, not args.no_curves, args.true_size,
+                                   not args.no_blends)
         out_dir = Path(args.out) if args.out else f.parent
         out_dir.mkdir(parents=True, exist_ok=True)
         out = out_dir / (f.stem + ".step")
