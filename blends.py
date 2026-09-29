@@ -17,6 +17,10 @@ from features import Feature, Revolved, Sphere
 SMOOTH_DEG = 50       # facets bending less than this meet smoothly
 SPREAD_DEG = 40       # one blend face turns at most this far from its first facet and its mean direction
 TANGENT_DEG = 35      # a neighbour this close in direction is rolled into tangentially
+MIN_BEND_DEG = 2      # an unrecognised facet must turn at least this far against a neighbour
+CORNER_SIZE = 1.5     # mm: a blend no bigger across than this is a corner...
+CORNER_SPREAD_DEG = 85  # ...and may turn this far
+MAX_SPLITS = 2        # a blend whose face won't fit is cut in two, at most this many times over
 SMALL_FACET = 0.02    # unrecognised facets smaller than this share of the biggest can be blends
 MAX_DEVIATION = 0.02  # a blend face must pass this close to every mesh corner (mm)
 MAX_BULGE = 0.15      # ...and bow away from a facet by at most this share of its size
@@ -104,7 +108,9 @@ def add_blends(mesh, features):
     def candidate(a):
         if owner[a] >= 0:
             return owner[a] in scraps
-        return mesh.farea[a] <= small and any(0.5 < _bend(mesh, a, b) < SMOOTH_DEG for b in mesh.nbrs[a])
+        # a facet that barely turns against any neighbour belongs to a flat face, not a blend
+        bends = [_bend(mesh, a, b) for b in mesh.nbrs[a]]
+        return mesh.farea[a] <= small and any(MIN_BEND_DEG <= x < SMOOTH_DEG for x in bends)
 
     cand = np.array([candidate(a) for a in range(nf)])
 
@@ -135,8 +141,15 @@ def add_blends(mesh, features):
                 if any(x not in free for x in u):
                     continue
                 mean = normal / np.linalg.norm(normal)
-                if max(max(angle(mesh.fn[x], seed_n), angle(mesh.fn[x], mean)) for x in u) > SPREAD_DEG:
-                    continue
+                turn = max(max(angle(mesh.fn[x], seed_n), angle(mesh.fn[x], mean)) for x in u)
+                if turn > SPREAD_DEG:
+                    # a small corner (where rounded edges meet) may turn further: one
+                    # N-sided patch spans it, bounded by the exact faces around it
+                    if turn > CORNER_SPREAD_DEG:
+                        continue
+                    P = mesh.pts[np.concatenate([mesh.fverts[x] for x in region + u])]
+                    if np.linalg.norm(np.ptp(P, axis=0)) > CORNER_SIZE:
+                        continue
                 free.difference_update(u)
                 region += u
                 stack += u
@@ -153,8 +166,46 @@ def add_blends(mesh, features):
         N = mesh.fn[facets]
         turn = math.degrees(math.acos(float(np.clip((N @ N.T).min(), -1, 1))))
         area = float(mesh.farea[facets].sum())
-        out.append(Feature(model=Blend(normal), label="smooth blend", detail=f"{len(facets)} facets, turns {turn:.0f} deg",
-                           convex=True, kind="blend", facets=facets, change=0.0, tolerance=0.02 * area,
-                           worst=0.0, parts=tuple(features[k] for k in parts)))
+        out.append(_blend(mesh, facets, tuple(features[k] for k in parts)))
         dropped.update(parts)
     return [f for k, f in enumerate(features) if k not in dropped] + out
+
+
+def _blend(mesh, facets, parts, depth=0):
+    N = mesh.fn[facets]
+    turn = math.degrees(math.acos(float(np.clip((N @ N.T).min(), -1, 1))))
+    normal = N.T @ mesh.farea[facets]
+    area = float(mesh.farea[facets].sum())
+    return Feature(model=Blend(normal / np.linalg.norm(normal)), label="smooth blend",
+                   detail=f"{len(facets)} facets, turns {turn:.0f} deg", convex=True, kind="blend",
+                   facets=np.asarray(facets), change=0.0, tolerance=0.02 * area, worst=0.0,
+                   parts=parts, depth=depth)
+
+
+def split(mesh, blend):
+    """A blend cut in two across its longest direction (each piece it replaced going
+    whole to the half holding most of it), or None if it can't be cut any further."""
+    if blend.depth >= MAX_SPLITS or len(blend.facets) < 8:
+        return None
+    C = mesh.fcent[blend.facets]
+    axis = np.linalg.svd(C - C.mean(axis=0))[2][0]
+    t = (C - C.mean(axis=0)) @ axis
+    cut = np.median(t)
+    side = {int(f): bool(x > cut) for f, x in zip(blend.facets, t)}
+    halves = [[], []], [[], []]          # (facets, parts) for each side
+    in_part = set()
+    for p in blend.parts:
+        votes = [side[int(f)] for f in p.facets if int(f) in side]
+        h = int(sum(votes) * 2 > len(votes))
+        halves[h][0].extend(int(f) for f in p.facets)
+        halves[h][1].append(p)
+        in_part.update(int(f) for f in p.facets)
+    for f in blend.facets:
+        if int(f) not in in_part:
+            halves[int(side[int(f)])][0].append(int(f))
+    out = []
+    for facets, parts in halves:
+        if len(facets) < 3:
+            return None
+        out.append(_blend(mesh, np.array(sorted(facets)), tuple(parts), blend.depth + 1))
+    return out

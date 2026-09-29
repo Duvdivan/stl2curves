@@ -25,6 +25,8 @@ from OCP.GeomAPI import GeomAPI_Interpolate
 from OCP.collections import HArray1_gp_Pnt
 from OCP.collections import List_TopoDS_Shape
 from OCP.GC import GC_MakeArcOfCircle
+from OCP.BRepMesh import BRepMesh_IncrementalMesh
+from OCP.TopLoc import TopLoc_Location
 from OCP.GeomAPI import GeomAPI_ProjectPointOnSurf
 from OCP.GeomLProp import GeomLProp_SLProps
 from OCP.BRepFill import BRepFill_Filling
@@ -617,6 +619,8 @@ def _repaired(face):
 
 # degree, points per boundary curve, iterations, anisotropy, 2d/3d/angular/curvature
 # tolerances, max degree, max segments
+USE_GUIDES = __import__("os").environ.get("S2C_GUIDES", "0") == "1"   # guide points past the outline: off (they pull against the real points where the neighbour is curved)
+BULGE_FACTOR = 1.0   # how far past a circular arc's sag a blend may bow over a facet
 FILL_SETTINGS = (3, 15, 2, False, 1e-5, 1e-4, 1e-2, 0.1, 8, 9)
 FINE_FILL_SETTINGS = (3, 30, 3, False, 1e-5, 1e-5, 1e-2, 0.1, 8, 20)
 
@@ -674,7 +678,7 @@ def _blend_face(feature, k, mesh, owner, bounds, edge_tri, edges):
         if edge is None:
             return None
         outline.append(edge)
-    inner = [pts[v] for v in V if v not in rim] + guides
+    inner = [pts[v] for v in V if v not in rim] + (guides if USE_GUIDES else [])
 
     def filled(settings):
         fill = BRepFill_Filling(*settings)
@@ -733,6 +737,8 @@ def _blend_face(feature, k, mesh, owner, bounds, edge_tri, edges):
         spread += mesh.tarea[t] * float(np.mean(np.abs(s_mid)))
     if worst > MAX_DEVIATION:
         return None
+    if not _hugs_mesh(face, mesh, tids):
+        return None
     gp = GProp_GProps()
     BRepGProp.SurfaceProperties_s(face, gp)
     target = float(mesh.farea[facets].sum())
@@ -755,6 +761,73 @@ def _blend_face(feature, k, mesh, owner, bounds, edge_tri, edges):
     feature.detail = feature.detail.split(", within")[0] + f", within {worst:.3f} mm of the mesh"
     cache[key] = (face, feature.change, feature.tolerance, feature.worst, feature.detail)
     return face
+
+
+def _point_triangle_distance(P, T):
+    """Distance from each point in P (n, 3) to the nearest of triangles T (m, 3, 3), and
+    which triangle that is."""
+    best = np.full(len(P), np.inf)
+    which = np.zeros(len(P), int)
+    for start in range(0, len(T), 256):
+        tri = T[start:start + 256]
+        a, b, c = tri[:, 0][None], tri[:, 1][None], tri[:, 2][None]
+        p = P[:, None]
+        ab, ac, ap = b - a, c - a, p - a
+        d1, d2 = (ab * ap).sum(-1), (ac * ap).sum(-1)
+        bp = p - b
+        d3, d4 = (ab * bp).sum(-1), (ac * bp).sum(-1)
+        cp = p - c
+        d5, d6 = (ab * cp).sum(-1), (ac * cp).sum(-1)
+        va = d3 * d6 - d5 * d4
+        vb = d5 * d2 - d1 * d6
+        vc = d1 * d4 - d3 * d2
+        denom = np.where(np.abs(va + vb + vc) > 1e-30, va + vb + vc, 1e-30)
+        v, w = vb / denom, vc / denom
+        inside = (v >= 0) & (w >= 0) & (v + w <= 1)
+        # inside: straight down onto the triangle; outside: the nearest point of its edges
+        dist = np.where(inside, np.linalg.norm(p - (a + ab * v[..., None] + ac * w[..., None]), axis=-1), np.inf)
+        for e0, e1 in ((a, b), (b, c), (c, a)):
+            e = e1 - e0
+            t = np.clip(((p - e0) * e).sum(-1) / np.maximum((e * e).sum(-1), 1e-30), 0, 1)
+            edge = np.linalg.norm(p - (e0 + e * t[..., None]), axis=-1)
+            dist = np.where(inside, dist, np.minimum(dist, edge))
+        k = dist.argmin(axis=1)
+        dmin = dist[np.arange(len(P)), k]
+        better = dmin < best
+        best[better], which[better] = dmin[better], k[better] + start
+    return best, which
+
+
+def _hugs_mesh(face, mesh, tids):
+    """Does the finished face stay as close to the mesh as a smooth surface through its
+    corners can? A smooth surface bows away from a flat facet by only about L*theta/4
+    (L its size, theta how far the surface turns across it, read from the mesh's own
+    corner normals); a fitted patch that waves between the corners bows much further."""
+    BRepMesh_IncrementalMesh(face, 0.005, False, 0.2, True)
+    loc = TopLoc_Location()
+    tri = BRep_Tool.Triangulation_s(face, loc)
+    if tri is None:
+        return False
+    nodes = np.array([[tri.Node(i).X(), tri.Node(i).Y(), tri.Node(i).Z()] for i in range(1, tri.NbNodes() + 1)])
+    ft = np.array([[tri.Triangle(i).Value(j) for j in (1, 2, 3)] for i in range(1, tri.NbTriangles() + 1)]) - 1
+    samples = np.vstack([nodes, nodes[ft].mean(axis=1)])
+    T = mesh.pts[mesh.tris[tids]]
+    d, k = _point_triangle_distance(samples, T)
+    # corner normals from the blend's own triangles only (averaging in a face across a
+    # sharp edge would make the surface look far more curved than it is)
+    corners = mesh.tris[tids]
+    vn = np.zeros_like(mesh.pts)
+    for j in range(3):
+        np.add.at(vn, corners[:, j], mesh.tn[tids] * mesh.tarea[tids][:, None])
+    vn /= np.maximum(np.linalg.norm(vn, axis=1), 1e-12)[:, None]
+    theta = np.arccos(np.clip(np.einsum("tkj,tj->tk", vn[corners], mesh.tn[tids]), -1, 1)).max(axis=1)
+    size = np.linalg.norm(T - T[:, [1, 2, 0]], axis=2).max(axis=1)
+    allowed = BULGE_FACTOR * size * theta / 4 + 0.005
+    if (d > allowed[k]).any():
+        return False
+    # and every mesh corner lies on the face itself (not just on its untrimmed surface)
+    dc, _ = _point_triangle_distance(mesh.pts[np.unique(corners)], nodes[ft])
+    return bool((dc <= MAX_DEVIATION).all())
 
 
 def _edge_gap(face):

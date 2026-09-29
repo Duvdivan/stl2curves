@@ -57,7 +57,7 @@ from features import load_stl, analyze, summarize, snap, Mesh, TOL
 from sizing import guess_size
 from build import build_faces, sew, features_near
 from bodies import split_bodies
-from blends import add_blends
+from blends import add_blends, split as split_blend
 
 
 def count(shape, kind):
@@ -270,9 +270,16 @@ def _build(mesh, features, mesh_tol, tol, fuse, info):
         while failed:  # patches whose face couldn't be built: drop them and retry
             if attempt.blamed:
                 blamed += [subset[k] for k in failed if subset[k].kind == "blend"]
-            info["skipped"] += [subset[k] for k in failed]
-            # a smooth blend that failed gives back the pieces it replaced
-            back = [p for k in failed for p in subset[k].parts]
+            # a smooth blend whose face won't fit is cut in two and tried again; failing
+            # that (or if it was only blamed), it gives back the pieces it replaced
+            back = []
+            for k in failed:
+                halves = None if attempt.blamed or subset[k].kind != "blend" else split_blend(mesh, subset[k])
+                if halves:
+                    back += halves
+                else:
+                    info["skipped"].append(subset[k])
+                    back += list(subset[k].parts)
             subset = [f for k, f in enumerate(subset) if k not in failed] + back
             result, failed = attempt(mesh, subset, mesh_tol, tol, fuse, faceted_volume)
         # A blend dropped for trouble nearby may have been innocent: once the part

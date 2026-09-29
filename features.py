@@ -56,6 +56,7 @@ LOOSE_MAX_GAP = 0.08        # mm: facet interiors (centres, edge midpoints) vs s
 LOOSE_MIN_TURN_DEG = {"cylinder": 6, "cone": 6, "sphere": 20, "torus": 20}
 LOOSE_MIN_FACETS = {"cylinder": 3, "cone": 6, "sphere": 8, "torus": 8}
 _loose = False
+_anchored = False   # the surface is pinned by the faces around it (fillets.py): trust it
 TWO_PI = 2 * math.pi
 
 
@@ -682,6 +683,17 @@ def analyze(pts, tris):
                     feature, idx, _ = best
                     region.free[idx] = False
                     features.append(feature)
+    # Pass 3: fillets between flat faces that the passes above couldn't make out (cut
+    # into few or irregular strips): a cylinder touching both faces, only its radius to find
+    import fillets
+    taken = np.zeros(len(mesh.farea), bool)
+    for f in features:
+        taken[f.facets] = True
+    rolled = fillets.find(mesh, regions, taken)
+    claimed = [int(f) for x in rolled for f in x.facets]
+    for region in regions:
+        region.free &= ~np.isin(region.facets, claimed)
+    features += rolled
     features += _loose_pass(mesh, regions, features)
     features = _band_tori(mesh, regions, features)
     return mesh, _merge_same_surface(mesh, features), _mesh_tol
@@ -1166,6 +1178,7 @@ class Feature:
     hi: float = 0.0
     planes: tuple = ()  # "wedge": planes through the centre bounding the corner
     parts: tuple = ()   # "blend": the pieces it replaced (put back if it can't be built)
+    depth: int = 0      # "blend": how many times it has been cut in two to make it fit
 
     def describe(self):
         return f"{self.label:<22} {self.detail}"
@@ -1189,7 +1202,7 @@ def _feature(mesh, model, fids, convex):
     worst = float(np.abs(s).max())
     if worst < 1e-5:
         return None
-    if _loose and (worst > LOOSE_MAX_GAP or not _loose_support(mesh, fids, model.kind)):
+    if _loose and not _anchored and (worst > LOOSE_MAX_GAP or not _loose_support(mesh, fids, model.kind)):
         return None
     base = dict(convex=convex, change=change, tolerance=0.5 * gain + 1e-3, facets=np.asarray(fids),
                 worst=worst)
