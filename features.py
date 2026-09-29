@@ -43,6 +43,8 @@ MIN_CORNERS = {"cylinder": 8, "cone": 10, "sphere": 8, "torus": 12}
 # A patch whose outline doesn't follow its own boundary lines (e.g. a hole running
 # out through a sloped face, or a rounded knob cut by another feature) is accepted as
 # a "trimmed" patch. Without the outline check to lean on, it needs more evidence:
+WHOLE_ON_SURFACE = 0.6     # a region fitted whole: this share of its corners on the surface
+WHOLE_STRAY = 0.02          # mm: how far the rest (outline corners on a seam) may stray
 TRIMMED_MIN_CORNERS = 12
 TRIMMED_MIN_FACETS = 6
 TRIMMED_MIN_TURN_DEG = 15   # the facets must face in directions at least this far apart
@@ -77,7 +79,45 @@ def load_stl(path):
     uniq, inv = np.unique(key, axis=0, return_inverse=True)
     pts = np.zeros((len(uniq), 3))
     pts[inv.ravel()] = verts
-    return pts, inv.reshape(-1, 3)
+    tris = inv.reshape(-1, 3)
+    tris = tris[(tris[:, 0] != tris[:, 1]) & (tris[:, 1] != tris[:, 2]) & (tris[:, 2] != tris[:, 0])]
+    return pts, _remove_slivers(pts, tris)
+
+
+def _remove_slivers(pts, tris):
+    """Remove slivers: triangles with one corner lying on the opposite side (all three
+    corners in a line). Their outline doubles back on itself, which spoils the face
+    they belong to. The triangle across that side is split at the corner instead, which
+    keeps the surface exactly as it was and the mesh closed."""
+    tris = tris.copy()
+    for _ in range(20):
+        T = tris
+        found = []
+        for k in range(3):
+            v, u, w = pts[T[:, k]], pts[T[:, (k + 1) % 3]], pts[T[:, (k + 2) % 3]]
+            e = w - u
+            length = np.linalg.norm(e, axis=1)
+            s = np.einsum("ij,ij->i", v - u, e) / np.maximum(length, 1e-12) ** 2
+            h = np.linalg.norm(np.cross(v - u, e), axis=1) / np.maximum(length, 1e-12)
+            for i in np.nonzero((h <= 1e-5 * length) & (h < 1e-4) & (s > 0) & (s < 1))[0]:
+                found.append((i, k))
+        if not found:
+            break
+        across = {(a, b): i for i, t in enumerate(T) for a, b in ((t[0], t[1]), (t[1], t[2]), (t[2], t[0]))}
+        drop, add, touched = set(), [], set()
+        for i, k in found:
+            v, u, w = T[i, k], T[i, (k + 1) % 3], T[i, (k + 2) % 3]
+            j = across.get((w, u))
+            if j is None or i in touched or j in touched:
+                continue
+            x = next(c for c in T[j] if c not in (u, w))
+            touched |= {i, j}
+            drop |= {i, j}
+            if x != v:          # (x == v: two slivers folded onto each other; both go)
+                add += [(w, v, x), (v, u, x)]
+        keep = np.array([i not in drop for i in range(len(T))])
+        tris = np.vstack([T[keep]] + ([np.array(add, dtype=T.dtype)] if add else []))
+    return tris
 
 
 def _labels(n, a, b):
@@ -107,6 +147,63 @@ def _edges(tris):
     return np.sort(tris[:, [0, 1, 1, 2, 2, 0]].reshape(-1, 2), axis=1)
 
 
+MERGE_MAX_DEG = 1     # rounding noise never explains a bigger tilt than this
+
+
+def grid_noise(pts):
+    """How far corners may sit off the true surface because the file rounded their
+    coordinates to a grid (many exports write 0.001 mm steps): half a step along each
+    axis. 0 when the coordinates aren't rounded."""
+    for step in (0.01, 0.001, 0.0001):
+        err = np.abs(pts - np.round(pts / step) * step)
+        if (err <= 2.5e-7 * np.abs(pts) + 1e-7).mean() >= 0.75:
+            return step * math.sqrt(3) / 2
+    return 0.0
+
+
+def _merge_flat(pts, tris, tn, tarea, labels, t1, t2, noise, tol):
+    """Join neighbouring facets that differ only by rounding noise. Rounded corners tilt
+    a long thin triangle by up to noise / its width, which splits one flat face into many
+    facets. Two triangles are joined when their tilt is within what the noise explains,
+    and only while all the corners of the joined facet still lie on one plane (so a
+    finely cut curve can't creep into a plane one strip at a time)."""
+    if noise <= 0 or not len(t1):
+        return labels
+    corners = pts[tris]
+    longest = np.linalg.norm(corners - corners[:, [1, 2, 0]], axis=2).max(axis=1)
+    width = 2 * tarea / np.maximum(longest, 1e-12)
+    dot = np.clip(np.einsum("ij,ij->i", tn[t1], tn[t2]), -1, 1)
+    allowed = np.minimum(noise / np.maximum(width[t1], 1e-12) + noise / np.maximum(width[t2], 1e-12),
+                         math.radians(MERGE_MAX_DEG))    # (specks narrower than the noise: no)
+    ok = (np.arccos(dot) <= allowed) & (labels[t1] != labels[t2])
+    if not ok.any():
+        return labels
+    verts = {}
+    for t, f in enumerate(labels):
+        verts.setdefault(int(f), set()).update(tris[t].tolist())
+    parent = list(range(labels.max() + 1))
+
+    def root(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for i in np.nonzero(ok)[0][np.argsort(-dot[ok])]:
+        x, y = root(int(labels[t1[i]])), root(int(labels[t2[i]]))
+        if x == y:
+            continue
+        both = verts[x] | verts[y]
+        P = pts[list(both)]
+        mid = P.mean(axis=0)
+        n = np.linalg.svd(P - mid, full_matrices=False)[2][2]
+        if np.abs((P - mid) @ n).max() <= tol + noise:
+            parent[x] = y
+            verts[y] = both
+            del verts[x]
+    return np.unique([root(int(f)) for f in labels], return_inverse=True)[1]
+
+
 class Mesh:
     """Triangles grouped into flat facets, with which facets meet at a gentle bend."""
 
@@ -129,6 +226,9 @@ class Mesh:
         flat = dot > math.cos(math.radians(COPLANAR_DEG))
 
         self.facet_of = _labels(len(self.tris), t1[flat], t2[flat])
+        self.noise = grid_noise(pts)
+        self.facet_of = _merge_flat(self.pts, self.tris, self.tn, self.tarea, self.facet_of,
+                                    t1[~flat], t2[~flat], self.noise, TOL + FLOAT_TOL * float(np.abs(pts).max()))
         nf = self.facet_of.max() + 1
         self.ftris = _groups(self.facet_of)
         self.farea = np.bincount(self.facet_of, self.tarea, nf)
@@ -638,6 +738,69 @@ def _seed_candidates(mesh, region, i, j):
     return _best(found)
 
 
+def _whole_region(mesh, region):
+    """The one cylinder, cone or sphere a whole smooth region lies on, if it is all one
+    surface (a countersink, a plain hole or boss between two creases). Fitted from every
+    facet at once: a cone cut into long thin triangles fools any guess from a few facets
+    (a thin strip of cone looks like a tilted cylinder)."""
+    idx = np.arange(len(region.facets))
+    P, N = region.points(idx), region.n
+    if len(P) < MIN_CORNERS["cylinder"]:
+        return None
+    guesses = []
+    sv, V = np.linalg.svd(N, full_matrices=False)[1:]
+    if sv[2] <= 0.1 * sv[0]:
+        guesses.append(_cylinder(V[2], P))      # every normal square to the axis
+    guesses.append(_cone(N, P))                  # every normal at one angle to the axis
+    found = []
+    for model in guesses:
+        if model is None:
+            continue
+        model = _tube_fit(P, model)
+        if _fits(model, P):
+            seed = [int(np.argmax(mesh.farea[region.facets]))]
+            found.append(_candidate(mesh, region, model, seed))
+        elif model is not None:
+            found.append(_whole_despite_seams(mesh, region, model))
+    ball = _sphere(P)
+    if _fits(ball, P):
+        found.append(_candidate(mesh, region, ball, [0]))
+    return _best(found)
+
+
+def _whole_despite_seams(mesh, region, model):
+    """The whole region on this surface although a few corners are off it: meshes where
+    one face's triangulation put extra points on the straight chords of another face's
+    outline (a few microns inside the curve). Accepted only if nearly every corner lies
+    on the surface and the stray ones are all on the region's outline, close by."""
+    idx = np.arange(len(region.facets))
+    P = region.P
+    for _ in range(4):
+        off = np.abs(model.signed(P))
+        keep = off <= max(_tol(model), 3 * np.median(off))
+        if keep.mean() < 0.5 or keep.sum() < MIN_CORNERS[model.kind]:
+            return None
+        model = _tube_fit(P[keep], model)
+        if model is None:
+            return None
+    off = np.abs(model.signed(P))
+    on = off <= _tol(model)
+    if on.mean() < WHOLE_ON_SURFACE or off.max() > WHOLE_STRAY:
+        return None
+    T = mesh.tris[np.concatenate([mesh.ftris[f] for f in region.facets])]
+    uniq, counts = np.unique(_edges(T), axis=0, return_counts=True)
+    if not set(region.vids[~on].tolist()) <= set(uniq[counts == 1].ravel().tolist()):
+        return None
+    ok, out, surface_n = region._test(model, idx)
+    facing = np.abs(np.einsum("ij,ij->i", region.n, surface_n))
+    if (out != out[0]).any() or (facing < math.cos(math.radians(NORMAL_DEG))).any():
+        return None
+    feature = _feature(mesh, model, region.facets, bool(out[0]))
+    if feature is None:
+        return None
+    return feature, idx, float(mesh.farea[region.facets].sum())
+
+
 def find_features(pts, tris):
     """Return a Feature for every curved patch that can be rebuilt exactly."""
     return analyze(pts, tris)[1]
@@ -646,10 +809,19 @@ def find_features(pts, tris):
 def analyze(pts, tris):
     """Return (mesh, features, tolerance): the facet structure and every rebuildable patch."""
     global _mesh_tol
-    _mesh_tol = TOL + FLOAT_TOL * float(np.abs(pts).max())
     mesh = Mesh(pts, tris)
+    _mesh_tol = TOL + FLOAT_TOL * float(np.abs(pts).max())
     regions = [Region(mesh, g) for g in mesh.smooth_regions()]
     features = []
+
+    # Pass 0: smooth regions that are all one surface, fitted whole.
+    for region in regions:
+        if len(region.facets) >= 6:
+            best = _whole_region(mesh, region)
+            if best:
+                feature, idx, _ = best
+                region.free[idx] = False
+                features.append(feature)
 
     # Pass 1: from each pair of neighbouring facets, work out what surface they're on.
     for region in regions:
@@ -710,16 +882,20 @@ def analyze(pts, tris):
 
 
 def _tube_fit(P, model, steps=30):
-    """Least-squares torus (or cylinder) through points P, starting from `model`.
+    """Least-squares torus, cylinder or cone through points P, starting from `model`.
 
     Gauss-Newton on the fewest parameters: the axis tilted by two small angles, the
-    centre moved across it (and along it for a torus), and the radii.
+    centre moved across it (and along it for a torus), and the radii (for a cone, the
+    radius where the axis point is and how fast it grows).
     """
     torus = not model.line
+    cone = not torus and model.line[1] != 0
     d0, e1, e2 = _frame(model.d)
     if torus:
         rc, zc, r = model.circle
         c0, x = model.a + zc * d0, np.array([0, 0, 0, 0, 0, rc, r], float)
+    elif cone:
+        c0, x = model.a, np.array([0, 0, 0, 0, model.line[0], model.line[1]], float)
     else:
         c0, x = model.a, np.array([0, 0, 0, 0, model.line[0]], float)
 
@@ -730,7 +906,11 @@ def _tube_fit(P, model, steps=30):
         v = P - c
         z = v @ d
         rho = np.linalg.norm(v - np.outer(z, d), axis=1)
-        return np.hypot(rho - x[5], z) - x[6] if torus else rho - x[4]
+        if torus:
+            return np.hypot(rho - x[5], z) - x[6]
+        if cone:
+            return (rho - x[4] - x[5] * z) / math.hypot(1, x[5])
+        return rho - x[4]
 
     f = res(x)
     for _ in range(steps):
@@ -760,6 +940,9 @@ def _tube_fit(P, model, steps=30):
     if torus:
         c = c + x[4] * d0
         return Revolved(c, d, circle=(abs(x[5]), float(c @ d), abs(x[6])))
+    if cone:
+        # the model measures heights from the axis point nearest the origin
+        return Revolved(c, d, line=(float(x[4] - x[5] * (c @ d)), float(x[5])))
     return Revolved(c, d, line=(abs(x[4]), 0))
 
 

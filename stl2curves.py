@@ -204,10 +204,17 @@ def attempt(mesh, features, mesh_tol, tol, fuse, faceted_volume):
         shape, nb, nv, signed = solids_from_shells(sewn, fuse)
     except RuntimeError:
         return None, []
-    expected = faceted_volume + sum(f.change for f in features)
+    change = sum(f.change for f in features)
+    expected = faceted_volume + change
     allowed = sum(f.tolerance for f in features) + 1e-6 * abs(faceted_volume) + 1e-3
     if abs(signed - expected) > allowed:
-        return None, []
+        # a mesh whose bare facets already don't add up to its volume (it crosses itself,
+        # say) is measured against what the bare facets give instead
+        if not _mesh_defective(mesh, tol, fuse) or mesh.bare_volume is None:
+            return None, []
+        expected = mesh.bare_volume + change
+        if abs(signed - expected) > allowed:
+            return None, []
     if not BRepCheck_Analyzer(shape).IsValid():
         fix = ShapeFix_Shape(shape)
         fix.Perform()
@@ -224,13 +231,16 @@ def attempt(mesh, features, mesh_tol, tol, fuse, faceted_volume):
 
 
 def _mesh_defective(mesh, tol, fuse):
-    """Is the mesh, built from bare facets, already not a valid solid?"""
+    """Is the mesh, built from bare facets, already not a valid solid (or not one with
+    the mesh's volume)? Sets mesh.bare_volume to the volume the bare facets give."""
     if "defective" not in mesh.__dict__:
         comp, shells, _ = build_faces(mesh, [], TOL)
         sewn, free = sew(comp, tol, shells)
+        mesh.bare_volume = None
         try:
-            shape = solids_from_shells(sewn, fuse)[0]
-            mesh.defective = bool(free) or not BRepCheck_Analyzer(shape).IsValid()
+            shape, _, _, mesh.bare_volume = solids_from_shells(sewn, fuse)
+            off = abs(mesh.bare_volume - mesh_volume(mesh)) > 1e-6 * abs(mesh_volume(mesh)) + 1e-3
+            mesh.defective = bool(free) or off or not BRepCheck_Analyzer(shape).IsValid()
         except RuntimeError:
             mesh.defective = True
     return mesh.defective

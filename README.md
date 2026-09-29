@@ -65,10 +65,18 @@ Without it the size is left alone (a slight scale is often deliberate, for fit).
 
 ## How it works
 
-1. **Facets** — triangles are grouped into flat facets (coplanar pieces).
-2. **Detection** (`features.py`) — neighbouring facets propose a surface (cylinder,
-   cone, sphere; tori on axes already found), which is grown while mesh corners stay
-   within a micron of it. Strict passes first (a patch must follow its surface's natural
+1. **Facets** — triangles are grouped into flat facets (coplanar pieces). The mesh is
+   tidied first: sliver triangles (three corners in a line) are split away, and when the
+   file rounded its coordinates (many exports write 0.001 mm steps) the rounding noise is
+   allowed for, both when deciding which triangles are coplanar (long thin triangles
+   tilt noticeably) and in every surface test. Pieces of the mesh that merely touch
+   (stacked blocks) are converted separately and fused.
+2. **Detection** (`features.py`) — first, each smooth area bounded by sharp edges is
+   tried as a whole (a countersink, a plain hole): one cylinder, cone or sphere fitted
+   through all its corners at once, allowing a few outline corners that a neighbouring
+   face's triangulation put slightly off the curve. Then neighbouring facets propose a
+   surface (cylinder, cone, sphere; tori on axes already found), which is grown while
+   mesh corners stay within a micron of it. Strict passes first (a patch must follow its surface's natural
    boundary lines, or meet its neighbours at creases), then fillets between flat faces
    (`fillets.py`: two faces meeting at an angle, rounded off, give a cylinder touching
    both, so only the radius is unknown and every strip corner pins it down; this finds
@@ -95,13 +103,17 @@ Without it the size is left alone (a slight scale is often deliberate, for fit).
    blend must pass within 0.02 mm of every mesh corner and may not bow away from a facet
    more than a circular arc through its corners would. Patches next to gaps or invalid
    faces left by sewing are dropped individually (blends first, then the nearest patch);
-   if the volume check fails, the feature list is halved to find the culprits. A final
-   tidy-up is kept only if the solid is still valid.
+   if the volume check fails, the feature list is halved to find the culprits (for ten
+   minutes at most; whatever is left then stays faceted). A patch that runs all the way
+   round its axis but is cut to shape is built as two half rings if it won't build whole.
+   A final tidy-up is kept only if the solid is still valid. If the STL itself is not a
+   clean solid (it touches or crosses itself), the result is checked against what its
+   bare facets give and flagged with a warning.
 
 Limits: large freeform areas (organic shells, variable-radius rounds over big areas)
 mostly stay faceted: the smooth patch fitter manages small blends and corners, but not
 yet whole freeform surfaces. Such parts also convert slowly (tens of minutes at ~17k
-triangles).
+triangles). Screw threads (helical surfaces) stay faceted.
 
 ## Tests
 

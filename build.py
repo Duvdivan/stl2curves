@@ -388,6 +388,8 @@ def _planar_face(mesh, fid, owner, bounds, edge_tri, edges):
     area = lambda loop: abs(sum(np.cross(pts[loop[i]], pts[loop[(i + 1) % len(loop)]]) @ normal
                                 for i in range(len(loop))))
     loops.sort(key=area, reverse=True)
+    if area(loops[-1]) < 1e-9 * area(loops[0]) + 1e-9:
+        return None     # a slit (an outline enclosing nothing): also left as triangles
     wires = []
     for loop in loops:
         n = len(loop)
@@ -417,7 +419,9 @@ def _planar_face(mesh, fid, owner, bounds, edge_tri, edges):
         if wire is None:
             return None
         wires.append(wire)
-    plane = gp_Pln(_pnt(pts[tris[0][0]]), gp_Dir(*normal))
+    # the plane through the middle of the corners: a facet joined across rounding noise
+    # has corners a little either side of it
+    plane = gp_Pln(_pnt(pts[mesh.fverts[fid]].mean(axis=0)), gp_Dir(*normal))
     maker = BRepBuilderAPI_MakeFace(plane, wires[0], True)
     for w in wires[1:]:
         maker.Add(w)
@@ -425,7 +429,17 @@ def _planar_face(mesh, fid, owner, bounds, edge_tri, edges):
         return None
     fix = ShapeFix_Face(maker.Face())
     fix.Perform()
-    return fix.Face()
+    face = fix.Face()
+    if mesh.noise and not BRepCheck_Analyzer(face).IsValid():
+        # (edges a rounding step off the plane: widen their tolerances to match)
+        whole = ShapeFix_Shape(face)
+        whole.SetPrecision(mesh.noise)
+        whole.SetMaxTolerance(10 * mesh.noise)
+        whole.Perform()
+        ex = TopExp_Explorer(whole.Shape(), TopAbs_FACE)
+        if ex.More():
+            face = TopoDS.Face(ex.Current())
+    return face
 
 
 def _patch_faces(feature, bound, mesh):

@@ -68,11 +68,48 @@ def _partners(pts, tris, t_list, u, v):
 
 
 def split_bodies(pts, tris):
-    """Groups of triangles to convert separately: one group when the mesh has no edge
-    shared by more than two triangles (the usual case), otherwise bodies that touch go in
-    different groups. Stray slivers (open or flat pieces of a few triangles) are dropped."""
+    """Groups of triangles to convert separately: separate pieces that merely touch or
+    lie apart (stacked blocks, say: sewing would stitch their touching faces together),
+    and within each, bodies that meet along an edge. Stray slivers (open or flat pieces
+    of a few triangles) are dropped."""
     # (zero-area slivers are kept: along a T-junction they are what closes the gap)
     tris = tris[(tris[:, 0] != tris[:, 1]) & (tris[:, 1] != tris[:, 2]) & (tris[:, 2] != tris[:, 0])]
+    groups = []
+    for part in _apart(pts, tris):
+        groups += _touching_at_edges(pts, part)
+    return groups
+
+
+def _apart(pts, tris):
+    """The mesh's pieces (no shared corners) in clusters whose bounding boxes overlap: a
+    cavity or a body sunk into another stays with it, the rest are converted apart."""
+    parent, find = _union_find(len(pts))
+    for a, b in np.concatenate([tris[:, [0, 1]], tris[:, [1, 2]]]):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+    piece = np.array([find(v) for v in tris[:, 0]])
+    ids = np.unique(piece)
+    if len(ids) == 1:
+        return [tris]
+    lo = np.array([pts[np.unique(tris[piece == i])].min(axis=0) for i in ids])
+    hi = np.array([pts[np.unique(tris[piece == i])].max(axis=0) for i in ids])
+    size = float((hi - lo).max())
+    cluster, find2 = _union_find(len(ids))
+    for i in range(len(ids)):
+        for j in range(i + 1, len(ids)):
+            overlap = np.minimum(hi[i], hi[j]) - np.maximum(lo[i], lo[j])
+            if overlap.min() > 1e-4 * size:
+                ri, rj = find2(i), find2(j)
+                if ri != rj:
+                    cluster[ri] = rj
+    root = np.array([find2(i) for i in range(len(ids))])
+    where = {v: k for k, v in enumerate(ids)}
+    of = root[[where[v] for v in piece]]
+    return [tris[of == r] for r in np.unique(of)]
+
+
+def _touching_at_edges(pts, tris):
     e = np.sort(np.concatenate([tris[:, [0, 1]], tris[:, [1, 2]], tris[:, [2, 0]]]), axis=1)
     owner = np.tile(np.arange(len(tris)), 3)
     key = e[:, 0].astype(np.int64) * (len(pts) + 1) + e[:, 1]
