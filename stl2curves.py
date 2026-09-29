@@ -212,14 +212,19 @@ def attempt(mesh, features, mesh_tol, tol, fuse, faceted_volume):
         # say) is measured against what the bare facets give instead
         if not _mesh_defective(mesh, tol, fuse) or mesh.bare_volume is None:
             return None, []
+        # (give or take what the defect itself does: it sews a little differently each time)
         expected = mesh.bare_volume + change
-        if abs(signed - expected) > allowed:
+        if abs(signed - expected) > allowed + abs(mesh.bare_volume - faceted_volume):
             return None, []
     if not BRepCheck_Analyzer(shape).IsValid():
-        fix = ShapeFix_Shape(shape)
-        fix.Perform()
-        if BRepCheck_Analyzer(fix.Shape()).IsValid() and abs(volume(fix.Shape()) - expected) <= allowed:
-            shape = fix.Shape()
+        fixed_shape = None
+        if not mesh.__dict__.get("defective"):      # (no repair mends a mesh that crosses itself)
+            fix = ShapeFix_Shape(shape)
+            fix.Perform()
+            fixed_shape = fix.Shape()
+        if (fixed_shape is not None and BRepCheck_Analyzer(fixed_shape).IsValid()
+                and abs(volume(fixed_shape) - expected) <= allowed):
+            shape = fixed_shape
         else:
             # patches next to faces that came out invalid: drop just those and try again
             blame = culprits(mesh, features, invalid_face_points(shape))
