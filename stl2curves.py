@@ -28,6 +28,9 @@ Usage:
                    (undoing e.g. a 99% slicer scale or an inch/cm export), with radii
                    snapped to round values
   --details        list every rebuilt feature with its size
+  --simplify MM    thin out an over-dense mesh first, moving its surface by at most MM
+                   (0: never; by default meshes over 150,000 triangles, at 0.005 mm)
+  --no-repair      don't mend mesh defects first
 """
 import argparse
 import os
@@ -58,8 +61,12 @@ from sizing import guess_size
 from build import build_faces, sew, features_near, settle_blends
 from bodies import split_bodies
 from blends import add_blends, split as split_blend, _blend as as_blend
+from repair import repair
+from simplify import simplify
 
 SEARCH_SECONDS = 600    # time allowed for hunting down patches that spoil the solid
+AUTO_SIMPLIFY = 150000  # meshes with more triangles than this are thinned out first ...
+SIMPLIFY_ERROR = 0.005  # ... moving the surface by at most this (mm)
 
 
 def count(shape, kind):
@@ -378,9 +385,21 @@ def _build(mesh, features, mesh_tol, tol, fuse, info):
     return result
 
 
-def stl_to_solid(path, tol, fuse=True, curves=True, true_size=False, blends=True):
+def stl_to_solid(path, tol, fuse=True, curves=True, true_size=False, blends=True, mend=True,
+                 simplify_to=None):
+    """simplify_to: how far (mm) thinning out an over-dense mesh may move its surface;
+    None: only above AUTO_SIMPLIFY triangles, at SIMPLIFY_ERROR; 0: never."""
     pts, tris = load_stl(path)
-    info = {"triangles": len(tris), "restored": [], "skipped": [], "size": None, "snapped": 0}
+    info = {"triangles": len(tris), "restored": [], "skipped": [], "size": None, "snapped": 0,
+            "repairs": [], "simplified": None}
+    if mend:
+        pts, tris, info["repairs"] = repair(pts, tris)
+    if simplify_to is None:
+        simplify_to = SIMPLIFY_ERROR if len(tris) > AUTO_SIMPLIFY else 0
+    if simplify_to:
+        before = len(tris)
+        tris = simplify(pts, tris, simplify_to)
+        info["simplified"] = (before, len(tris), simplify_to)
     groups = split_bodies(pts, tris)          # bodies touching at an edge are built apart
     if curves:
         parts = [analyze(pts, g) for g in groups]
@@ -481,6 +500,11 @@ def main():
     ap.add_argument("--details", action="store_true", help="list every rebuilt feature")
     ap.add_argument("--no-blends", action="store_true",
                     help="don't turn curved areas no simple surface fits into smooth freeform faces")
+    ap.add_argument("--no-repair", action="store_true",
+                    help="don't mend mesh defects (duplicates, slivers, cracks, holes, flipped or crossing triangles)")
+    ap.add_argument("--simplify", type=float, metavar="MM",
+                    help=f"thin out the mesh first, moving its surface by at most MM (0: never; default: "
+                         f"{SIMPLIFY_ERROR} mm for meshes over {AUTO_SIMPLIFY:,} triangles)")
     ap.add_argument("--true-size", action="store_true",
                     help="rebuild at the apparent design size, with radii snapped to round values")
     args = ap.parse_args()
@@ -496,7 +520,7 @@ def main():
         t = time.time()
         print(f"{f.name}: converting...", flush=True)
         shape, info = stl_to_solid(f, args.tol, not args.no_fuse, not args.no_curves, args.true_size,
-                                   not args.no_blends)
+                                   not args.no_blends, not args.no_repair, args.simplify)
         out_dir = Path(args.out) if args.out else f.parent
         out_dir.mkdir(parents=True, exist_ok=True)
         out = out_dir / (f.stem + ".step")
@@ -508,6 +532,11 @@ def main():
               f"volume {info['volume']:,.1f} mm^3, "
               f"{'valid solid' if info['valid'] else 'WARNING: check geometry' + (' (the STL itself is not a clean solid: it touches or crosses itself)' if info.get('mesh_defects') else '')}, "
               f"{time.time() - t:.1f}s -> {out}")
+        if info["repairs"]:
+            print("  mended the mesh: " + "; ".join(info["repairs"]))
+        if info["simplified"]:
+            before, after, err = info["simplified"]
+            print(f"  thinned out: {before:,} -> {after:,} triangles (surface moved {err} mm at most)")
         if info["restored"] or info["skipped"]:
             print(describe_features(info, args.details))
         if info["size"] is not None:

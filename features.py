@@ -81,43 +81,7 @@ def load_stl(path):
     pts[inv.ravel()] = verts
     tris = inv.reshape(-1, 3)
     tris = tris[(tris[:, 0] != tris[:, 1]) & (tris[:, 1] != tris[:, 2]) & (tris[:, 2] != tris[:, 0])]
-    return pts, _remove_slivers(pts, tris)
-
-
-def _remove_slivers(pts, tris):
-    """Remove slivers: triangles with one corner lying on the opposite side (all three
-    corners in a line). Their outline doubles back on itself, which spoils the face
-    they belong to. The triangle across that side is split at the corner instead, which
-    keeps the surface exactly as it was and the mesh closed."""
-    tris = tris.copy()
-    for _ in range(20):
-        T = tris
-        found = []
-        for k in range(3):
-            v, u, w = pts[T[:, k]], pts[T[:, (k + 1) % 3]], pts[T[:, (k + 2) % 3]]
-            e = w - u
-            length = np.linalg.norm(e, axis=1)
-            s = np.einsum("ij,ij->i", v - u, e) / np.maximum(length, 1e-12) ** 2
-            h = np.linalg.norm(np.cross(v - u, e), axis=1) / np.maximum(length, 1e-12)
-            for i in np.nonzero((h <= 1e-5 * length) & (h < 1e-4) & (s > 0) & (s < 1))[0]:
-                found.append((i, k))
-        if not found:
-            break
-        across = {(a, b): i for i, t in enumerate(T) for a, b in ((t[0], t[1]), (t[1], t[2]), (t[2], t[0]))}
-        drop, add, touched = set(), [], set()
-        for i, k in found:
-            v, u, w = T[i, k], T[i, (k + 1) % 3], T[i, (k + 2) % 3]
-            j = across.get((w, u))
-            if j is None or i in touched or j in touched:
-                continue
-            x = next(c for c in T[j] if c not in (u, w))
-            touched |= {i, j}
-            drop |= {i, j}
-            if x != v:          # (x == v: two slivers folded onto each other; both go)
-                add += [(w, v, x), (v, u, x)]
-        keep = np.array([i not in drop for i in range(len(T))])
-        tris = np.vstack([T[keep]] + ([np.array(add, dtype=T.dtype)] if add else []))
-    return tris
+    return pts, tris
 
 
 def _labels(n, a, b):
