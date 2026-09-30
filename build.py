@@ -36,7 +36,8 @@ from OCP.ShapeFix import ShapeFix_Face, ShapeFix_Shape
 from OCP.TopAbs import TopAbs_EDGE, TopAbs_FACE, TopAbs_SHELL, TopAbs_REVERSED
 from OCP.TopExp import TopExp_Explorer
 from OCP.TopoDS import TopoDS, TopoDS_Compound
-from OCP.gp import gp_Ax1, gp_Ax2, gp_Circ, gp_Dir, gp_Pln, gp_Pnt
+from OCP.gp import gp_Ax1, gp_Ax2, gp_Ax3, gp_Circ, gp_Dir, gp_Pln, gp_Pnt
+from OCP.Geom import Geom_ToroidalSurface
 
 from features import TWO_PI, _angle_gap, _frame, Revolved, Sphere
 from blends import TANGENT_DEG, MAX_DEVIATION, MAX_BULGE, MAX_EDGE_GAP
@@ -462,8 +463,20 @@ def _patch_faces(feature, bound, mesh):
     return [_revolved_face(bound, feature.lo, feature.hi, feature.u0, feature.span)]
 
 
-def _revolved_face(bound, lo, hi, u0, span):
+def _plain_torus(m, lo, hi):
+    """Would sweeping this profile give a general surface of revolution rather than a
+    torus (a tube all round, or a bend tighter than its tube)?"""
+    return bool(m.circle) and m.circle[0] > 0 and (hi - lo >= TWO_PI - 1e-9 or m.circle[0] < m.circle[2])
+
+
+def _revolved_face(bound, lo, hi, u0, span, exact=True):
     m = bound.m
+    if exact and _plain_torus(m, lo, hi):
+        # there the torus is made directly (the model's frame d, e1, e2 is right-handed
+        # and its profile angle is the torus's own v); exact=False sweeps it all the same
+        rc, zc, r = m.circle
+        torus = Geom_ToroidalSurface(gp_Ax3(_pnt(m.a + zc * m.d), gp_Dir(*m.d), gp_Dir(*m.e1)), rc, r)
+        return BRepBuilderAPI_MakeFace(torus, u0, u0 + span, lo, hi, 1e-7).Face()
     if m.line:
         edge = _line(bound.profile_point(lo, u0), bound.profile_point(hi, u0))
     elif hi - lo >= TWO_PI - 1e-9:
@@ -494,8 +507,9 @@ def _sphere_face(center, r, avoid):
     return TopoDS.Face(TopExp_Explorer(ball, TopAbs_FACE).Current())
 
 
-def _generous_surface(feature, bound, mesh):
-    """A piece of the patch's surface comfortably bigger than the patch."""
+def _generous_surface(feature, bound, mesh, exact=True):
+    """A piece of the patch's surface comfortably bigger than the patch (exact: see
+    _revolved_face)."""
     m = feature.model
     if isinstance(m, Sphere):
         return _sphere_face(m.c, m.r, [mesh.fn[f] for f in feature.facets])
@@ -519,8 +533,8 @@ def _generous_surface(feature, bound, mesh):
         # (less on a side where the margin would run the profile across the axis: a
         # bent tube whose bend is tighter than the tube is wide passes close to it)
         crosses = lambda a, b: (rc + r * np.cos(np.linspace(a, b, 60)) < 0).any()
-        grow_lo = next((m for m in margin * np.array([1, 0.5, 0.25, 0.1]) if not crosses(lo - m, lo)), 0.0)
-        grow_hi = next((m for m in margin * np.array([1, 0.5, 0.25, 0.1]) if not crosses(hi, hi + m)), 0.0)
+        grow_lo = next((g for g in margin * np.array([1, 0.5, 0.25, 0.1]) if not crosses(lo - g, lo)), 0.0)
+        grow_hi = next((g for g in margin * np.array([1, 0.5, 0.25, 0.1]) if not crosses(hi, hi + g)), 0.0)
         lo, hi = lo - grow_lo, hi + grow_hi
         if margin and hi - lo >= TWO_PI - 1e-6:
             return None
@@ -532,7 +546,7 @@ def _generous_surface(feature, bound, mesh):
             u0, span = 0.0, TWO_PI
         else:
             u0, span = u0 - grow, span + 2 * grow
-    return _revolved_face(bound, lo, hi, u0, span)
+    return _revolved_face(bound, lo, hi, u0, span, exact)
 
 
 THREAD_SAMPLES = 48     # points a turn on a thread's helices (a B-spline through them is
@@ -709,13 +723,21 @@ def _trimmed_face(feature, k, bound, mesh, owner, bounds, edge_tri, edges, tol):
                 return None
             tools.append(edge)
             per_loop[-1].append(edge)
-    base = _generous_surface(feature, bound, mesh)
-    if base is None:
-        return None
-    face = _split_face(feature, mesh, base, tools, loops, tol)
-    if face is None:
-        face = _outline_face(feature, mesh, base, loops, per_loop)
-    return face if face is not None else _polygon_face(feature, mesh, base, loops)
+    # (a torus made directly doesn't always cut where its swept twin does: then the
+    # same surface as a swept profile)
+    swept = isinstance(m, Revolved) and _plain_torus(m, feature.lo, feature.hi)
+    for exact in (True, False) if swept else (True,):
+        base = _generous_surface(feature, bound, mesh, exact)
+        if base is None:
+            return None
+        face = _split_face(feature, mesh, base, tools, loops, tol)
+        if face is None:
+            face = _outline_face(feature, mesh, base, loops, per_loop)
+        if face is None:
+            face = _polygon_face(feature, mesh, base, loops)
+        if face is not None:
+            return face
+    return None
 
 
 def _outline_face(feature, mesh, base, loops, per_loop):
