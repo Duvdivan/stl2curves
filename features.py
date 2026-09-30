@@ -59,6 +59,8 @@ LOOSE_MIN_TURN_DEG = {"cylinder": 6, "cone": 6, "sphere": 20, "torus": 20}
 LOOSE_MIN_FACETS = {"cylinder": 3, "cone": 6, "sphere": 8, "torus": 8}
 _loose = False
 _anchored = False   # the surface is pinned by the faces around it (fillets.py): trust it
+_axis_vouched = False   # on an axis another patch already has, in a rounded-off mesh: a cut-to-
+                        # shape patch may hand over smoothly (to its own fillets) all round
 TWO_PI = 2 * math.pi
 
 
@@ -112,6 +114,7 @@ def _edges(tris):
 
 
 MERGE_MAX_DEG = 1     # rounding noise never explains a bigger tilt than this
+AXIS_NOISE = 10       # on a known axis, corners may sit this many rounding steps off
 
 
 def grid_noise(pts):
@@ -369,9 +372,15 @@ def _line_on_direction(d, P):
     k, c0 = np.polyfit(z, rho, 1)
     if abs(k) > math.tan(math.radians(80)):
         return None                     # nearly flat: leave it as a plane
-    if abs(k) < 1e-4:
+    if _straight(k, z):
         k, c0 = 0, rho.mean()
     return Revolved(cx * e1 + cy * e2, d, line=(c0, k))
+
+
+def _straight(k, z):
+    """Is a line profile's slope k (over heights z) no slope at all? (A rounded-off mesh
+    tilts a cylinder's fit by a hair; straightened, it still fits within tolerance.)"""
+    return abs(k) < 1e-4 or abs(k) * np.ptp(z) / 2 <= _tol()
 
 
 def _rings_refit(model, P):
@@ -422,7 +431,7 @@ def _on_axis(axis, P):
         return None
     if np.ptp(z) > 1e-6:
         k, c0 = np.polyfit(z, rho, 1)
-        if abs(k) < 1e-4:
+        if _straight(k, z):
             k, c0 = 0, rho.mean()
         line = Revolved(axis[0], axis[1], line=(c0, k))
         if abs(k) < math.tan(math.radians(80)) and _fits(line, P):
@@ -787,6 +796,24 @@ def analyze(pts, tris):
                 region.free[idx] = False
                 features.append(feature)
 
+    # Screw threads, among the curved facets still unexplained: before any pass that
+    # tries surfaces round known axes (a thread's crest, root and flanks lie close to a
+    # cylinder or cone on its own axis, which is often a hole's too) or the loose pass
+    # (which would take pieces of them for cylinders and cones)
+    import threads
+    free = [region.facets[region.free] for region in regions]
+    screws = []
+    for thread, fids in threads.find(mesh, np.concatenate(free) if free else np.zeros(0, int)):
+        screws += threads.patches(mesh, thread, fids)
+    claimed = [int(f) for x in screws for f in x.facets]
+    for region in regions:
+        region.free &= ~np.isin(region.facets, claimed)
+
+    # Pass 0b: surfaces on the axes found so far (a lug round its screw hole), before
+    # pairs of facets can propose surfaces of their own: on a coarse, rounded-off mesh a
+    # strip of three or four facets fits a cylinder of almost any radius and tilt.
+    features += _axis_pass(mesh, regions, _distinct_axes(features, mesh), AXIS_NOISE * mesh.noise)
+
     # Pass 1: from each pair of neighbouring facets, work out what surface they're on.
     for region in regions:
         for i in range(len(region.facets)):
@@ -812,7 +839,9 @@ def analyze(pts, tris):
         if not axes:
             break
         done += axes
-        features += _axis_pass(mesh, regions, axes)
+        # (on a known axis only the radius is free, so a file that rounded its corners
+        # can be allowed that much more: the CAD program's own export is often as loose)
+        features += _axis_pass(mesh, regions, axes, AXIS_NOISE * mesh.noise)
     # Pass 3: fillets between flat faces that the passes above couldn't make out (cut
     # into few or irregular strips): a cylinder touching both faces, only its radius to find
     import fillets
@@ -824,28 +853,11 @@ def analyze(pts, tris):
     for region in regions:
         region.free &= ~np.isin(region.facets, claimed)
     features += rolled
-    # Pass 4: screw threads, among the curved facets still unexplained (before the loose
-    # pass, which would take pieces of them for cylinders and cones)
-    import threads
-    free = [region.facets[region.free] for region in regions]
-    screws = []
-    for thread, fids in threads.find(mesh, np.concatenate(free) if free else np.zeros(0, int)):
-        screws += threads.patches(mesh, thread, fids)
-    claimed = [int(f) for x in screws for f in x.facets]
-    for region in regions:
-        region.free &= ~np.isin(region.facets, claimed)
     # a thread usually ends in a countersink or chamfer round its own axis, which the
     # passes above couldn't try (the thread wasn't known yet). Held to the thread's own
     # tolerance: the CAD program drew them together, both a hundredth or so off true.
     axes = [(t.a, t.d, 2 * float(t.profile[:, 1].max()) + 3) for t in {id(p.model.thread): p.model.thread for p in screws}.values()]
-    ends = []
-    if axes:
-        strict = _mesh_tol
-        _mesh_tol = max(strict, threads.ON_TOL + mesh.noise)
-        try:
-            ends = _axis_pass(mesh, regions, axes)
-        finally:
-            _mesh_tol = strict
+    ends = _axis_pass(mesh, regions, axes, threads.ON_TOL + mesh.noise) if axes else []
     features += _loose_pass(mesh, regions, features)
     features = _band_tori(mesh, regions, features)
     # (the thread's pieces ahead of what was found round its ends: if the solid won't
@@ -1319,8 +1331,24 @@ def _distinct_axes(features, mesh=None):
     return axes
 
 
-def _axis_pass(mesh, regions, axes):
-    """Patches on the given axes (cylinders, cones, tori) among the free facets."""
+def _axis_pass(mesh, regions, axes, tol=None):
+    """Patches on the given axes (cylinders, cones, tori) among the free facets, held to
+    `tol` if given (else the mesh's own tolerance)."""
+    global _mesh_tol, _axis_vouched
+    strict = _mesh_tol
+    if not tol or tol <= strict:
+        return _axis_patches(mesh, regions, axes)
+    # the wider allowance only for straight profiles (cylinders, cones: only the
+    # radius and slope free); a torus's three free numbers find false fits in it
+    _mesh_tol, _axis_vouched = tol, True
+    try:
+        out = _axis_patches(mesh, regions, axes, lines_only=True)
+    finally:
+        _mesh_tol, _axis_vouched = strict, False
+    return out + _axis_patches(mesh, regions, axes)
+
+
+def _axis_patches(mesh, regions, axes, lines_only=False):
     out = []
     for region in regions:
         region.explored[:] = False
@@ -1332,6 +1360,8 @@ def _axis_pass(mesh, regions, axes):
             found = []
             for axis in _near(axes, pts):
                 model = _on_axis(axis, pts)
+                if lines_only and model is not None and not model.line:
+                    continue
                 if _fits(model, pts):
                     found.append(_candidate(mesh, region, model, [i], axis_fixed=True))
             best = _best(found)
@@ -1578,7 +1608,8 @@ def _revolved_feature(mesh, model, P, rim, rim_edges, base):
         along = np.any([line[a] & line[b] for line in lines], axis=0)
         if not along.all():
             # the outline leaves the natural edges: only OK as a well-supported trimmed patch
-            if not _loose and not _enough_for_trimmed(mesh, base["facets"], P, rim_edges[~along]):
+            vouched = _axis_vouched and len(base["facets"]) >= TRIMMED_MIN_FACETS
+            if not _loose and not vouched and not _enough_for_trimmed(mesh, base["facets"], P, rim_edges[~along]):
                 return None
             trimmed = True
     if not _loose:
