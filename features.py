@@ -812,23 +812,7 @@ def analyze(pts, tris):
         if not axes:
             break
         done += axes
-        for region in regions:
-            region.explored[:] = False
-            for i in range(len(region.facets)):
-                near = [i] + [k for k in region.nbrs[i] if region.free[k]]
-                if not region.free[i] or region.explored[i] or len(near) < 2:
-                    continue
-                pts = region.points(near)
-                found = []
-                for axis in _near(axes, pts):
-                    model = _on_axis(axis, pts)
-                    if _fits(model, pts):
-                        found.append(_candidate(mesh, region, model, [i], axis_fixed=True))
-                best = _best(found)
-                if best:
-                    feature, idx, _ = best
-                    region.free[idx] = False
-                    features.append(feature)
+        features += _axis_pass(mesh, regions, axes)
     # Pass 3: fillets between flat faces that the passes above couldn't make out (cut
     # into few or irregular strips): a cylinder touching both faces, only its radius to find
     import fillets
@@ -850,9 +834,23 @@ def analyze(pts, tris):
     claimed = [int(f) for x in screws for f in x.facets]
     for region in regions:
         region.free &= ~np.isin(region.facets, claimed)
+    # a thread usually ends in a countersink or chamfer round its own axis, which the
+    # passes above couldn't try (the thread wasn't known yet). Held to the thread's own
+    # tolerance: the CAD program drew them together, both a hundredth or so off true.
+    axes = [(t.a, t.d, 2 * float(t.profile[:, 1].max()) + 3) for t in {id(p.model.thread): p.model.thread for p in screws}.values()]
+    ends = []
+    if axes:
+        strict = _mesh_tol
+        _mesh_tol = max(strict, threads.ON_TOL + mesh.noise)
+        try:
+            ends = _axis_pass(mesh, regions, axes)
+        finally:
+            _mesh_tol = strict
     features += _loose_pass(mesh, regions, features)
     features = _band_tori(mesh, regions, features)
-    return mesh, _merge_same_surface(mesh, features) + screws, _mesh_tol
+    # (the thread's pieces ahead of what was found round its ends: if the solid won't
+    # check out with everything, the search for culprits keeps what comes first)
+    return mesh, _merge_same_surface(mesh, features) + screws + ends, _mesh_tol
 
 
 def _tube_fit(P, model, steps=30):
@@ -1319,6 +1317,29 @@ def _distinct_axes(features, mesh=None):
         else:
             axes.append((a, d, 2 * size + 3))
     return axes
+
+
+def _axis_pass(mesh, regions, axes):
+    """Patches on the given axes (cylinders, cones, tori) among the free facets."""
+    out = []
+    for region in regions:
+        region.explored[:] = False
+        for i in range(len(region.facets)):
+            near = [i] + [k for k in region.nbrs[i] if region.free[k]]
+            if not region.free[i] or region.explored[i] or len(near) < 2:
+                continue
+            pts = region.points(near)
+            found = []
+            for axis in _near(axes, pts):
+                model = _on_axis(axis, pts)
+                if _fits(model, pts):
+                    found.append(_candidate(mesh, region, model, [i], axis_fixed=True))
+            best = _best(found)
+            if best:
+                feature, idx, _ = best
+                region.free[idx] = False
+                out.append(feature)
+    return out
 
 
 def _near(axes, pts, most=6):
