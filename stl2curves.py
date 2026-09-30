@@ -433,8 +433,19 @@ def stl_to_solid(path, tol, fuse=True, curves=True, true_size=False, blends=True
         info["mesh_defects"] = info.get("mesh_defects", False) or mesh.__dict__.get("defective", False)
     shape = shapes[0]
     if len(shapes) > 1:
-        # bodies that met at an edge were built apart; join them now
-        shape = boolean(BRepAlgoAPI_Fuse, shapes[:1], shapes[1:]) if fuse else compound(shapes)
+        # bodies that met at an edge were built apart; join them now, unless the join
+        # comes out invalid or loses material (the boolean can return nothing at all
+        # where bodies only touch): then they are handed over side by side
+        shape = compound(shapes)
+        if fuse:
+            apart = sum(volume(s) for s in shapes)
+            try:
+                fused = boolean(BRepAlgoAPI_Fuse, shapes[:1], shapes[1:])
+            except RuntimeError:
+                fused = None
+            if (fused is not None and BRepCheck_Analyzer(fused).IsValid()
+                    and abs(volume(fused) - apart) <= UNIFY_VOLUME * abs(apart) + 1e-3):
+                shape = fused
         nb = count(shape, TopAbs_SOLID)
 
     # Tidy up, but only keep the result if it is still a valid solid of the same volume;
@@ -472,6 +483,8 @@ def stl_to_solid(path, tol, fuse=True, curves=True, true_size=False, blends=True
 
     info["bodies"], info["voids"] = nb, nv
     info["faces"] = count(shape, TopAbs_FACE)
+    if not info["faces"]:
+        raise RuntimeError("the solid came out empty")
     info["volume"] = volume(shape)
     info["valid"] = BRepCheck_Analyzer(shape).IsValid()
     return shape, info

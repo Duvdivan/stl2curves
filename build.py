@@ -142,6 +142,12 @@ class Boundary:
         center = m.a + z[0] * m.d
         return BRepBuilderAPI_MakeEdge(gp_Circ(gp_Ax2(_pnt(center), gp_Dir(*m.d)), float(rho[0]))).Edge()
 
+    def full_profile(self, label):
+        """The whole profile circle of a torus at one end of its sweep (the round end of a
+        bent tube's bore, where it meets the straight bore)."""
+        f = self.f
+        return BRepBuilderAPI_MakeEdge(_profile_circle(self, f.u0 if label == "u0" else f.u0 + f.span)).Edge()
+
     def _sphere_mid(self, a, b):
         c, r = self.m.c, self.m.r
         v = (a + b) / 2 - c
@@ -263,6 +269,9 @@ def _run_edge(edges, bounds, tag, ids, patch_side=False):
     if label in ("lo", "hi") and len(ids) > 3 and ids[0] == ids[-1] and bound.f.kind != "wedge":
         # a whole natural boundary circle: the exact circle (as the face beside it uses)
         return bound.full_circle(label)
+    if (label in ("u0", "u1") and len(ids) > 3 and ids[0] == ids[-1] and bound.f.kind != "wedge"
+            and not bound.m.line):
+        return bound.full_profile(label)    # likewise the whole profile circle of a torus
     return edges.get(ids, lambda canon: bound.edge(label, edges.pts[canon]))
 
 
@@ -457,10 +466,21 @@ def _revolved_face(bound, lo, hi, u0, span):
     m = bound.m
     if m.line:
         edge = _line(bound.profile_point(lo, u0), bound.profile_point(hi, u0))
+    elif hi - lo >= TWO_PI - 1e-9:
+        edge = BRepBuilderAPI_MakeEdge(_profile_circle(bound, u0)).Edge()   # a tube all round
     else:
         edge = _arc(bound.profile_point(lo, u0), bound.profile_point((lo + hi) / 2, u0),
                     bound.profile_point(hi, u0))
     return BRepPrimAPI_MakeRevol(edge, gp_Ax1(_pnt(m.a), gp_Dir(*m.d)), span).Shape()
+
+
+def _profile_circle(bound, u):
+    """A torus's whole profile circle, in the half-plane at angle u round the axis."""
+    m = bound.m
+    rc, zc, r = m.circle
+    centre = m.point(rc, zc, u)
+    out = (bound.profile_point(0.0, u) - centre) / r      # away from the axis
+    return gp_Circ(gp_Ax2(_pnt(centre), gp_Dir(*np.cross(out, m.d)), gp_Dir(*out)), r)
 
 
 def _sphere_face(center, r, avoid):
@@ -494,10 +514,17 @@ def _generous_surface(feature, bound, mesh):
     else:
         rc, zc, r = m.circle
         margin = math.radians(10)
-        lo, hi = lo - margin, hi + margin
-        if hi - lo >= TWO_PI - 1e-6:
+        if hi - lo >= TWO_PI - 1e-9:
+            margin = 0.0                # a tube all round: nothing to add
+        # (less on a side where the margin would run the profile across the axis: a
+        # bent tube whose bend is tighter than the tube is wide passes close to it)
+        crosses = lambda a, b: (rc + r * np.cos(np.linspace(a, b, 60)) < 0).any()
+        grow_lo = next((m for m in margin * np.array([1, 0.5, 0.25, 0.1]) if not crosses(lo - m, lo)), 0.0)
+        grow_hi = next((m for m in margin * np.array([1, 0.5, 0.25, 0.1]) if not crosses(hi, hi + m)), 0.0)
+        lo, hi = lo - grow_lo, hi + grow_hi
+        if margin and hi - lo >= TWO_PI - 1e-6:
             return None
-        if (rc + r * np.cos(np.linspace(lo, hi, 60)) < 0).any():
+        if crosses(lo, hi):
             return None             # would cross the axis
     if span < TWO_PI:
         grow = math.radians(10)

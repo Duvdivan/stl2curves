@@ -116,6 +116,8 @@ def _edges(tris):
 MERGE_MAX_DEG = 1     # rounding noise never explains a bigger tilt than this
 AXIS_NOISE = 10       # on a known axis, corners may sit this many rounding steps off
 MIN_VOUCHED_CONE_DEG = 5    # ... but a cone found that way must taper at least this much
+STRADDLE_STEPS = 5    # a leftover flat facet this many tolerances off a neighbouring patch's
+                      # surface joins it (_absorb_straddlers)
 
 
 def grid_noise(pts):
@@ -1265,6 +1267,8 @@ def snap(mesh, features, round_unit=None):
                 g = _rebuilt(mesh, features[k], new)
                 if g:
                     features[k], changed = g, changed + 1
+    # (now the surfaces are final, leftover facets lying on them can join them)
+    _absorb_straddlers(mesh, features)
     return changed
 
 
@@ -1295,6 +1299,57 @@ def _merge_same_surface(mesh, features):
                 merged = True
                 break
             if merged:
+                break
+    return features
+
+
+def _absorb_straddlers(mesh, features):
+    """Hand each leftover facet that lies on a neighbouring patch's surface to it.
+
+    Where a finely cut curve runs straight on into another (a bent pipe's crest where
+    the straight run meets the bend) a long strip of one and a sliver of the other can
+    be flat together to well under a micron, and are joined into one facet that neither
+    patch can take. Left flat, such a facet is a hairline face between two curved ones
+    that the sewing can't close; so is a needle-thin triangle whose normal kept it out
+    of the patch. Their corners do lie on the surface beside them, within a
+    few tolerances; the patch is described afresh with it and keeps it if that holds (the
+    surface is already pinned down by the patch, so its outline rules are waived as for
+    fillets). Runs once the surfaces are final (after snap)."""
+    global _loose, _anchored
+    owner = np.full(len(mesh.farea), -1)
+    for k, f in enumerate(features):
+        owner[f.facets] = k
+
+    for g in np.nonzero(owner < 0)[0]:
+        C = mesh.pts[mesh.tris[mesh.ftris[g]]]
+        mids = np.r_[((C + C[:, [1, 2, 0]]) / 2).reshape(-1, 3), C.mean(axis=1)]
+        V = mesh.pts[mesh.fverts[g]]
+        # (a needle-thin facet's own normal means nothing, as in Region)
+        needle = mesh.farea[g] < 0.05 * np.ptp(V, axis=0).max() ** 2
+        if len(mesh.ftris[g]) < 2 and not needle:
+            continue    # an ordinary curved facet the passes left: smooth blends see to those
+        for k in sorted({owner[h] for h in mesh.nbrs[g]} - {-1}):
+            f = features[k]
+            if not isinstance(f.model, (Revolved, Sphere)):
+                continue
+            if np.abs(f.model.signed(V)).max() > STRADDLE_STEPS * _tol(f.model):
+                continue
+            if not needle and abs(mesh.fn[g] @ f.model.normal(mesh.fcent[g][None])[0]) < math.cos(math.radians(NORMAL_DEG)):
+                continue
+            # it must bow off the surface no more than the patch's own facets do (a real
+            # flat, a D-flat on a shaft, has its corners on the surface too, but cuts deeper)
+            if np.abs(f.model.signed(mids)).max() > max(1.5 * f.worst, STRADDLE_STEPS * _tol(f.model)):
+                continue
+            wider = _feature(mesh, f.model, np.r_[f.facets, g], f.convex)
+            if wider is None:
+                _loose, _anchored = True, True
+                try:
+                    wider = _feature(mesh, f.model, np.r_[f.facets, g], f.convex)
+                finally:
+                    _loose, _anchored = False, False
+            if wider is not None:
+                features[k] = wider
+                owner[g] = k
                 break
     return features
 
@@ -1586,8 +1641,11 @@ def _revolved_feature(mesh, model, P, rim, rim_edges, base):
     else:
         rc, zc, r = model.circle
         ring = _arc(np.arctan2(z - zc, rho - rc))
-        if ring is None or ring[1] >= TWO_PI - 1e-9:
-            return None                 # a complete tube (O-ring): not handled
+        if ring is None:
+            return None
+        if ring[1] >= TWO_PI - 1e-9 and (span >= TWO_PI or rc - r <= tol):
+            return None                 # a complete ring (O-ring), or a tube crossing itself
+        # (a tube all round but only part way round the axis is a bent pipe's bore)
         lo, hi = ring[0], ring[0] + ring[1]
         v = np.arctan2(r_z - zc, r_rho - rc)
         at = lambda end: _angle_gap(v, end) * r <= tol

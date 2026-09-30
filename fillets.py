@@ -43,7 +43,7 @@ def find(mesh, regions, taken=None):
     nf = len(mesh.farea)
     used = np.zeros(nf, bool) if taken is None else taken.copy()
     tol = 2 * F._tol()
-    faces = [f for f in np.argsort(-mesh.farea) if mesh.farea[f] >= MIN_FACE_AREA]
+    faces = [f for f in np.argsort(-mesh.farea) if mesh.farea[f] >= MIN_FACE_AREA and not used[f]]
     plane_pt = {f: mesh.pts[mesh.fverts[f][0]] for f in faces}
     verts = mesh.fverts
 
@@ -77,6 +77,12 @@ def find(mesh, regions, taken=None):
             # the strip starts at facets touching one face and lying near the other
             strip = [g for g in nbrs[X] if g != Y and not used[g]
                      and gap(g, Y) <= MAX_GAP]
+            # (a fillet's strips are clearly smaller than both faces, as _grow demands in
+            # the end; the long facets of a finely cut tube are big, but so are all their
+            # neighbours: skip those pairs without the fitting)
+            small = min(mesh.farea[A], mesh.farea[B]) / FACE_TO_STRIP
+            if not any(mesh.farea[g] <= small for g in strip):
+                continue
             got = _fillet(mesh, nbrs, used, X, Y, strip, plane_pt, on_plane, tol) if strip else None
             if got is not None:
                 feature, facets = got
