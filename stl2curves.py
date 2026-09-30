@@ -66,6 +66,7 @@ from repair import repair
 from simplify import simplify
 
 SEARCH_SECONDS = 600    # time allowed for hunting down patches that spoil the solid
+FIX_PRECISIONS = (1e-5, 1e-4)   # mm: precisions ShapeFix tries on an invalid solid after its default
 UNIFY_TOL = 0.001       # mm: faces this close to one surface are merged at the end ...
 UNIFY_DEG = 0.1         # ... if their normals agree this closely
 UNIFY_VOLUME = 1e-3     # and kept if the volume stays this close (the integration itself
@@ -236,9 +237,16 @@ def attempt(mesh, features, mesh_tol, tol, fuse, faceted_volume):
     if not BRepCheck_Analyzer(shape).IsValid():
         fixed_shape = None
         if not mesh.__dict__.get("defective"):      # (no repair mends a mesh that crosses itself)
-            fix = ShapeFix_Shape(shape)
-            fix.Perform()
-            fixed_shape = fix.Shape()
+            # (a straight edge running on tangent into an arc can pass for a crossing at
+            # the default precision; a coarser one, still far below the sewing, mends it)
+            for precision in (None,) + FIX_PRECISIONS:
+                fix = ShapeFix_Shape(shape)
+                if precision:
+                    fix.SetPrecision(precision)
+                fix.Perform()
+                fixed_shape = fix.Shape()
+                if BRepCheck_Analyzer(fixed_shape).IsValid() and abs(volume(fixed_shape) - expected) <= allowed:
+                    break
         if (fixed_shape is not None and BRepCheck_Analyzer(fixed_shape).IsValid()
                 and abs(volume(fixed_shape) - expected) <= allowed):
             shape = fixed_shape
