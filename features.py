@@ -115,6 +115,7 @@ def _edges(tris):
 
 MERGE_MAX_DEG = 1     # rounding noise never explains a bigger tilt than this
 AXIS_NOISE = 10       # on a known axis, corners may sit this many rounding steps off
+MIN_VOUCHED_CONE_DEG = 5    # ... but a cone found that way must taper at least this much
 
 
 def grid_noise(pts):
@@ -1364,6 +1365,11 @@ def _axis_patches(mesh, regions, axes, lines_only=False):
                     continue
                 if _fits(model, pts):
                     found.append(_candidate(mesh, region, model, [i], axis_fixed=True))
+            if _axis_vouched:
+                # (the wider allowance lets a cone a degree off a cylinder fit a strip of
+                # it; a real cone, a chamfer or countersink, tapers far more)
+                found = [c for c in found if not c or not c[0].model.line
+                         or c[0].model.line[1] == 0 or abs(c[0].model.line[1]) >= math.tan(math.radians(MIN_VOUCHED_CONE_DEG))]
             best = _best(found)
             if best:
                 feature, idx, _ = best

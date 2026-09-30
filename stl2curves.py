@@ -33,6 +33,7 @@ Usage:
   --no-repair      don't mend mesh defects first
 """
 import argparse
+import math
 import os
 import sys
 import time
@@ -65,6 +66,10 @@ from repair import repair
 from simplify import simplify
 
 SEARCH_SECONDS = 600    # time allowed for hunting down patches that spoil the solid
+UNIFY_TOL = 0.001       # mm: faces this close to one surface are merged at the end ...
+UNIFY_DEG = 0.1         # ... if their normals agree this closely
+UNIFY_VOLUME = 1e-3     # and kept if the volume stays this close (the integration itself
+                        # wobbles by a few mm^3 on a big part)
 AUTO_SIMPLIFY = 150000  # meshes with more triangles than this are thinned out first ...
 SIMPLIFY_ERROR = 0.005  # ... moving the surface by at most this (mm)
 
@@ -213,6 +218,9 @@ def attempt(mesh, features, mesh_tol, tol, fuse, faceted_volume):
         shape, nb, nv, signed = solids_from_shells(sewn, fuse)
     except RuntimeError:
         return None, []
+    _mesh_defective(mesh, tol, fuse)
+    if mesh.bare_bodies and nb > mesh.bare_bodies:
+        return None, []     # a body the bare facets don't make: a face ran off somewhere
     change = sum(f.change for f in features)
     expected = faceted_volume + change
     allowed = sum(f.tolerance for f in features) + 1e-6 * abs(faceted_volume) + 1e-3
@@ -246,13 +254,14 @@ def attempt(mesh, features, mesh_tol, tol, fuse, faceted_volume):
 
 def _mesh_defective(mesh, tol, fuse):
     """Is the mesh, built from bare facets, already not a valid solid? Sets
-    mesh.bare_volume to the volume the bare facets give."""
+    mesh.bare_volume and mesh.bare_bodies to the volume and number of bodies the bare
+    facets give (None and 0 if they make no solid)."""
     if "defective" not in mesh.__dict__:
         comp, shells, _ = build_faces(mesh, [], TOL)
         sewn, free = sew(comp, tol, shells)
-        mesh.bare_volume = None
+        mesh.bare_volume, mesh.bare_bodies = None, 0
         try:
-            shape, _, _, mesh.bare_volume = solids_from_shells(sewn, fuse)
+            shape, mesh.bare_bodies, _, mesh.bare_volume = solids_from_shells(sewn, fuse)
             mesh.defective = bool(free) or not BRepCheck_Analyzer(shape).IsValid()
         except RuntimeError:
             mesh.defective = True
@@ -428,16 +437,29 @@ def stl_to_solid(path, tol, fuse=True, curves=True, true_size=False, blends=True
         shape = boolean(BRepAlgoAPI_Fuse, shapes[:1], shapes[1:]) if fuse else compound(shapes)
         nb = count(shape, TopAbs_SOLID)
 
-    # Tidy up (merge edges split along one line), but only keep the result if it is still
-    # a valid solid; otherwise hand over the checked shape as it was built
+    # Tidy up, but only keep the result if it is still a valid solid of the same volume;
+    # otherwise hand over the checked shape as it was built. First faces on one surface
+    # are merged into one (a flat face whose outline defeated the face builder, a step or
+    # ridge a thousandth of a millimetre high in an export, was built triangle by
+    # triangle), failing that just edges split along one line.
     checked = shape
-    try:
-        unify = ShapeUpgrade_UnifySameDomain(shape, True, False, False)  # merge edges only
-        unify.Build()
-        sf = ShapeFix_Shape(unify.Shape())
-        sf.Perform()
-        shape = sf.Shape()
-    except Exception:
+    target = volume(checked)
+    shape = None
+    for faces in (True, False):
+        try:
+            unify = ShapeUpgrade_UnifySameDomain(checked, True, faces, False)
+            unify.SetLinearTolerance(UNIFY_TOL)
+            unify.SetAngularTolerance(math.radians(UNIFY_DEG))
+            unify.Build()
+            sf = ShapeFix_Shape(unify.Shape())
+            sf.Perform()
+            tidy = sf.Shape()
+        except Exception:
+            continue
+        if BRepCheck_Analyzer(tidy).IsValid() and abs(volume(tidy) - target) <= UNIFY_VOLUME * abs(target) + 1e-3:
+            shape = tidy
+            break
+    if shape is None:
         shape = checked
     if not BRepCheck_Analyzer(shape).IsValid():
         if BRepCheck_Analyzer(checked).IsValid():
