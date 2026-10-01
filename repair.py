@@ -243,9 +243,10 @@ def _orient(pts, tris):
     for a, b, ok in zip(ta.tolist(), tb.tolist(), agree.tolist()):
         adj[a].append((b, ok))
         adj[b].append((a, ok))
-    flip = np.zeros(m, bool)
-    seen = np.zeros(m, bool)
-    comp = np.full(m, -1)
+    # (plain lists: element access on numpy arrays is slow in a loop like this)
+    flip = [False] * m
+    seen = [False] * m
+    comp = [-1] * m
     c = 0
     for start in range(m):
         if seen[start]:
@@ -262,18 +263,19 @@ def _orient(pts, tris):
                     flip[u] = flip[t] if ok else not flip[t]
                     stack.append(u)
         c += 1
+    flip, comp = np.array(flip, bool), np.array(comp)
     # each piece: flip it wholesale if it has more triangles flipped than not
-    for k in range(c):
-        members = comp == k
-        if flip[members].sum() * 2 > members.sum():
-            flip[members] = ~flip[members]
+    wholesale = np.bincount(comp, weights=flip, minlength=c) * 2 > np.bincount(comp, minlength=c)
+    flip ^= wholesale[comp]
     tris[flip] = tris[flip][:, ::-1]
     count = int(flip.sum())
     # facing: outward for pieces at even depth, inward inside an odd number of others
     a, b, cc = pts[tris[:, 0]], pts[tris[:, 1]], pts[tris[:, 2]]
     vol6 = np.einsum("ij,ij->i", a, np.cross(b, cc))
-    pieces = [np.nonzero(comp == k)[0] for k in range(c)]
+    by_piece = np.argsort(comp, kind="stable")
+    pieces = np.split(by_piece, np.cumsum(np.bincount(comp, minlength=c))[:-1])
     closed = [p for p in pieces if len(p) >= 4 and not len(_open_edges(tris[p]))]
+    boxes = [(pts[tris[q]].min(axis=(0, 1)), pts[tris[q]].max(axis=(0, 1))) for q in closed]
     for p in closed:
         if vol6[p].sum() > 0:
             continue
@@ -281,7 +283,9 @@ def _orient(pts, tris):
         # (or a body buried in another: either way the file's own facing is the best clue)
         corners = np.unique(tris[p])
         sample = pts[corners[:: max(1, len(corners) // 12)]]
-        if not any(all(_inside(pts, tris[q], x) for x in sample) for q in closed if q is not p):
+        # (a piece whose box doesn't hold every sample point can't hold them all)
+        if not any(np.all((sample >= lo) & (sample <= hi)) and all(_inside(pts, tris[q], x) for x in sample)
+                   for q, (lo, hi) in zip(closed, boxes) if q is not p):
             tris[p] = tris[p][:, ::-1]
             count += len(p)
     return tris, count
@@ -450,20 +454,29 @@ def crossing_triangles(pts, tris):
     key = (ec[:, 0] * 73856093) ^ (ec[:, 1] * 19349663) ^ (ec[:, 2] * 83492791)
     order = np.argsort(key, kind="stable")
     key, et = key[order], et[order]
-    run = np.diff(np.r_[0, np.nonzero(key[1:] != key[:-1])[0] + 1, len(key)])
-    pa, pb = [], []
-    for off in range(1, min(int(run.max()), 200)):
-        same = key[off:] == key[:-off]
-        pa.append(et[:-off][same])
-        pb.append(et[off:][same])
-    if not pa:
+    starts = np.r_[0, np.nonzero(key[1:] != key[:-1])[0] + 1]
+    ends = np.r_[starts[1:], len(key)]
+    # every entry with each one after it in its cell (up to 199 on: an overfull cell is
+    # a pile of slivers, not a speck), written out directly rather than offset by offset
+    pos = np.arange(len(key))
+    end = np.repeat(ends, ends - starts)
+    count = np.minimum(end - pos - 1, 199)
+    if not count.sum():
         return np.zeros((0, 2), int)
-    pairs = np.unique(np.sort(np.c_[np.concatenate(pa), np.concatenate(pb)], axis=1), axis=0)
+    first = np.repeat(pos, count)
+    second = first + 1 + np.arange(len(first)) - np.repeat(np.cumsum(count) - count, count)
+    a, b = et[first], et[second]
+    # boxes apart: not a crossing (checked before the duplicates are sorted out, as it
+    # leaves far fewer to sort)
+    ov = np.all((lo[a] <= hi[b]) & (hi[a] >= lo[b]), axis=1)
+    a, b = np.minimum(a[ov], b[ov]), np.maximum(a[ov], b[ov])
+    n = np.int64(len(tris))
+    code = np.unique(a.astype(np.int64) * n + b)
+    pairs = np.c_[code // n, code % n]
+    pairs = pairs[pairs[:, 0] != pairs[:, 1]]
     # sharing a corner: not a crossing (neighbours meet along an edge or at a point)
     share = (tris[pairs[:, 0]][:, :, None] == tris[pairs[:, 1]][:, None, :]).any(axis=(1, 2))
     pairs = pairs[~share]
-    ov = np.all((lo[pairs[:, 0]] <= hi[pairs[:, 1]]) & (hi[pairs[:, 0]] >= lo[pairs[:, 1]]), axis=1)
-    pairs = pairs[ov]
     if not len(pairs):
         return pairs
     hit = np.zeros(len(pairs), bool)
