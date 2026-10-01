@@ -103,7 +103,10 @@ Without it the size is left alone (a slight scale is often deliberate, for fit).
    pins it down). This finds fillets however coarsely or irregularly they were cut into
    triangles, and forgives meshes that lost some accuracy there (most corners within
    0.02 mm); and since a design usually uses one fillet radius throughout, a band that
-   nearly fits a radius found cleanly elsewhere in the part takes that radius. Strict
+   nearly fits a radius found cleanly elsewhere in the part takes that radius. The same
+   rolling ball then looks for fillets between a flat face and a curved wall found so
+   far: a floor meeting a boss or hole (a torus round its axis), or a wall with a boss
+   or groove running along it (a cylinder beside the wall's). Strict
    passes follow (a patch must follow its surface's natural boundary lines, or meet its
    neighbours at creases), then a permissive pass for what is left, then neighbouring
    patches on the same surface are
@@ -122,7 +125,10 @@ Without it the size is left alone (a slight scale is often deliberate, for fit).
    corners), sewn into a solid. Bodies that touch along an edge (`bodies.py`) are built
    separately and fused.
 5. **Checks** — every result must be a valid closed solid whose volume matches the
-   mesh plus the predicted change from the curves; features that fail are left
+   mesh plus the predicted change from the curves (measured again from a fine
+   tessellation where OpenCascade's own volume disagrees: its integration goes astray
+   where the sewing had to close gaps of a few hundredths of a millimetre, as beside a
+   curved patch on a rough mesh); features that fail are left
    faceted instead of spoiling the part (a blend that fails gives back the pieces it
    replaced; an exact patch whose face can't be cut to shape is tried as a blend). A
    blend must pass within 0.02 mm of every mesh corner and may not bow away from a facet

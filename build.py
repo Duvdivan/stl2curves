@@ -831,26 +831,34 @@ def _split_face(feature, mesh, base, tools, loops, tol):
     # sample away from the outline: a needle-thin facet on the edge touches both pieces
     rim = set(np.concatenate(loops).tolist())
     inner = np.array([f for f in facets if not rim & set(mesh.fverts[f].tolist())])
-    source = inner if len(inner) else facets
-    pick = source[np.linspace(0, len(source) - 1, min(len(source), 60)).astype(int)]
-    c = mesh.fcent[pick]
-    probes = c - m.signed(c)[:, None] * m.normal(c)
-    vertices = [BRepBuilderAPI_MakeVertex(_pnt(p)).Vertex() for p in probes]
-    hit = []
-    ex = TopExp_Explorer(splitter.Shape(), TopAbs_FACE)
-    while ex.More():
-        face = TopoDS.Face(ex.Current())
-        ex.Next()
-        if any(BRepExtrema_DistShapeShape(v, face).Value() < 1e-3 for v in vertices):
-            props = GProp_GProps()
-            BRepGProp.SurfaceProperties_s(face, props)
-            hit.append((face, props.Mass()))
     target = float(mesh.farea[facets].sum())
+    total = lambda combo: sum(a for _, a in combo)
+
+    def pieces(source):
+        pick = source[np.linspace(0, len(source) - 1, min(len(source), 60)).astype(int)]
+        c = mesh.fcent[pick]
+        probes = c - m.signed(c)[:, None] * m.normal(c)
+        vertices = [BRepBuilderAPI_MakeVertex(_pnt(p)).Vertex() for p in probes]
+        hit = []
+        ex = TopExp_Explorer(splitter.Shape(), TopAbs_FACE)
+        while ex.More():
+            face = TopoDS.Face(ex.Current())
+            ex.Next()
+            if any(BRepExtrema_DistShapeShape(v, face).Value() < 1e-3 for v in vertices):
+                props = GProp_GProps()
+                BRepGProp.SurfaceProperties_s(face, props)
+                hit.append((face, props.Mass()))
+        return hit
+
+    hit = pieces(inner if len(inner) else facets)
+    if len(inner) and abs(total(hit) - target) > 0.1 * target:
+        # (a patch in several pieces, each a narrow strip: one may have no facet clear
+        # of the outline at all; then from every facet, and the best-matching set below)
+        hit = pieces(facets)
     if not hit or len(hit) > 10:
         return None
     # Normally every piece hit belongs to the patch; if they don't add up (a probe sat
     # right on the outline, touching the next piece too), take the best-matching set.
-    total = lambda combo: sum(a for _, a in combo)
     if abs(total(hit) - target) <= 0.1 * target:
         kept = [f for f, _ in hit]
     else:

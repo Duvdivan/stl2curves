@@ -79,6 +79,12 @@ Local regression data on this machine (not in the repo):
      the band's facets (finely cut pins), faces and fillet running at least one radius
      along the edge (slices of rounded corners and curved edges), and radii found with
      confidence preferred for near-misses (one radius is used all over a design).
+     Everything is done in a cross-section (`_Flat`, `_Wall`, `_Beside`) with the ball
+     rolling between two curves (`_Lines`, `_LineCircle`). After flat-flat pairs come
+     flat face + wall pairs, the walls being the features so far (pieces on one
+     surface joined): face square to the axis gives a torus, face along a cylinder's
+     axis a cylinder. A coarse chamfer round a hole fits a torus exactly (all its
+     corners on the rims), hence the profile-bend and interior-corner guards.
    - Pass 1: surfaces hypothesised from pairs of neighbouring facets.
    - Pass 2: tori around axes already found; thread ends (countersinks, chamfers).
    - Loose pass, band tori, merge of same-surface neighbours.
@@ -93,7 +99,7 @@ Local regression data on this machine (not in the repo):
    sharing each boundary edge between the two faces beside it (`Edges` cache), then
    sews. `stl2curves._build`/`attempt` then checks the solid: valid, and volume equal to
    the faceted volume plus each feature's predicted `change` (within the summed
-   `tolerance`). Features that fail are dropped and left faceted (blends give back the
+   `tolerance`; OCC's volume, re-measured by `tessellated_volume` when it disagrees). Features that fail are dropped and left faceted (blends give back the
    pieces they replaced; failed exact patches are retried as blends; whole rings as two
    half rings; a halving search finds culprits, capped in time).
 
@@ -142,6 +148,11 @@ Key contracts:
   noise-tolerant sliver handling (broke the RAK enclosures).
 - Facet normals on real meshes are good only to about 1°. Anything needing precision
   (thread pitch, axis) should come from corners, which are exact to the file's rounding.
+- OCC's volume integration (GProp) goes astray on solids sewn across wide gaps (a
+  curved patch's outline edge bowed onto its surface, the flat facet beside it keeping
+  the chord, 0.05-0.09 mm apart on a rough mesh): several mm^3 off, the same wherever
+  the part sits, while a watertight tessellation gives the predicted change. That is
+  why `attempt` re-measures by tessellation before failing a volume check.
 - OCP 8 quirks: `TopoDS.Shell/Face` (no `_s`), `OCP.collections` for arrays and
   sequences, `Bnd_Box.Get()` is broken, `Quantity_Color` returns linear RGB,
   `BRepCheck_Result.Status()` can't be read (use `BRepCheck_Analyzer.IsValid(sub)`).

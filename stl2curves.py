@@ -60,6 +60,8 @@ from OCP.STEPControl import STEPControl_Writer, STEPControl_AsIs
 from OCP.Interface import Interface_Static
 from OCP.IFSelect import IFSelect_RetDone
 from OCP.BRepAlgoAPI import BRepAlgoAPI_Fuse
+from OCP.BRepMesh import BRepMesh_IncrementalMesh
+from OCP.TopLoc import TopLoc_Location
 from OCP.collections import List_TopoDS_Shape, IndexedMap_TopoDS_Shape_TopTools_ShapeMapHasher
 
 import features as features_mod
@@ -81,6 +83,8 @@ FUSE_SECONDS = 30       # bodies whose fuse takes longer than this are handed ov
 BARE_AHEAD = 5000       # facets from which the bare-facet build is made ahead, in a worker process
 WORKERS_FROM = 5000     # triangles from which a part is worth starting worker processes for
 BARE_DRIFT = 1e-4       # share of a sound mesh's volume its bare facets may differ by and still be a reference
+TESS_DEFLECTION = 0.0005    # mm: how closely a solid's faces are tessellated to measure its volume
+                            # where OCC's integration and the expected volume disagree
 UNIFY_TOL = 0.001       # mm: faces this close to one surface are merged at the end ...
 UNIFY_DEG = 0.1         # ... if their normals agree this closely
 UNIFY_VOLUME = 1e-3     # and kept if the volume stays this close (the integration itself
@@ -103,6 +107,39 @@ def volume(shape):
     props = GProp_GProps()
     BRepGProp.VolumeProperties_s(shape, props, 1e-6)
     return props.Mass()
+
+
+def tessellated_volume(shape):
+    """The volume a fine tessellation of the shape's faces encloses, or None if a face
+    won't tessellate. OCC integrates face by face, each over its own surface; where the
+    sewing joined edges a few hundredths of a millimetre apart (a curved patch's outline
+    bowed onto its surface, the flat facet beside it keeping the straight chord) the
+    faces don't quite meet, and the integration can come out several mm^3 off, one way
+    or the other. The tessellation follows the shared edges, so it closes up."""
+    BRepTools.Clean_s(shape)
+    BRepMesh_IncrementalMesh(shape, TESS_DEFLECTION, False, 0.1, True)
+    box = Bnd_Box()
+    BRepBndLib.Add_s(shape, box)
+    p, q = box.CornerMin(), box.CornerMax()
+    centre = np.array([p.X() + q.X(), p.Y() + q.Y(), p.Z() + q.Z()]) / 2     # (less to cancel)
+    total = 0.0
+    ex = TopExp_Explorer(shape, TopAbs_FACE)
+    while ex.More():
+        face = TopoDS.Face(ex.Current())
+        ex.Next()
+        loc = TopLoc_Location()
+        tri = BRep_Tool.Triangulation_s(face, loc)
+        if tri is None:
+            BRepTools.Clean_s(shape)
+            return None
+        move = loc.Transformation()
+        P = np.array([(n.X(), n.Y(), n.Z()) for n in (tri.Node(i).Transformed(move) for i in range(1, tri.NbNodes() + 1))])
+        T = np.array([tri.Triangle(i).Get() for i in range(1, tri.NbTriangles() + 1)]) - 1
+        P = P - centre
+        v = np.einsum("ij,ij->i", P[T[:, 0]], np.cross(P[T[:, 1]], P[T[:, 2]])).sum() / 6
+        total += -v if face.Orientation() == TopAbs_REVERSED else v
+    BRepTools.Clean_s(shape)
+    return float(total)
 
 
 def fixed(solid):
@@ -373,6 +410,12 @@ def attempt(mesh, features, mesh_tol, tol, fuse, faceted_volume):
     change = sum(f.change for f in features)
     expected = faceted_volume + change
     allowed = sum(f.tolerance for f in features) + 1e-6 * abs(faceted_volume) + 1e-3
+    if abs(signed - expected) > allowed:
+        # (OCC's integration can be off where the sewing closed wide gaps: measured
+        # again from the faces' tessellation, which follows the edges they share)
+        tess = tessellated_volume(shape)
+        if tess is not None and abs(tess - expected) <= allowed:
+            signed = tess
     if abs(signed - expected) > allowed:
         # a mesh whose bare facets already don't add up to its volume (it crosses itself,
         # or is many bodies touching at corners, some too thin to make a solid) is

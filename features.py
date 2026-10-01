@@ -853,7 +853,7 @@ def analyze(pts, tris):
     for f in features + screws:
         taken[f.facets] = True
     known = [r for r in (_radius(f.model) for f in features) if r]
-    rolled = fillets.find(mesh, regions, taken, known)
+    rolled = fillets.find(mesh, regions, taken, known, walls=features)
     claimed = [int(f) for x in rolled for f in x.facets]
     for region in regions:
         region.free &= ~np.isin(region.facets, claimed)
