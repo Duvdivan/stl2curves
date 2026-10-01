@@ -46,6 +46,12 @@ Local regression data on this machine (not in the repo):
   243 / 230 faces, all valid. Re-check after every change.
 - `C:\Users\delta\Tools\compare\rak` (20 parts, coordinates rounded to 0.001 mm):
   `run2.sh`, `summary.sh`, `devall.sh` there; outputs in `out_v*`.
+- `compare\bass` (instrument: bent tubes, cavities), `compare\box2` (`tray.stl`, and
+  `toolbox.stl`: 223k triangles, many bodies touching at corners, ~11 min; both with the
+  original STEPs as ground truth), `compare\new5` (newer downloads, incl. a Bambu 3MF).
+- `C:\Users\delta\Tools\compare\regress.sh`: Rak, toolbox parts, instrument and tray,
+  one conversion at a time (each uses all the worker processes; running several at
+  once only makes the timings meaningless).
 - `C:\Users\delta\Tools\compare\gps` (freeform-heavy, 20+ min per part) and
   `compare\repeater` (1.3M-triangle hubs, exercises `simplify.py`): slow; only run
   them when the change targets them.
@@ -86,6 +92,20 @@ Local regression data on this machine (not in the repo):
    pieces they replaced; failed exact patches are retried as blends; whole rings as two
    half rings; a halving search finds culprits, capped in time).
 
+Speed (`workers.py`): OpenCascade and small-array numpy hold the GIL, so parallel work
+runs in a shared process pool (up to 16 workers), started in the background once a mesh
+has 3,000+ triangles and kept for further parts of the same run. Shapes cross processes
+as BRep files, the mesh once per pass via `workers.share`/`load`. What runs there:
+
+- The seed passes (pass 1, loose pass, axis passes: `features._seed_pass`), per region,
+  and big regions in slices whose answers are replayed in order. The result must stay
+  **identical** to the sequential run: check with an analysis fingerprint (md5 of the
+  features' sorted facets) on Rak N and the full toolbox after any change there.
+- Blend fills (each capped at `FILL_SECONDS`) and their fit checks (`_assess_blend`),
+  the bare-facet build (`_bare_ahead`), and the final fuse (capped at `FUSE_SECONDS`).
+- `TIME_LIMIT` (`--time-limit`) only stops optional refinement (blends, culprit search,
+  second chances); analysis always runs to the end (cutting it gave garbage).
+
 Key contracts:
 
 - **`Feature`** (dataclass in `features.py`): `model`, `kind` (`revolve`, `wedge`,
@@ -118,7 +138,18 @@ Key contracts:
 - Facet normals on real meshes are good only to about 1°. Anything needing precision
   (thread pitch, axis) should come from corners, which are exact to the file's rounding.
 - OCP 8 quirks: `TopoDS.Shell/Face` (no `_s`), `OCP.collections` for arrays and
-  sequences, `Bnd_Box.Get()` is broken, `Quantity_Color` returns linear RGB.
+  sequences, `Bnd_Box.Get()` is broken, `Quantity_Color` returns linear RGB,
+  `BRepCheck_Result.Status()` can't be read (use `BRepCheck_Analyzer.IsValid(sub)`).
+- Pickling a `Mesh` reorders its neighbour *sets*, and pass 1 tries `nbrs[i][:3]`: send
+  regions' neighbour lists along to workers, or results silently change.
+- Windows process pools spawn a worker only when a job finds none idle, one by one in
+  the submitting thread: `workers._start` calls `_launch_processes()` up front. Scripts
+  that convert must have an `if __name__ == "__main__"` guard (workers re-import them).
+- Profiling: cProfile inflates small functions; py-spy on Windows hangs or samples the
+  launcher. A sampling thread over `sys._current_frames()`, weighted by elapsed time
+  (long OCC calls hold the GIL), works well.
+- Big multi-body meshes sew into hundreds of zero-volume shells (coincident face pairs);
+  `solids_from_shells` drops them (`EMPTY_SHELL`), or body counts and fuses go wrong.
 
 ## Conventions
 

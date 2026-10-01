@@ -1,8 +1,8 @@
 # stl2curves
 
-Convert STL meshes (3D-printing downloads, exports from other programs) into solid
-STEP files with **true curved surfaces**, so they can be edited properly in Fusion,
-FreeCAD or any other CAD program.
+Convert STL meshes and 3MF projects (3D-printing downloads, slicer projects, exports
+from other programs) into solid STEP files with **true curved surfaces**, so they can
+be edited properly in Fusion, FreeCAD or any other CAD program.
 
 A plain STL-to-STEP conversion gives you a solid made of thousands of tiny flat
 triangles: you can't select a hole, measure a diameter or fillet an edge. stl2curves
@@ -15,6 +15,7 @@ works out which surface each part of the mesh really lies on and rebuilds it exa
 | cones | countersinks, chamfers around round edges, cone tips |
 | spheres | domes, dimples, ball ends, corners where three rounded edges meet |
 | tori | rounded edges that follow a curve (rounded box corners, fillets round a pin) |
+| screw threads | bolts, threaded holes and sockets (helical surfaces, with the thread named) |
 | smooth blends | where rounded edges meet at a corner, fillets along spline-shaped edges |
 
 Surfaces can be cut to any outline (a hole running out through a sloped face, two
@@ -38,7 +39,8 @@ pip install -r requirements.txt
 
 ```
 python stl2curves.py part.stl                    # -> part.step next to it
-python stl2curves.py some_folder --out STEP      # every .stl in a folder
+python stl2curves.py project.3mf                 # one STEP per object printed in it
+python stl2curves.py some_folder --out STEP      # every .stl and .3mf in a folder
 python stl2curves.py a.stl b.stl --merge all     # also one combined STEP
 python stl2curves.py part.stl --details          # list every rebuilt feature
 python stl2curves.py part.stl --true-size        # rebuild at the apparent design size
@@ -50,7 +52,23 @@ On Windows, `stl2curves.bat` accepts drag-and-drop (or put a shortcut to it in
 
 Options: `--tol` sewing tolerance (mm), `--no-fuse` keep overlapping bodies separate,
 `--no-curves` flat faces only, `--no-blends` no smooth freeform faces (exact surfaces
-and flat facets only).
+and flat facets only), `--no-repair` take the mesh as it is, `--simplify MM` thin out
+the mesh first (moving its surface by at most MM; meshes over 150,000 triangles are
+thinned by 0.005 mm automatically), `--time-limit SECONDS` (default 600, 0 for none).
+
+From a 3MF file (Bambu Studio, OrcaSlicer, PrusaSlicer...) every object on the build
+plates is converted to its own STEP, named after the file and the object, placed as on
+the plate. Modifier volumes, negative volumes and support blockers are left out.
+
+### Time
+
+Small parts take seconds, typical printed parts of 5,000-15,000 triangles a minute or
+two, and very large ones (hundreds of thousands of triangles) about ten minutes. The
+slow steps run in parallel on all but two of the computer's cores (up to 16 worker
+processes). After the time limit, fitting further freeform faces and hunting down
+patches that spoil the solid stop, and whatever has checked out by then is kept: the
+result is always a solid matching the mesh, with fewer curves rebuilt the earlier it
+had to stop.
 
 ### Design size
 
@@ -65,8 +83,11 @@ Without it the size is left alone (a slight scale is often deliberate, for fit).
 
 ## How it works
 
-1. **Facets** — triangles are grouped into flat facets (coplanar pieces). The mesh is
-   tidied first: sliver triangles (three corners in a line) are split away, and when the
+1. **Facets** — the mesh is mended first (`repair.py`: duplicate and zero-thickness
+   triangles, slivers, cracks, flipped triangles, holes and small self-crossings), and
+   meshes over 150,000 triangles are thinned out (`simplify.py`) without moving their
+   surface more than 0.005 mm. Triangles are then grouped into flat facets (coplanar
+   pieces): sliver triangles (three corners in a line) are split away, and when the
    file rounded its coordinates (many exports write 0.001 mm steps) the rounding noise is
    allowed for, both when deciding which triangles are coplanar (long thin triangles
    tilt noticeably) and in every surface test. Pieces of the mesh that merely touch
@@ -102,9 +123,11 @@ Without it the size is left alone (a slight scale is often deliberate, for fit).
    replaced; an exact patch whose face can't be cut to shape is tried as a blend). A
    blend must pass within 0.02 mm of every mesh corner and may not bow away from a facet
    more than a circular arc through its corners would. Patches next to gaps or invalid
-   faces left by sewing are dropped individually (blends first, then the nearest patch);
-   if the volume check fails, the feature list is halved to find the culprits (for ten
-   minutes at most; whatever is left then stays faceted). A patch that runs all the way
+   faces left by sewing, or next to a face that came out flipped, are dropped
+   individually (blends first, then the nearest patch), and once the part builds they
+   get a second chance together; if the volume check fails, the feature list is halved
+   to find the culprits (until the time limit; whatever is left then stays faceted). A
+   patch that runs all the way
    round its axis but is cut to shape is built as two half rings if it won't build whole.
    A final tidy-up is kept only if the solid is still valid. If the STL itself is not a
    clean solid (it touches or crosses itself), the result is checked against what its
@@ -112,8 +135,8 @@ Without it the size is left alone (a slight scale is often deliberate, for fit).
 
 Limits: large freeform areas (organic shells, variable-radius rounds over big areas)
 mostly stay faceted: the smooth patch fitter manages small blends and corners, but not
-yet whole freeform surfaces. Such parts also convert slowly (tens of minutes at ~17k
-triangles). Screw threads (helical surfaces) stay faceted.
+yet whole freeform surfaces. Lettering and other shapes extruded from free curves stay
+faceted too.
 
 ## Tests
 

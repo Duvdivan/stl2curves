@@ -9,6 +9,9 @@ faces are then sewn together.
 """
 import itertools
 import math
+import os
+import shutil
+import tempfile
 import time
 
 import numpy as np
@@ -35,10 +38,13 @@ from OCP.GeomAbs import GeomAbs_C0
 from OCP.ShapeFix import ShapeFix_Face, ShapeFix_Shape
 from OCP.TopAbs import TopAbs_EDGE, TopAbs_FACE, TopAbs_SHELL, TopAbs_REVERSED
 from OCP.TopExp import TopExp_Explorer
-from OCP.TopoDS import TopoDS, TopoDS_Compound
+from OCP.TopoDS import TopoDS, TopoDS_Compound, TopoDS_Iterator, TopoDS_Shape
+from OCP.BRepTools import BRepTools
 from OCP.gp import gp_Ax1, gp_Ax2, gp_Ax3, gp_Circ, gp_Dir, gp_Pln, gp_Pnt
 from OCP.Geom import Geom_ToroidalSurface
 
+import features as features_mod
+import workers
 from features import TWO_PI, _angle_gap, _frame, Revolved, Sphere
 from blends import TANGENT_DEG, MAX_DEVIATION, MAX_BULGE, MAX_EDGE_GAP
 
@@ -395,8 +401,7 @@ def _planar_face(mesh, fid, owner, bounds, edge_tri, edges):
     pts = mesh.pts
     # outer boundary first: the loop enclosing the most area
     normal = mesh.fn[fid]
-    area = lambda loop: abs(sum(np.cross(pts[loop[i]], pts[loop[(i + 1) % len(loop)]]) @ normal
-                                for i in range(len(loop))))
+    area = lambda loop: abs(np.cross(pts[loop], pts[np.roll(loop, -1)]).sum(axis=0) @ normal)
     loops.sort(key=area, reverse=True)
     if area(loops[-1]) < 1e-9 * area(loops[0]) + 1e-9:
         return None     # a slit (an outline enclosing nothing): also left as triangles
@@ -893,6 +898,118 @@ FILL_SETTINGS = (3, 15, 2, False, 1e-5, 1e-4, 1e-2, 0.1, 8, 9)
 FINE_FILL_SETTINGS = (3, 30, 3, False, 1e-5, 1e-5, 1e-2, 0.1, 8, 20)
 BLEND_SECONDS = 300     # time allowed for fitting blends; the rest keep their exact pieces or facets
 FINE_BLENDS = 150       # a part with more blends than this is mostly freeform: skip the finer (slower) refits
+PARALLEL_FILLS = 40     # without worker processes, more fills than this start them
+FILL_SECONDS = 5        # a fill in a worker process still running after this long counts as failed
+BUILD_SHARE = 0.35      # of the conversion's time limit, what is kept back for building and checking
+                        # the part (blends not fitted by then keep their exact pieces or facets)
+
+
+class _Deferred(Exception):
+    """A blend's fill was queued to be done with the others (settle_blends)."""
+
+
+def _fill(outline, inner, settings):
+    """An N-sided patch through the outline edges and the points inside, or None."""
+    fill = BRepFill_Filling(*settings)
+    for edge in outline:
+        fill.Add(edge, GeomAbs_C0, True)
+    for q in inner:
+        fill.Add(_pnt(q))
+    try:
+        fill.Build()
+        return _repaired(fill.Face()) if fill.IsDone() else None
+    except Exception:
+        return None
+
+
+def _fill_job(job):
+    """In a worker process: one fill, its outline read from and the face written to
+    BRep files (OpenCascade shapes don't cross processes otherwise)."""
+    edges_path, inner, settings, face_path = job
+    comp = TopoDS_Shape()
+    BRepTools.Read_s(comp, edges_path, BRep_Builder())
+    outline, it = [], TopoDS_Iterator(comp)
+    while it.More():
+        outline.append(TopoDS.Edge(it.Value()))
+        it.Next()
+    face = _fill(outline, inner, settings)
+    return face is not None and BRepTools.Write_s(face, face_path)
+
+
+def _assess_job(job):
+    """In a worker process: _assess_blend on a face written to a BRep file."""
+    face_path, piece = job
+    shape = TopoDS_Shape()
+    BRepTools.Read_s(shape, face_path, BRep_Builder())
+    ex = TopExp_Explorer(shape, TopAbs_FACE)
+    return _assess_blend(TopoDS.Face(ex.Current()), piece) if ex.More() else False
+
+
+def _fill_all(jobs):
+    """Run fills [(key, outline, inner, settings, piece)] -> {key: (face or None, verdict)}.
+    OpenCascade holds Python's lock while it works, so they run in worker processes, all
+    at once; the workers then also judge each face against its blend's triangles (piece,
+    see _assess_blend: the verdict), or the verdict is None and that is left to later."""
+    out = {}
+    # (workers still starting are waited for: done here a fill can't be cut short, and
+    # one of them can take a minute; they are only started for parts big enough)
+    pool = workers.get()
+    if pool is None and len(jobs) >= PARALLEL_FILLS:
+        workers.start()
+        pool = workers.get()
+    if pool is not None and jobs:
+        tmp = tempfile.mkdtemp(prefix="stl2curves_")
+        try:
+            args = []
+            for i, (_, outline, inner, settings, _) in enumerate(jobs):
+                comp = TopoDS_Compound()
+                builder = BRep_Builder()
+                builder.MakeCompound(comp)
+                for edge in outline:
+                    builder.Add(comp, edge)
+                BRepTools.Write_s(comp, os.path.join(tmp, f"{i}_in.brep"))
+                args.append((os.path.join(tmp, f"{i}_in.brep"), [tuple(map(float, q)) for q in inner],
+                             settings, os.path.join(tmp, f"{i}_out.brep")))
+            # Most fills take a few hundredths of a second, but a few that end up failing
+            # anyway grind on for tens of seconds: each gets FILL_SECONDS once started
+            from concurrent.futures import wait, FIRST_COMPLETED
+            futures = {pool.submit(_fill_job, a): (key, a) for (key, *_), a in zip(jobs, args)}
+            started, pending = {}, set(futures)
+            while pending:
+                _, pending = wait(pending, timeout=0.2, return_when=FIRST_COMPLETED)
+                now = time.time()
+                for f in pending:
+                    if f.running():
+                        started.setdefault(f, now)
+                if pending and all(f in started and now - started[f] > FILL_SECONDS for f in pending):
+                    workers.abandoned()
+                    break           # only overrunning fills left
+            pieces = {key: piece for key, *_, piece in jobs}
+            judged = {}
+            for f, (key, a) in futures.items():
+                face = None
+                if f.done() and not f.cancelled() and f.exception() is None and f.result():
+                    shape = TopoDS_Shape()
+                    BRepTools.Read_s(shape, a[3], BRep_Builder())
+                    ex = TopExp_Explorer(shape, TopAbs_FACE)
+                    face = TopoDS.Face(ex.Current()) if ex.More() else None
+                    if face is not None and pieces[key] is not None:
+                        judged[key] = pool.submit(_assess_job, (a[3], pieces[key]))
+                out[key] = (face, None)
+            # (an overrunning fill can't be stopped inside OpenCascade; its worker is left
+            # to finish it, and the workers are restarted once the part is done)
+            for key, f in judged.items():
+                if f.exception() is None:
+                    out[key] = (out[key][0], f.result())
+        except Exception:
+            out = {}                    # (the worker processes broke down: do them here)
+            workers.broken()
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+    for key, outline, inner, settings, _ in jobs:
+        if key not in out:
+            out[key] = (_fill(outline, inner, settings), None)
+    return out
 
 
 def _blend_face(feature, k, mesh, owner, bounds, edge_tri, edges):
@@ -943,7 +1060,9 @@ def _blend_face(feature, k, mesh, owner, bounds, edge_tri, edges):
         return face
     if mesh.__dict__.get("blends_only_cached"):
         return None                 # the time for fitting blends is used up
-    cache[key] = None
+    jobs = mesh.__dict__.get("fill_jobs")      # a list while settle_blends gathers the fills
+    if jobs is None:
+        cache[key] = None
     outline = []
     for tag, run in runs:
         edge = _run_edge(edges, bounds, tag, run, patch_side=True)
@@ -952,70 +1071,41 @@ def _blend_face(feature, k, mesh, owner, bounds, edge_tri, edges):
         outline.append(edge)
     inner = [pts[v] for v in V if v not in rim] + (guides if USE_GUIDES else [])
 
+    done = mesh.__dict__.setdefault("fills", {})
+    vids, local = np.unique(mesh.tris[tids], return_inverse=True)
+    piece = (pts[mesh.tris[tids]], mesh.tn[tids], mesh.tarea[tids], local.reshape(-1, 3), pts[vids],
+             float(mesh.farea[facets].sum()))
+
     def filled(settings):
-        fill = BRepFill_Filling(*settings)
-        for edge in outline:
-            fill.Add(edge, GeomAbs_C0, True)
-        for q in inner:
-            fill.Add(_pnt(q))
-        try:
-            fill.Build()
-            return _repaired(fill.Face()) if fill.IsDone() else None
-        except Exception:
-            return None
+        if (key, settings) not in done:
+            if jobs is not None:
+                jobs.append(((key, settings), outline, inner, settings, piece))
+                raise _Deferred
+            # (through the workers too when they are running: held to FILL_SECONDS)
+            done.update(_fill_all([((key, settings), outline, inner, settings, piece)]))
+        return done[key, settings][0]
 
     # a quick patch first; if it follows its outline loosely, a finer (slower) one
-    face = filled(FILL_SETTINGS)
-    if (face is None or _edge_gap(face) > MAX_EDGE_GAP / 4) and mesh.__dict__.get("blend_count", 0) <= FINE_BLENDS:
-        finer = filled(FINE_FILL_SETTINGS)
-        if finer is not None and (face is None or _edge_gap(finer) < _edge_gap(face)):
-            face = finer
+    try:
+        face, chosen = filled(FILL_SETTINGS), FILL_SETTINGS
+        if (face is None or _edge_gap(face) > MAX_EDGE_GAP / 4) and mesh.__dict__.get("blend_count", 0) <= FINE_BLENDS:
+            finer = filled(FINE_FILL_SETTINGS)
+            if finer is not None and (face is None or _edge_gap(finer) < _edge_gap(face)):
+                face, chosen = finer, FINE_FILL_SETTINGS
+    except _Deferred:
+        return None
     if face is None or _edge_gap(face) > MAX_EDGE_GAP:
         return None     # a loose outline would force a loose sewing tolerance on the whole part
+    verdict = done[key, chosen][1]
+    if verdict is None:
+        verdict = _assess_blend(face, piece)
+    if not verdict:
+        return None
+    worst, change, spread = verdict
+    target = piece[5]
     surface = BRep_Tool.Surface_s(face)
     proj = GeomAPI_ProjectPointOnSurf()
     proj.Init(surface, *surface.Bounds())
-
-    def along(p, n):
-        """Signed distance from p to the surface, measured along direction n."""
-        proj.Perform(_pnt(p))
-        if not proj.IsDone() or not proj.NbPoints():
-            return None
-        q = proj.NearestPoint()
-        return float((np.array([q.X(), q.Y(), q.Z()]) - p) @ n)
-
-    # how far the surface strays from the mesh corners, and the volume it adds
-    worst, change, spread = 0.0, 0.0, 0.0
-    for t in tids:
-        n_t = mesh.tn[t]
-        corners = pts[mesh.tris[t]]
-        for p in corners:
-            d = along(p, n_t)
-            if d is None:
-                return None
-            worst = max(worst, abs(d))
-        s_mid = [along(p, n_t) for p in (corners + corners[[1, 2, 0]]) / 2]
-        # between the corners a smooth surface bows away from a flat facet only a little
-        # (about a tenth of the facet's size even for a fillet cut into two strips);
-        # more than that is the fit overshooting
-        centre = corners.mean(axis=0)
-        s_in = [along(p, n_t) for p in [centre] + list((corners + centre) / 2)]
-        if any(d is None for d in s_mid + s_in):
-            return None
-        size = float(np.linalg.norm(corners - corners[[1, 2, 0]], axis=1).max())
-        if max(abs(d) for d in s_mid + s_in) > max(MAX_DEVIATION, MAX_BULGE * size):
-            return None
-        change += mesh.tarea[t] * float(np.mean(s_mid))
-        spread += mesh.tarea[t] * float(np.mean(np.abs(s_mid)))
-    if worst > MAX_DEVIATION:
-        return None
-    if not _hugs_mesh(face, mesh, tids):
-        return None
-    gp = GProp_GProps()
-    BRepGProp.SurfaceProperties_s(face, gp)
-    target = float(mesh.farea[facets].sum())
-    if abs(gp.Mass() - target) > 0.15 * target + 1e-3:
-        return None
     # face the same way as the mesh
     proj.Perform(_pnt(mesh.fcent[facets[0]]))
     u, v = proj.LowerDistanceParameters()
@@ -1070,11 +1160,62 @@ def _point_triangle_distance(P, T):
     return best, which
 
 
-def _hugs_mesh(face, mesh, tids):
+def _assess_blend(face, piece):
+    """How a blend's face fits its triangles: (worst gap at a mesh corner, volume it adds,
+    spread of that), or False if it strays too far. piece: the triangles' corners (n, 3, 3),
+    normals, areas, corner numbers into P and corner points P, and the facets' area.
+    Needs nothing else, so the workers that fill the blends can judge them too."""
+    T, tn, tarea, corner_ids, P, target = piece
+    surface = BRep_Tool.Surface_s(face)
+    proj = GeomAPI_ProjectPointOnSurf()
+    proj.Init(surface, *surface.Bounds())
+
+    def along(p, n):
+        """Signed distance from p to the surface, measured along direction n."""
+        proj.Perform(_pnt(p))
+        if not proj.IsDone() or not proj.NbPoints():
+            return None
+        q = proj.NearestPoint()
+        return float((np.array([q.X(), q.Y(), q.Z()]) - p) @ n)
+
+    # how far the surface strays from the mesh corners, and the volume it adds
+    worst, change, spread = 0.0, 0.0, 0.0
+    for corners, n_t, area in zip(T, tn, tarea):
+        for p in corners:
+            d = along(p, n_t)
+            if d is None:
+                return False
+            worst = max(worst, abs(d))
+        s_mid = [along(p, n_t) for p in (corners + corners[[1, 2, 0]]) / 2]
+        # between the corners a smooth surface bows away from a flat facet only a little
+        # (about a tenth of the facet's size even for a fillet cut into two strips);
+        # more than that is the fit overshooting
+        centre = corners.mean(axis=0)
+        s_in = [along(p, n_t) for p in [centre] + list((corners + centre) / 2)]
+        if any(d is None for d in s_mid + s_in):
+            return False
+        size = float(np.linalg.norm(corners - corners[[1, 2, 0]], axis=1).max())
+        if max(abs(d) for d in s_mid + s_in) > max(MAX_DEVIATION, MAX_BULGE * size):
+            return False
+        change += area * float(np.mean(s_mid))
+        spread += area * float(np.mean(np.abs(s_mid)))
+    if worst > MAX_DEVIATION:
+        return False
+    if not _hugs_mesh(face, piece):
+        return False
+    gp = GProp_GProps()
+    BRepGProp.SurfaceProperties_s(face, gp)
+    if abs(gp.Mass() - target) > 0.15 * target + 1e-3:
+        return False
+    return worst, change, spread
+
+
+def _hugs_mesh(face, piece):
     """Does the finished face stay as close to the mesh as a smooth surface through its
     corners can? A smooth surface bows away from a flat facet by only about L*theta/4
     (L its size, theta how far the surface turns across it, read from the mesh's own
     corner normals); a fitted patch that waves between the corners bows much further."""
+    T, tn, tarea, corners, P, _ = piece
     BRepMesh_IncrementalMesh(face, 0.005, False, 0.2, True)
     loc = TopLoc_Location()
     tri = BRep_Tool.Triangulation_s(face, loc)
@@ -1084,22 +1225,20 @@ def _hugs_mesh(face, mesh, tids):
     ft = np.array([[tri.Triangle(i).Value(j) for j in (1, 2, 3)] for i in range(1, tri.NbTriangles() + 1)]) - 1
     samples = np.vstack([nodes, nodes[ft].mean(axis=1)])
     samples = samples[::max(1, len(samples) // 4000)]
-    T = mesh.pts[mesh.tris[tids]]
     d, k = _point_triangle_distance(samples, T)
     # corner normals from the blend's own triangles only (averaging in a face across a
     # sharp edge would make the surface look far more curved than it is)
-    corners = mesh.tris[tids]
-    vn = np.zeros_like(mesh.pts)
+    vn = np.zeros_like(P)
     for j in range(3):
-        np.add.at(vn, corners[:, j], mesh.tn[tids] * mesh.tarea[tids][:, None])
+        np.add.at(vn, corners[:, j], tn * tarea[:, None])
     vn /= np.maximum(np.linalg.norm(vn, axis=1), 1e-12)[:, None]
-    theta = np.arccos(np.clip(np.einsum("tkj,tj->tk", vn[corners], mesh.tn[tids]), -1, 1)).max(axis=1)
+    theta = np.arccos(np.clip(np.einsum("tkj,tj->tk", vn[corners], tn), -1, 1)).max(axis=1)
     size = np.linalg.norm(T - T[:, [1, 2, 0]], axis=2).max(axis=1)
     allowed = BULGE_FACTOR * size * theta / 4 + 0.005
     if (d > allowed[k]).any():
         return False
     # and every mesh corner lies on the face itself (not just on its untrimmed surface)
-    dc, _ = _point_triangle_distance(mesh.pts[np.unique(corners)], nodes[ft])
+    dc, _ = _point_triangle_distance(P, nodes[ft])
     return bool((dc <= MAX_DEVIATION).all())
 
 
@@ -1154,18 +1293,28 @@ def settle_blends(mesh, features, tol, split, skipped):
         for k, f in enumerate(features):
             owner[f.facets] = k
         bounds = [Boundary(f, 10 * tol) for f in features]
-        edge_tri = {}
-        for t, (a, b, c) in enumerate(mesh.tris):
-            edge_tri[(a, b)] = t
-            edge_tri[(b, c)] = t
-            edge_tri[(c, a)] = t
+        edge_tri = _edge_tri(mesh)
         edges = Edges(mesh.pts)
+        # every blend's fill first, all at once in worker processes (each depends only on
+        # its own outline): the quick ones, then the finer refits they call for
+        try:
+            for _ in range(2):
+                mesh.fill_jobs = []
+                for k, f in enumerate(features):
+                    if f.kind == "blend":
+                        _blend_face(f, k, mesh, owner, bounds, edge_tri, edges)
+                jobs, mesh.fill_jobs = mesh.fill_jobs, None
+                if not jobs:
+                    break
+                mesh.fills.update(_fill_all(jobs))
+        finally:
+            mesh.fill_jobs = None
         out, changed = [], False
         for k, f in enumerate(features):
             if f.kind != "blend":
                 out.append(f)
                 continue
-            if time.time() - start > BLEND_SECONDS:
+            if time.time() - start > BLEND_SECONDS or features_mod.time_left() < BUILD_SHARE * (features_mod._budget or 0):
                 # out of time: keep only blends already known to fit (their faces are cached)
                 mesh.blends_only_cached = True
             if _blend_face(f, k, mesh, owner, bounds, edge_tri, edges) is not None:
@@ -1184,17 +1333,50 @@ def settle_blends(mesh, features, tol, split, skipped):
     return features
 
 
+def _across(mesh):
+    """For each facet, the facets it shares an edge with (however sharp the bend)."""
+    if "across" not in mesh.__dict__:
+        near = [set() for _ in range(len(mesh.fn))]
+        for fs in mesh.edge_facets.values():
+            for a in fs:
+                near[a].update(fs)
+        mesh.across = [np.array(sorted(s - {a}), int) for a, s in enumerate(near)]
+    return mesh.across
+
+
+def _edge_tri(mesh):
+    """Directed mesh edge (a, b) -> the triangle it belongs to."""
+    if "edge_tri" not in mesh.__dict__:
+        edge_tri = {}
+        for t, (a, b, c) in enumerate(mesh.tris):
+            edge_tri[(a, b)] = t
+            edge_tri[(b, c)] = t
+            edge_tri[(c, a)] = t
+        mesh.edge_tri = edge_tri
+    return mesh.edge_tri
+
+
 def build_faces(mesh, features, tol):
-    """All faces of the rebuilt part, as a compound, plus the features that were used."""
+    """All faces of the rebuilt part, as a compound, plus the features that were used.
+
+    A face depends only on its own patch (or flat facet) and on who owns each facet
+    across its outline, so it is reused from an earlier attempt at the part whenever
+    those are unchanged (the search for troublemakers builds the part dozens of times,
+    changing a few patches at a time)."""
     owner = np.full(len(mesh.fn), -1)
     for k, f in enumerate(features):
         owner[f.facets] = k
     bounds = [Boundary(f, 10 * tol) for f in features]
-    edge_tri = {}
-    for t, (a, b, c) in enumerate(mesh.tris):
-        edge_tri[(a, b)] = t
-        edge_tri[(b, c)] = t
-        edge_tri[(c, a)] = t
+    edge_tri = _edge_tri(mesh)
+    across = _across(mesh)
+    cache = mesh.__dict__.setdefault("face_cache", {})
+    alive = mesh.__dict__.setdefault("face_cache_features", {})
+    for f in features:
+        alive[id(f)] = f        # (kept, so no later feature can take over its id)
+    ident = np.array([id(f) for f in features] + [-1], dtype=np.int64)
+
+    def who(facets):
+        return ident[owner[facets]].tobytes()   # (owner -1 picks the trailing -1)
 
     comp = TopoDS_Compound()
     builder = BRep_Builder()
@@ -1202,7 +1384,12 @@ def build_faces(mesh, features, tol):
     failed, shells = [], []
     edges = Edges(mesh.pts)
     for k, (f, bound) in enumerate(zip(features, bounds)):
-        if f.model.kind == "thread":
+        if "_across" not in f.__dict__:
+            f._across = np.setdiff1d(np.unique(np.concatenate([across[x] for x in f.facets])), f.facets)
+        key = ("patch", id(f), who(f._across))
+        if key in cache:
+            faces = cache[key]
+        elif f.model.kind == "thread":
             faces = [_thread_face(f, k, mesh, owner, bounds, edge_tri)]
         elif f.kind == "trimmed":
             faces = [_trimmed_face(f, k, bound, mesh, owner, bounds, edge_tri, edges, tol)]
@@ -1210,6 +1397,7 @@ def build_faces(mesh, features, tol):
             faces = [_blend_face(f, k, mesh, owner, bounds, edge_tri, edges)]
         else:
             faces = _patch_faces(f, bound, mesh)
+        cache[key] = faces
         if any(x is None for x in faces):
             failed.append(k)
             continue
@@ -1221,7 +1409,12 @@ def build_faces(mesh, features, tol):
     for fid in range(len(mesh.fn)):
         if owner[fid] >= 0 and owner[fid] not in failed:
             continue
-        face = None if owner[fid] >= 0 else _planar_face(mesh, fid, owner, bounds, edge_tri, edges)
+        face = None
+        if owner[fid] < 0:
+            key = ("flat", fid, who(across[fid]))
+            if key not in cache:
+                cache[key] = _planar_face(mesh, fid, owner, bounds, edge_tri, edges)
+            face = cache[key]
         if face is None:
             # fall back to the facet's own triangles
             for t in mesh.ftris[fid]:
@@ -1255,6 +1448,35 @@ def sew(shape, tol, shells=()):
     return comp, free
 
 
+def point_facet_distance(mesh, facets, points):
+    """Distance from each point to the nearest of the facets' triangles, (len(points),).
+    (Not to their corners: a gap along a long straight edge has its middle far from
+    every corner, though it lies right on the facets.)"""
+    points = np.asarray(points, float)
+    if len(points) > 32:        # (a few at a time: points x triangles arrays)
+        return np.concatenate([point_facet_distance(mesh, facets, points[k:k + 32])
+                               for k in range(0, len(points), 32)])
+    T = mesh.tris[np.concatenate([mesh.ftris[x] for x in facets])]
+    A, B, C = (mesh.pts[T[:, i]][None] for i in range(3))
+    P = points[:, None]
+    # nearest point of each triangle's plane, kept only if it falls inside the triangle
+    ab, ac = B - A, C - A
+    n = np.cross(ab, ac)
+    nn = np.maximum((n * n).sum(-1), 1e-300)
+    h = ((P - A) * n).sum(-1) / nn
+    Q = P - h[..., None] * n
+    inside = np.ones(Q.shape[:2], bool)
+    for X, Y in ((A, B), (B, C), (C, A)):
+        inside &= (np.cross(Y - X, Q - X) * n).sum(-1) >= 0
+    d = np.where(inside, np.abs(h) * np.sqrt(nn), np.inf)
+    # else the nearest point on an edge
+    for X, Y in ((A, B), (B, C), (C, A)):
+        e = Y - X
+        t = np.clip(((P - X) * e).sum(-1) / np.maximum((e * e).sum(-1), 1e-300), 0, 1)
+        d = np.minimum(d, np.linalg.norm(P - (X + t[..., None] * e), axis=-1))
+    return d.min(axis=1)
+
+
 def features_near(mesh, features, points, reach=0.5):
     """Indices of the features whose facets come within `reach` mm of any of the points."""
     if not points:
@@ -1265,6 +1487,6 @@ def features_near(mesh, features, points, reach=0.5):
         P = mesh.pts[np.unique(np.concatenate([mesh.fverts[x] for x in f.facets]))]
         lo, hi = P.min(axis=0) - reach, P.max(axis=0) + reach
         near = points[np.all((points >= lo) & (points <= hi), axis=1)]
-        if len(near) and (np.linalg.norm(near[:, None] - P[None], axis=2).min() <= reach):
+        if len(near) and point_facet_distance(mesh, f.facets, near).min() <= reach:
             out.append(k)
     return out

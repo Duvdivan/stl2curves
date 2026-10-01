@@ -22,8 +22,10 @@ those areas simply stay faceted.
 Each accepted patch records its exact surface and its boundary lines; build.py
 turns it into one true curved face and stitches it to the flat faces around it.
 """
+import copy
 import math
 import struct
+import time
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -62,6 +64,15 @@ _anchored = False   # the surface is pinned by the faces around it (fillets.py):
 _axis_vouched = False   # on an axis another patch already has, in a rounded-off mesh: a cut-to-
                         # shape patch may hand over smoothly (to its own fillets) all round
 TWO_PI = 2 * math.pi
+_deadline = None            # time.time() by which the whole conversion should be done
+_budget = None              # (seconds; both set by stl2curves.stl_to_solid)
+
+
+def time_left():
+    """Seconds left of the conversion's time limit (infinite without one). Only the
+    optional refinements heed it (fitting blends, hunting down troublemakers): finding
+    patches cut short leaves the rest to become hundreds of slow blends."""
+    return math.inf if _deadline is None else _deadline - time.time()
 
 
 # ---------------------------------------------------------------- mesh
@@ -244,10 +255,17 @@ class Mesh:
 # ---------------------------------------------------------------- surfaces
 
 def _frame(d):
-    d = np.asarray(d, float) / np.linalg.norm(d)
-    e1 = np.cross(d, [1.0, 0, 0] if abs(d[0]) < 0.9 else [0, 1.0, 0])
-    e1 /= np.linalg.norm(e1)
-    return d, e1, np.cross(d, e1)
+    """Unit axis d and two unit directions square to it (d, e1, e2 right-handed).
+    Written out by hand: numpy's cross and norm cost more than the arithmetic on three
+    numbers, and this runs millions of times."""
+    x, y, z = float(d[0]), float(d[1]), float(d[2])
+    n = math.sqrt(x * x + y * y + z * z)
+    x, y, z = x / n, y / n, z / n
+    a, b, c = (0.0, z, -y) if abs(x) < 0.9 else (-z, 0.0, x)    # d x (1,0,0), d x (0,1,0)
+    m = math.sqrt(a * a + b * b + c * c)
+    a, b, c = a / m, b / m, c / m
+    return (np.array([x, y, z]), np.array([a, b, c]),
+            np.array([y * c - z * b, z * a - x * c, x * b - y * a]))
 
 
 class Revolved:
@@ -474,6 +492,7 @@ class Region:
         self.sliver = mesh.farea[self.facets] < 0.05 * self.size ** 2
         self.free = np.ones(len(self.facets), bool)
         self.explored = np.zeros(len(self.facets), bool)
+        self.reads = self.marks = None  # (while trying pairs ahead in a worker: see _pairs_slice)
 
     def points(self, idx):
         return self.P[np.unique(np.concatenate([self.fv[i] for i in idx]))]
@@ -494,6 +513,8 @@ class Region:
         else:
             aligned = (np.abs(facing) >= math.cos(math.radians(NORMAL_DEG))) | self.sliver[idx]
             gap = MAX_SAG
+        if self.reads is not None:
+            self.reads.append(np.asarray(idx))      # (see _pairs_slice)
         ok = ((worst <= _tol(model)) & (np.abs(model.signed(self.c[idx])) <= gap)
               & aligned & self.free[idx])
         return ok, facing > 0, surface_n
@@ -645,6 +666,8 @@ def _candidate(mesh, region, model, seeds, axis_fixed=False):
         result = result or found
     if result is None and len(idx) >= 6:
         region.explored[idx] = True
+        if region.marks is not None:
+            region.marks.append(idx)                # (see _pairs_slice)
     return result
 
 
@@ -695,10 +718,14 @@ def _seed_candidates(mesh, region, i, j):
         # quick guesses: estimate the axis from the whole neighbourhood's normals and
         # let a least-squares fit through the corners settle it. (Only where the normals
         # all lie square to one direction, as on a cylinder; not on doubly curved areas.)
-        axis = np.linalg.svd(region.n[near])[2][2]
-        cyl = _cylinder(axis, near_pts)
+        # (the loose pass meets most of the same neighbourhoods again: fitted once)
+        fits = region.__dict__.setdefault("tube_fits", {})
+        if tuple(near) not in fits:
+            axis = np.linalg.svd(region.n[near])[2][2]
+            cyl = _cylinder(axis, near_pts)
+            fits[tuple(near)] = None if cyl is None else _tube_fit(near_pts, cyl)
+        cyl = copy.deepcopy(fits[tuple(near)])      # (a model may be changed later on)
         if cyl is not None:
-            cyl = _tube_fit(near_pts, cyl)
             if _fits(cyl, near_pts) and cyl.line[0] < 1e3:
                 found.append(_candidate(mesh, region, cyl, [i, j]))
     # The same axis may carry a torus or sphere that explains more than one ring of facets.
@@ -818,17 +845,7 @@ def analyze(pts, tris):
     features += _axis_pass(mesh, regions, _distinct_axes(features, mesh), AXIS_NOISE * mesh.noise)
 
     # Pass 1: from each pair of neighbouring facets, work out what surface they're on.
-    for region in regions:
-        for i in range(len(region.facets)):
-            for j in region.nbrs[i][:3]:
-                if not (region.free[i] and region.free[j]) or region.explored[i]:
-                    continue
-                best = _seed_candidates(mesh, region, i, j)
-                if best:
-                    feature, idx, _ = best
-                    region.free[idx] = False
-                    features.append(feature)
-                    break
+    features += _pairs_pass(mesh, regions)
 
     # Pass 2: tori (and anything missed) around the axes of the patches found so far.
     # A curved rounded edge always shares its axis with a neighbouring hole, pin or
@@ -886,27 +903,29 @@ def _tube_fit(P, model, steps=30):
     else:
         c0, x = model.a, np.array([0, 0, 0, 0, model.line[0]], float)
 
-    def res(x):
-        d = d0 + x[0] * e1 + x[1] * e2
-        d /= np.linalg.norm(d)
-        c = c0 + x[2] * e1 + x[3] * e2 + (x[4] * d0 if torus else 0)
-        v = P - c
-        z = v @ d
-        rho = np.linalg.norm(v - np.outer(z, d), axis=1)
+    def residuals(X):
+        """Residuals for each row of parameters X (m, n): (m, len(P)). All the nudged
+        parameter sets of a Jacobian go through at once."""
+        d = d0 + X[:, 0:1] * e1 + X[:, 1:2] * e2
+        d /= np.sqrt((d * d).sum(axis=1))[:, None]
+        c = c0 + X[:, 2:3] * e1 + X[:, 3:4] * e2 + (X[:, 4:5] * d0 if torus else 0)
+        v = P[None] - c[:, None]
+        z = np.einsum("mpk,mk->mp", v, d)
+        w = v - z[..., None] * d[:, None]
+        rho = np.sqrt((w * w).sum(axis=2))
         if torus:
-            return np.hypot(rho - x[5], z) - x[6]
+            return np.hypot(rho - X[:, 5:6], z) - X[:, 6:7]
         if cone:
-            return (rho - x[4] - x[5] * z) / math.hypot(1, x[5])
-        return rho - x[4]
+            return (rho - X[:, 4:5] - X[:, 5:6] * z) / np.hypot(1, X[:, 5:6])
+        return rho - X[:, 4:5]
+
+    def res(x):
+        return residuals(x[None])[0]
 
     f = res(x)
     for _ in range(steps):
-        J = np.empty((len(P), len(x)))
-        for k in range(len(x)):
-            h = 1e-7 * max(1.0, abs(x[k]))
-            dx = x.copy()
-            dx[k] += h
-            J[:, k] = (res(dx) - f) / h
+        h = 1e-7 * np.maximum(1.0, np.abs(x))
+        J = ((residuals(x + np.diag(h)) - f) / h[:, None]).T
         step = np.linalg.lstsq(J, -f, rcond=None)[0]
         x2 = x + step
         f2 = res(x2)
@@ -1078,33 +1097,271 @@ def _band_tori(mesh, regions, features):
 
 def _loose_pass(mesh, regions, features):
     """Pass 3: whatever curved facets are left, accept any surface that explains them."""
-    global _loose
-    axes = _distinct_axes(features, mesh)
-    found_all = []
-    _loose = True
-    try:
+    return _pairs_pass(mesh, regions, _distinct_axes(features, mesh))
+
+
+PARALLEL_FACETS = 3000  # unexplained facets needed before a pass is shared out among worker processes
+SLICE_FACETS = 400      # a region bigger than this is shared out in slices of this many facets
+
+
+def _pairs_pass(mesh, regions, axes=None):
+    """Pass 1 (axes None) or the loose pass (axes: the axes found so far): from each pair
+    of neighbouring facets, work out what surface they're on (in the loose pass,
+    accepting any surface that explains them, including ones round the axes found)."""
+    return _seed_pass(mesh, regions, ("pairs", axes, _mesh_tol))
+
+
+def _axis_patches(mesh, regions, axes, lines_only=False):
+    """Patches on the given axes round each free facet (with lines_only, cylinders and
+    cones only), held to the tolerance in force."""
+    return _seed_pass(mesh, regions, ("axis", axes, _mesh_tol, lines_only, _axis_vouched))
+
+
+# A seed pass goes through each region's facets in order, trying the surfaces each
+# suggests (with a neighbour, for "pairs"; round known axes, for "axis") and claiming
+# the facets of every patch found. `how` says which, with what it needs: ("pairs",
+# axes or None, tolerance) or ("axis", axes, tolerance, lines only, axis vouched).
+
+def _seed_pass(mesh, regions, how):
+    """The features of a seed pass over every region, in region order.
+
+    On a big mesh this is shared out among worker processes (workers.py), with exactly
+    the result of going through it in order. Regions don't affect one another, so each
+    mid-sized one is simply done whole in a worker. A big one is cut into slices of
+    facets, each gone through in order by a worker from the region as it stood when the
+    pass began, noting which facets each try looked at; here the slices are then gone
+    through in order, taking a worker's answer wherever those facets still stand as the
+    worker saw them, and trying again here where a patch from elsewhere changed them.
+    """
+    work = [k for k, r in enumerate(regions) if r.free.sum() >= 2]
+    results, pool, jobs = {}, None, {}
+    if sum(int(regions[k].free.sum()) for k in work) >= PARALLEL_FACETS:
+        import workers
+        pool = workers.get()
+    if how[0] == "axis" or how[1] is not None:         # (passes that start with nothing explored)
         for region in regions:
             region.explored[:] = False
-            for i in range(len(region.facets)):
-                for j in region.nbrs[i][:3]:
-                    if not (region.free[i] and region.free[j]) or region.explored[i]:
-                        continue
-                    found = [_seed_candidates(mesh, region, i, j)]
-                    near = [i, j] + [k for k in region.nbrs[i] + region.nbrs[j] if region.free[k]]
-                    pts = region.points(near)
-                    for axis in _near(axes, pts):
-                        m = _on_axis(axis, pts)
-                        if _fits(m, pts):
-                            found.append(_candidate(mesh, region, m, [i, j], axis_fixed=True))
-                    best = _best(found)
-                    if best:
-                        feature, idx, _ = best
-                        region.free[idx] = False
-                        found_all.append(feature)
-                        break
-    finally:
-        _loose = False
+    start = {k: (regions[k].free.copy(), regions[k].explored.copy()) for k in work}
+    if pool is not None:
+        try:
+            if "shared_as" not in mesh.__dict__:
+                mesh.shared_as = workers.share(mesh)
+            order = sorted(work, key=lambda k: -len(regions[k].facets))
+            # (each region's neighbour lists as they are here: rebuilt from the mesh's
+            # sets in another process they can come out in another order, and the order
+            # decides what is tried)
+            big = [k for k in order if len(regions[k].facets) >= 50]
+            state = workers.share({k: (regions[k].facets, regions[k].nbrs, regions[k].free, regions[k].explored,
+                                       regions[k].__dict__.get("tube_fits", {}))
+                                   for k in big})
+            for k in big:
+                n = len(regions[k].facets)
+                if n <= SLICE_FACETS:
+                    jobs[k] = pool.submit(_seed_job, (mesh.shared_as, state, how, k))
+                else:
+                    jobs[k] = [pool.submit(_seed_slice, (mesh.shared_as, state, how, k, lo, min(lo + SLICE_FACETS, n)))
+                               for lo in range(0, n, SLICE_FACETS)]
+            for k in order:             # (the small ones meanwhile here)
+                if k not in jobs:
+                    results[k] = _seed_region(mesh, regions[k], how)
+            for k in big:
+                if isinstance(jobs[k], list):
+                    results[k] = _seed_replay(mesh, regions[k], how, jobs[k])
+                else:
+                    found, free, explored, fits = jobs[k].result()
+                    regions[k].free[:], regions[k].explored[:] = free, explored
+                    regions[k].tube_fits = fits
+                    results[k] = found
+        except Exception:
+            workers.broken()            # (then done here, from where they started)
+            for k in jobs:
+                regions[k].free[:], regions[k].explored[:] = start[k]
+                results.pop(k, None)
+    for k in work:
+        if k not in results:
+            results[k] = _seed_region(mesh, regions[k], how)
+    return [f for k in sorted(results) for f in results[k]]
+
+
+class _Settings:
+    """The module settings a seed pass runs under, put in place for its duration."""
+
+    def __init__(self, how):
+        self.how = how
+
+    def __enter__(self):
+        global _mesh_tol, _loose, _axis_vouched
+        self.saved = _mesh_tol, _loose, _axis_vouched
+        if self.how[0] == "pairs":
+            _mesh_tol, _loose = self.how[2], self.how[1] is not None
+        else:
+            _mesh_tol, _axis_vouched = self.how[2], self.how[4]
+        return self
+
+    def __exit__(self, *exc):
+        global _mesh_tol, _loose, _axis_vouched
+        _mesh_tol, _loose, _axis_vouched = self.saved
+
+
+def _seeds(region, i, how):
+    """What facet i is tried with: each of its first three neighbours ("pairs"), or on
+    its own ("axis")."""
+    return region.nbrs[i][:3] if how[0] == "pairs" else (None,)
+
+
+def _open(region, i, j, how):
+    """Is the seed (i, j) to be tried, the region standing as it does?"""
+    if region.explored[i] or not region.free[i]:
+        return False
+    if how[0] == "pairs":
+        return bool(region.free[j])
+    return sum(1 for k in region.nbrs[i] if region.free[k]) >= 1
+
+
+def _seed_try(mesh, region, i, j, how):
+    """The best patch grown from seed (i, j), or None."""
+    if region.reads is not None:        # (see _seed_slice)
+        region.reads.append(np.array([i] + region.nbrs[i] + ([j] + region.nbrs[j] if j is not None else [])))
+    if how[0] == "pairs":
+        return _pair_seed(mesh, region, i, j, how[1])
+    axes, lines_only = how[1], how[3]
+    near = [i] + [k for k in region.nbrs[i] if region.free[k]]
+    pts = region.points(near)
+    found = []
+    for axis in _near(axes, pts):
+        model = _on_axis(axis, pts)
+        if lines_only and model is not None and not model.line:
+            continue
+        if _fits(model, pts):
+            found.append(_candidate(mesh, region, model, [i], axis_fixed=True))
+    if _axis_vouched:
+        # (the wider allowance lets a cone a degree off a cylinder fit a strip of
+        # it; a real cone, a chamfer or countersink, tapers far more)
+        found = [c for c in found if not c or not c[0].model.line
+                 or c[0].model.line[1] == 0 or abs(c[0].model.line[1]) >= math.tan(math.radians(MIN_VOUCHED_CONE_DEG))]
+    return _best(found)
+
+
+def _seed_region(mesh, region, how):
+    """A seed pass over one region, in order: its features."""
+    found_all = []
+    with _Settings(how):
+        if how[0] == "axis" or how[1] is not None:
+            region.explored[:] = False
+        for i in range(len(region.facets)):
+            for j in _seeds(region, i, how):
+                if not _open(region, i, j, how):
+                    continue
+                best = _seed_try(mesh, region, i, j, how)
+                if best:
+                    feature, idx, _ = best
+                    region.free[idx] = False
+                    found_all.append(feature)
+                    break
     return found_all
+
+
+def _worker_region(mesh_key, state_key, k):
+    """In a worker: region k of the shared mesh as it stood when the pass began."""
+    import workers
+    mesh = workers.load(mesh_key)
+    facets, nbrs, free, explored, fits = workers.load(state_key)[k]
+    if workers.memo.get("state") != state_key:
+        workers.memo.clear()
+        workers.memo["state"] = state_key
+    region = workers.memo.get(k)
+    if region is None:
+        region = workers.memo[k] = Region(mesh, facets)
+        region.nbrs = nbrs
+        region.tube_fits = dict(fits)
+    region.free[:], region.explored[:] = free, explored
+    return mesh, region
+
+
+def _seed_job(job):
+    """In a worker: _seed_region over one whole region."""
+    mesh_key, state_key, how, k = job
+    mesh, region = _worker_region(mesh_key, state_key, k)
+    found = _seed_region(mesh, region, how)
+    return found, region.free, region.explored, region.tube_fits
+
+
+def _seed_slice(job):
+    """In a worker: the seeds of a slice of a region's facets gone through in order, as
+    _seed_region would, but from the region as it stood when the pass began (nothing
+    found in the slices before this one): [(i, j, what was found, facets whose
+    availability the try looked at, facets it marked explored)] for every seed tried."""
+    mesh_key, state_key, how, k, lo, hi = job
+    mesh, region = _worker_region(mesh_key, state_key, k)
+    out = []
+    with _Settings(how):
+        try:
+            for i in range(lo, hi):
+                for j in _seeds(region, i, how):
+                    if not _open(region, i, j, how):
+                        continue
+                    region.reads, region.marks = [], []
+                    best = _seed_try(mesh, region, i, j, how)
+                    out.append((i, j, best, np.unique(np.concatenate(region.reads)).astype(np.int32), region.marks))
+                    if best:
+                        region.free[best[1]] = False
+                        break
+        finally:
+            region.reads = region.marks = None
+    return out
+
+
+def _seed_replay(mesh, region, how, slices):
+    """Go through a region's seeds in order, taking the workers' answers (_seed_slice)
+    wherever every facet a try looked at stands as it did for the worker: the same
+    result as _seed_region. Only tries that something outside their own slice changed
+    the ground for are made again here."""
+    found_all = []
+    start = region.free.copy()
+    with _Settings(how):
+        if how[0] == "axis" or how[1] is not None:
+            region.explored[:] = False
+        for c, job in enumerate(slices):
+            tried = job.result()
+            seen = start.copy()             # availability as the worker saw it
+            at = 0
+            for i in range(c * SLICE_FACETS, min((c + 1) * SLICE_FACETS, len(region.facets))):
+                done = False
+                for j in _seeds(region, i, how):
+                    got = None
+                    if at < len(tried) and tried[at][0] == i and tried[at][1] == j:
+                        got = tried[at]
+                        at += 1
+                    if not done and _open(region, i, j, how):
+                        if got is not None and (seen[got[3]] == region.free[got[3]]).all():
+                            best = got[2]
+                            for idx in got[4]:
+                                region.explored[idx] = True
+                        else:
+                            best = _seed_try(mesh, region, i, j, how)
+                        if best:
+                            feature, idx, _ = best
+                            region.free[idx] = False
+                            found_all.append(feature)
+                            done = True
+                    if got is not None and got[2]:
+                        seen[got[2][1]] = False     # (the worker carried on from its own find)
+    return found_all
+
+
+def _pair_seed(mesh, region, i, j, axes=None):
+    """The best patch grown from facets i and j (pass 1), or in the loose pass (axes:
+    the axes found so far) from any surface that explains them, those axes included."""
+    if axes is None:
+        return _seed_candidates(mesh, region, i, j)
+    found = [_seed_candidates(mesh, region, i, j)]
+    near = [i, j] + [k for k in region.nbrs[i] + region.nbrs[j] if region.free[k]]
+    pts = region.points(near)
+    for axis in _near(axes, pts):
+        m = _on_axis(axis, pts)
+        if _fits(m, pts):
+            found.append(_candidate(mesh, region, m, [i, j], axis_fixed=True))
+    return _best(found)
 
 
 def _simple_outline(mesh, fids):
@@ -1402,35 +1659,6 @@ def _axis_pass(mesh, regions, axes, tol=None):
     finally:
         _mesh_tol, _axis_vouched = strict, False
     return out + _axis_patches(mesh, regions, axes)
-
-
-def _axis_patches(mesh, regions, axes, lines_only=False):
-    out = []
-    for region in regions:
-        region.explored[:] = False
-        for i in range(len(region.facets)):
-            near = [i] + [k for k in region.nbrs[i] if region.free[k]]
-            if not region.free[i] or region.explored[i] or len(near) < 2:
-                continue
-            pts = region.points(near)
-            found = []
-            for axis in _near(axes, pts):
-                model = _on_axis(axis, pts)
-                if lines_only and model is not None and not model.line:
-                    continue
-                if _fits(model, pts):
-                    found.append(_candidate(mesh, region, model, [i], axis_fixed=True))
-            if _axis_vouched:
-                # (the wider allowance lets a cone a degree off a cylinder fit a strip of
-                # it; a real cone, a chamfer or countersink, tapers far more)
-                found = [c for c in found if not c or not c[0].model.line
-                         or c[0].model.line[1] == 0 or abs(c[0].model.line[1]) >= math.tan(math.radians(MIN_VOUCHED_CONE_DEG))]
-            best = _best(found)
-            if best:
-                feature, idx, _ = best
-                region.free[idx] = False
-                out.append(feature)
-    return out
 
 
 def _near(axes, pts, most=6):

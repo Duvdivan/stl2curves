@@ -40,33 +40,47 @@ import time
 from pathlib import Path
 
 import numpy as np
-from OCP.TopoDS import TopoDS, TopoDS_Compound
+from OCP.TopoDS import TopoDS, TopoDS_Compound, TopoDS_Iterator, TopoDS_Shape
+from OCP.BRepTools import BRepTools
 from OCP.BRep import BRep_Builder, BRep_Tool
 from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeSolid
 from OCP.BRepClass3d import BRepClass3d_SolidClassifier
+from OCP.Bnd import Bnd_Box
+from OCP.BRepBndLib import BRepBndLib
 from OCP.ShapeUpgrade import ShapeUpgrade_UnifySameDomain
 from OCP.ShapeFix import ShapeFix_Solid, ShapeFix_Shape
 from OCP.BRepCheck import BRepCheck_Analyzer
 from OCP.BRepGProp import BRepGProp
 from OCP.GProp import GProp_GProps
-from OCP.TopExp import TopExp_Explorer
-from OCP.TopAbs import TopAbs_FACE, TopAbs_SHELL, TopAbs_SOLID, TopAbs_VERTEX, TopAbs_IN
+from OCP.TopExp import TopExp, TopExp_Explorer
+from OCP.BRepAdaptor import BRepAdaptor_Curve
+from OCP.TopAbs import (TopAbs_EDGE, TopAbs_FACE, TopAbs_SHELL, TopAbs_SOLID, TopAbs_VERTEX, TopAbs_IN,
+                        TopAbs_FORWARD, TopAbs_REVERSED)
 from OCP.STEPControl import STEPControl_Writer, STEPControl_AsIs
 from OCP.Interface import Interface_Static
 from OCP.IFSelect import IFSelect_RetDone
 from OCP.BRepAlgoAPI import BRepAlgoAPI_Fuse
-from OCP.collections import List_TopoDS_Shape
+from OCP.collections import List_TopoDS_Shape, IndexedMap_TopoDS_Shape_TopTools_ShapeMapHasher
 
-from features import load_stl, analyze, summarize, snap, half_rings, Mesh, TOL
+import features as features_mod
+from features import load_stl, analyze, summarize, snap, half_rings, Mesh, TOL, time_left
 from sizing import guess_size
-from build import build_faces, sew, features_near, settle_blends
+from build import build_faces, sew, features_near, point_facet_distance, settle_blends
+import workers
 from bodies import split_bodies
 from blends import add_blends, split as split_blend, _blend as as_blend
 from repair import repair
 from simplify import simplify
+from read3mf import read_3mf
 
 SEARCH_SECONDS = 600    # time allowed for hunting down patches that spoil the solid
+TIME_LIMIT = 600        # seconds after which the optional refinements stop (--time-limit); see stl_to_solid
 FIX_PRECISIONS = (1e-5, 1e-4)   # mm: precisions ShapeFix tries on an invalid solid after its default
+EMPTY_SHELL = 1e-6      # closed shells with less volume than this share of the biggest are dropped
+FUSE_SECONDS = 30       # bodies whose fuse takes longer than this are handed over side by side
+BARE_AHEAD = 5000       # facets from which the bare-facet build is made ahead, in a worker process
+WORKERS_FROM = 5000     # triangles from which a part is worth starting worker processes for
+BARE_DRIFT = 1e-4       # share of a sound mesh's volume its bare facets may differ by and still be a reference
 UNIFY_TOL = 0.001       # mm: faces this close to one surface are merged at the end ...
 UNIFY_DEG = 0.1         # ... if their normals agree this closely
 UNIFY_VOLUME = 1e-3     # and kept if the volume stays this close (the integration itself
@@ -125,8 +139,9 @@ def mesh_volume(mesh):
     return float(np.einsum("ij,ij->i", a, np.cross(b, c)).sum() / 6)
 
 
-def solids_from_shells(sewn, fuse):
-    """Turn sewn shells into solids. A shell inside another is a cavity, the rest are bodies.
+def solids_from_shells(sewn, inward=True):
+    """Turn sewn shells into solids. A shell inside another is a cavity, the rest are bodies
+    (inward False: the mesh has no inward-facing shell, so every shell is a body).
 
     Returns (shape, number of bodies, number of cavities, total volume of material).
     """
@@ -149,41 +164,70 @@ def solids_from_shells(sewn, fuse):
         ex.Next()
     if not shells:
         raise RuntimeError("no closed body found")
+    # (a closed shell with next to no volume is two faces lying on each other, where the
+    # mesh had a wall of no thickness: no material, and not a body)
+    biggest = max(abs(v) for _, _, v in shells)
+    shells = [x for x in shells if abs(x[2]) > EMPTY_SHELL * biggest]
     shells.sort(key=lambda x: -x[2])        # biggest first: an enclosing shell comes first
 
     def points_of(shape, most=24):
         # corners and face centres (a rib spanning wall to wall has every corner buried
         # in the walls, but the middle of its top face is out in the open)
-        pts, ex = [], TopExp_Explorer(shape, TopAbs_FACE)
+        faces, ex = [], TopExp_Explorer(shape, TopAbs_FACE)
         while ex.More():
-            props = GProp_GProps()
-            BRepGProp.SurfaceProperties_s(ex.Current(), props)
-            pts.append(props.CentreOfMass())
+            faces.append(ex.Current())
             ex.Next()
-        ex = TopExp_Explorer(shape, TopAbs_VERTEX)
+        corners, ex = [], TopExp_Explorer(shape, TopAbs_VERTEX)
         while ex.More():
-            pts.append(BRep_Tool.Pnt_s(TopoDS.Vertex(ex.Current())))
+            corners.append(ex.Current())
             ex.Next()
-        return pts[::max(1, len(pts) // most)]
+        pts = []
+        for k in range(0, len(faces) + len(corners), max(1, (len(faces) + len(corners)) // most)):
+            if k < len(faces):
+                # (only the faces sampled: working out every face's centre is slow)
+                props = GProp_GProps()
+                BRepGProp.SurfaceProperties_s(faces[k], props)
+                pts.append(props.CentreOfMass())
+            else:
+                pts.append(BRep_Tool.Pnt_s(TopoDS.Vertex(corners[k - len(faces)])))
+        return pts
 
-    def inside(solid, pts):
-        return all(BRepClass3d_SolidClassifier(solid, p, 1e-6).State() == TopAbs_IN for p in pts)
+    def inside(body, pts):
+        # (one classifier per body, set up once: making one per point re-reads a big
+        # body's faces each time; a point outside its box is outside it)
+        lo, hi = body[2]
+        if any(not (lo[0] <= p.X() <= hi[0] and lo[1] <= p.Y() <= hi[1] and lo[2] <= p.Z() <= hi[2])
+               for p in pts):
+            return False
+        if body[3] is None:
+            body[3] = BRepClass3d_SolidClassifier(body[0])
+        for p in pts:
+            body[3].Perform(p, 1e-6)
+            if body[3].State() != TopAbs_IN:
+                return False
+        return True
+
+    def box(shape):
+        b = Bnd_Box()
+        BRepBndLib.Add_s(shape, b)
+        p, q = b.CornerMin(), b.CornerMax()
+        return (p.X(), p.Y(), p.Z()), (q.X(), q.Y(), q.Z())
 
     # A cavity lies wholly inside its host; an overlapping body (a rib sunk into a
     # floor, say) has some corners outside, and gets fused on instead.
-    bodies, cavities, total = [], [], 0.0      # bodies: [outer solid, [cavity solids]]
+    bodies, cavities, total = [], [], 0.0      # bodies: [outer solid, [cavity solids], box, classifier]
     for shell, solid, v in shells:
-        pts = points_of(shell)
-        host = next((b for b in bodies if inside(b[0], pts)), None)
+        pts = points_of(shell) if bodies and inward else None
+        host = next((b for b in bodies if inside(b, pts)), None) if pts else None
         if host is None:
-            bodies.append([solid, []])
+            bodies.append([solid, [], box(solid), None])
             total += v
         else:
             host[1].append(solid)
             cavities.append(solid)
             total -= v
     solids = []
-    for outer, holes in bodies:
+    for outer, holes, _, _ in bodies:
         if not holes:
             solids.append(outer)
             continue
@@ -192,49 +236,163 @@ def solids_from_shells(sewn, fuse):
             inner = TopoDS.Shell(TopExp_Explorer(h, TopAbs_SHELL).Current())
             maker.Add(TopoDS.Shell(inner.Reversed()))
         solids.append(fixed(maker.Solid()))
-    solid = solids[0]
-    if fuse and len(solids) > 1:
-        solid = boolean(BRepAlgoAPI_Fuse, solids[:1], solids[1:])
-    elif len(solids) > 1:
-        solid = compound(solids)
+    # (bodies side by side: fusing the ones that overlap is left until the part has
+    # checked out, see fuse_overlapping; on an assembly of many bodies it is slow)
+    solid = solids[0] if len(solids) == 1 else compound(solids)
     return solid, len(solids), len(cavities), total
+
+
+def inward_shells(mesh):
+    """Does any closed shell of the mesh face inward (a cavity)? Without one, no shell
+    built from it can be a cavity, and sorting cavities from bodies (slow when a part is
+    many bodies) is skipped. A shell here: triangles joined through edges they share."""
+    if "inward" not in mesh.__dict__:
+        from scipy.sparse import coo_matrix
+        from scipy.sparse.csgraph import connected_components
+        T = mesh.tris
+        e = np.sort(np.concatenate([T[:, [0, 1]], T[:, [1, 2]], T[:, [2, 0]]]), axis=1)
+        owner = np.tile(np.arange(len(T)), 3)
+        key = e[:, 0].astype(np.int64) * (len(mesh.pts) + 1) + e[:, 1]
+        order = np.argsort(key, kind="stable")
+        k = key[order]
+        same = np.nonzero(k[1:] == k[:-1])[0]
+        a, b = owner[order[same]], owner[order[same + 1]]
+        graph = coo_matrix((np.ones(len(a)), (a, b)), shape=(len(T), len(T)))
+        n, label = connected_components(graph, directed=False)
+        p, q, r = (mesh.pts[T[:, i]] for i in range(3))
+        vol = np.bincount(label, np.einsum("ij,ij->i", p, np.cross(q, r)), n)
+        mesh.inward = bool((vol < 0).any())
+    return mesh.inward
+
+
+def fuse_overlapping(shape):
+    """Fuse a checked part's bodies where they overlap (a rib sunk into a floor). Kept
+    only if the result is a valid solid whose volume lies between the biggest body's
+    and all of them together; otherwise they are handed over side by side."""
+    solids, ex = [], TopExp_Explorer(shape, TopAbs_SOLID)
+    while ex.More():
+        solids.append(ex.Current())
+        ex.Next()
+    if len(solids) < 2:
+        return shape
+    vols = [volume(s) for s in solids]
+    slack = UNIFY_VOLUME * sum(vols) + 1e-3
+    fused = fuse_checked(solids[:1], solids[1:], max(vols) - slack, sum(vols) + slack)
+    return shape if fused is None else fused
+
+
+def fuse_checked(args, tools, low, high):
+    """The fuse of the shapes if it is a valid solid with a volume between low and high,
+    else None. Done in a worker process when there are any, and given up after
+    FUSE_SECONDS (a boolean on a part of many thousand faces can grind on for minutes;
+    bodies merely touching or apart gain nothing from it anyway)."""
+    pool = workers.get()
+    if pool is None:
+        return _fuse_checked(args, tools, low, high)
+    import shutil
+    import tempfile
+    from concurrent.futures import TimeoutError as Timeout
+    tmp = tempfile.mkdtemp(prefix="stl2curves_")
+    try:
+        a, t, out = (os.path.join(tmp, n) for n in ("args.brep", "tools.brep", "fused.brep"))
+        BRepTools.Write_s(compound(args), a)
+        BRepTools.Write_s(compound(tools), t)
+        job = pool.submit(_fuse_job, (a, t, low, high, out))
+        try:
+            if not job.result(timeout=FUSE_SECONDS):
+                return None
+        except Timeout:
+            workers.abandoned()     # (the worker is left to finish; then restarted)
+            return None
+        except Exception:
+            workers.broken()
+            return None
+        fused = TopoDS_Shape()
+        BRepTools.Read_s(fused, out, BRep_Builder())
+        return fused
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _fuse_job(job):
+    """In a worker process: _fuse_checked on shapes read from BRep files, the result
+    written to one. True if there is a result."""
+    a, t, low, high, out = job
+    shapes = []
+    for path in (a, t):
+        comp = TopoDS_Shape()
+        BRepTools.Read_s(comp, path, BRep_Builder())
+        it, items = TopoDS_Iterator(comp), []
+        while it.More():
+            items.append(it.Value())
+            it.Next()
+        shapes.append(items)
+    fused = _fuse_checked(shapes[0], shapes[1], low, high)
+    return fused is not None and BRepTools.Write_s(fused, out)
+
+
+def _fuse_checked(args, tools, low, high):
+    try:
+        fused = boolean(BRepAlgoAPI_Fuse, args, tools)
+    except RuntimeError:
+        return None
+    if count(fused, TopAbs_FACE) and BRepCheck_Analyzer(fused).IsValid() and low <= volume(fused) <= high:
+        return fused
+    return None
 
 
 def attempt(mesh, features, mesh_tol, tol, fuse, faceted_volume):
     """Build and sew the part with these features. Returns (result, to_drop): result is
     (shape, bodies, cavities), or None if it fails the checks; to_drop lists the patches
     to leave out next time (faces that couldn't be built, or those blamed for a gap or an
-    invalid face), and attempt.blamed says whether they were only blamed."""
+    invalid face), and attempt.blamed says whether they were only blamed. attempt.why
+    names the check that failed ("build", "free", "nosolid", "bodies", "volume",
+    "volume2", "invalid"; "ok"), for diagnosing a slow or poor conversion."""
     attempt.blamed = False
+    attempt.why = "ok"
     comp, shells, failed = build_faces(mesh, features, mesh_tol)
     if failed:
+        attempt.why = "build"
         return None, failed
     attempt.blamed = True
     worst = max((f.worst for f in features), default=0.0)
     sewn, free = sew(comp, max(tol, min(0.2, 1.5 * worst)), shells)
     if free:
         # patches whose faces left gaps: drop just those and try again
+        attempt.why = "free"
         return None, culprits(mesh, features, free)
     try:
-        shape, nb, nv, signed = solids_from_shells(sewn, fuse)
+        shape, nb, nv, signed = solids_from_shells(sewn, inward_shells(mesh))
     except RuntimeError:
+        attempt.why = "nosolid"
         return None, []
     _mesh_defective(mesh, tol, fuse)
     if mesh.bare_bodies and nb > mesh.bare_bodies:
+        attempt.why = "bodies"
         return None, []     # a body the bare facets don't make: a face ran off somewhere
     change = sum(f.change for f in features)
     expected = faceted_volume + change
     allowed = sum(f.tolerance for f in features) + 1e-6 * abs(faceted_volume) + 1e-3
     if abs(signed - expected) > allowed:
         # a mesh whose bare facets already don't add up to its volume (it crosses itself,
-        # say) is measured against what the bare facets give instead
-        if not _mesh_defective(mesh, tol, fuse) or mesh.bare_volume is None:
+        # or is many bodies touching at corners, some too thin to make a solid) is
+        # measured against what the bare facets give instead
+        drift = abs(mesh.bare_volume - faceted_volume) if mesh.bare_volume is not None else None
+        defective = _mesh_defective(mesh, tol, fuse)
+        # (a sound mesh only by what flattening its facets moves: anything more would be
+        # the bare build itself going wrong, and is no reference)
+        if drift is None or (not defective and drift > BARE_DRIFT * abs(faceted_volume) + 1e-3):
+            attempt.why = "volume"
             return None, []
-        # (give or take what the defect itself does: it sews a little differently each time)
         expected = mesh.bare_volume + change
-        if abs(signed - expected) > allowed + abs(mesh.bare_volume - faceted_volume):
+        # (a defective mesh give or take what the defect itself does: it sews a little
+        # differently each time)
+        slack = drift if defective else 0.0
+        if abs(signed - expected) > allowed + slack:
+            attempt.why = "volume2"
             return None, []
-    if not BRepCheck_Analyzer(shape).IsValid():
+    check = BRepCheck_Analyzer(shape)
+    if not check.IsValid():
         fixed_shape = None
         if not mesh.__dict__.get("defective"):      # (no repair mends a mesh that crosses itself)
             # (a straight edge running on tangent into an arc can pass for a crossing at
@@ -252,8 +410,9 @@ def attempt(mesh, features, mesh_tol, tol, fuse, faceted_volume):
             shape = fixed_shape
         else:
             # patches next to faces that came out invalid: drop just those and try again
-            blame = culprits(mesh, features, invalid_face_points(shape))
+            blame = culprits(mesh, features, invalid_face_points(shape, check))
             if blame or not _mesh_defective(mesh, tol, fuse):
+                attempt.why = "invalid"
                 return None, blame
             # nothing to blame and the mesh as bare facets fails the same way: the
             # defect is in the mesh itself (it touches itself, say), not in the curves
@@ -265,15 +424,44 @@ def _mesh_defective(mesh, tol, fuse):
     mesh.bare_volume and mesh.bare_bodies to the volume and number of bodies the bare
     facets give (None and 0 if they make no solid)."""
     if "defective" not in mesh.__dict__:
-        comp, shells, _ = build_faces(mesh, [], TOL)
-        sewn, free = sew(comp, tol, shells)
-        mesh.bare_volume, mesh.bare_bodies = None, 0
-        try:
-            shape, mesh.bare_bodies, _, mesh.bare_volume = solids_from_shells(sewn, fuse)
-            mesh.defective = bool(free) or not BRepCheck_Analyzer(shape).IsValid()
-        except RuntimeError:
-            mesh.defective = True
+        got, ahead = None, mesh.__dict__.pop("bare_ahead", None)
+        if ahead is not None:
+            try:
+                got = ahead.result()
+            except Exception:
+                got = None
+        mesh.defective, mesh.bare_volume, mesh.bare_bodies = got or _bare(mesh, tol)
     return mesh.defective
+
+
+def _bare(mesh, tol):
+    """(defective, volume, bodies) of the mesh built from bare facets."""
+    comp, shells, _ = build_faces(mesh, [], TOL)
+    sewn, free = sew(comp, tol, shells)
+    try:
+        shape, bodies, _, vol = solids_from_shells(sewn, inward_shells(mesh))
+        return bool(free) or not BRepCheck_Analyzer(shape).IsValid(), vol, bodies
+    except RuntimeError:
+        return True, None, 0
+
+
+def _bare_job(job):
+    """In a worker process: _bare on the shared mesh."""
+    key, tol = job
+    return _bare(workers.load(key), tol)
+
+
+def _bare_ahead(mesh, tol):
+    """Start building a big mesh from bare facets in a worker process (_mesh_defective
+    picks it up), so it is ready by the time the first attempt is checked."""
+    pool = workers.get() if len(mesh.farea) >= BARE_AHEAD else None
+    if pool is not None and "defective" not in mesh.__dict__:
+        try:
+            if "shared_as" not in mesh.__dict__:
+                mesh.shared_as = workers.share(mesh)
+            mesh.bare_ahead = pool.submit(_bare_job, (mesh.shared_as, tol))
+        except Exception:
+            mesh.__dict__.pop("bare_ahead", None)
 
 
 def culprits(mesh, features, points):
@@ -286,8 +474,7 @@ def culprits(mesh, features, points):
     P = np.asarray(points)
     dist = {}
     for k in near:
-        V = mesh.pts[np.unique(np.concatenate([mesh.fverts[x] for x in features[k].facets]))]
-        dist[k] = np.linalg.norm(P[:, None] - V[None], axis=2).min(axis=1)   # per trouble spot
+        dist[k] = point_facet_distance(mesh, features[k].facets, P)     # per trouble spot
     # blends are the likeliest cause and the cheapest loss: blame one nearby first
     blends = [k for k in near if features[k].kind == "blend"]
     out = set()
@@ -299,12 +486,14 @@ def culprits(mesh, features, points):
     return sorted(out)
 
 
-def invalid_face_points(shape):
-    """A point on each face of the shape that fails the validity check."""
+def invalid_face_points(shape, check=None):
+    """A point on each face of the shape that fails the validity check (check: the
+    shape's BRepCheck_Analyzer, if already run: it has every face's verdict)."""
     out, ex = [], TopExp_Explorer(shape, TopAbs_FACE)
     while ex.More():
         face = ex.Current()
-        if not BRepCheck_Analyzer(face).IsValid():
+        bad = not (check.IsValid(face) if check is not None else BRepCheck_Analyzer(face).IsValid())
+        if bad:
             props = GProp_GProps()
             BRepGProp.SurfaceProperties_s(face, props)
             c = props.CentreOfMass()
@@ -315,6 +504,35 @@ def invalid_face_points(shape):
                 out.append((p.X(), p.Y(), p.Z()))
                 vx.Next()
         ex.Next()
+    return out + misjoined_edge_points(shape)
+
+
+def misjoined_edge_points(shape):
+    """The middle of each edge its shell uses wrongly: run the same way by both faces
+    beside it (one of them is flipped), or shared by more than two faces. Every face
+    can check out on its own while its shell doesn't; this says where."""
+    out, ex = [], TopExp_Explorer(shape, TopAbs_SHELL)
+    while ex.More():
+        edges = IndexedMap_TopoDS_Shape_TopTools_ShapeMapHasher()
+        TopExp.MapShapes_s(ex.Current(), TopAbs_EDGE, edges)
+        uses = np.zeros((edges.Extent() + 1, 2), int)       # forward, reversed
+        fx = TopExp_Explorer(ex.Current(), TopAbs_FACE)
+        while fx.More():
+            ee = TopExp_Explorer(fx.Current(), TopAbs_EDGE)
+            while ee.More():
+                o = ee.Current().Orientation()
+                if o in (TopAbs_FORWARD, TopAbs_REVERSED):
+                    uses[edges.FindIndex(ee.Current()), int(o == TopAbs_REVERSED)] += 1
+                ee.Next()
+            fx.Next()
+        n = uses.sum(axis=1)
+        for i in np.nonzero((n > 2) | ((n == 2) & (uses[:, 0] != 1)))[0]:
+            edge = TopoDS.Edge(edges.FindKey(int(i)))
+            if not BRep_Tool.Degenerated_s(edge):
+                c = BRepAdaptor_Curve(edge)
+                p = c.Value((c.FirstParameter() + c.LastParameter()) / 2)
+                out.append((p.X(), p.Y(), p.Z()))
+        ex.Next()
     return out
 
 
@@ -322,14 +540,13 @@ def _build(mesh, features, mesh_tol, tol, fuse, info):
     """Build and check one group of bodies, leaving faceted any feature that spoils it.
     Returns (shape, bodies, cavities)."""
     faceted_volume = mesh_volume(mesh)
+    _bare_ahead(mesh, tol)
     features = settle_blends(mesh, features, mesh_tol, split_blend, info["skipped"])
 
     def good(subset):
         result, failed = attempt(mesh, subset, mesh_tol, tol, fuse, faceted_volume)
         blamed = []
         while failed:  # patches whose face couldn't be built: drop them and retry
-            if attempt.blamed:
-                blamed += [subset[k] for k in failed if subset[k].kind == "blend"]
             # a smooth blend whose face won't fit is cut in two and tried again; failing
             # that (or if it was only blamed), it gives back the pieces it replaced
             back = []
@@ -356,16 +573,28 @@ def _build(mesh, features, mesh_tol, tol, fuse, info):
                 else:
                     info["skipped"].append(f)
                     back += list(f.parts)
+                    if attempt.blamed:
+                        blamed.append(f)
             subset = [f for k, f in enumerate(subset) if k not in failed] + back
             result, failed = attempt(mesh, subset, mesh_tol, tol, fuse, faceted_volume)
-        # A blend dropped for trouble nearby may have been innocent: once the part
-        # builds, give each one a second chance on its own.
-        for b in blamed[:6] if result is not None else []:
-            trial = [f for f in subset if all(f is not p for p in b.parts)] + [b]
-            got, again = attempt(mesh, trial, mesh_tol, tol, fuse, faceted_volume)
-            if got is not None and not again:
+
+        # Patches dropped for trouble nearby may have been innocent: once the part
+        # builds, give them a second chance, all together first, halving on failure.
+        def again(group):
+            nonlocal result, subset
+            if not group or time_left() < 0:
+                return
+            trial = [f for f in subset if all(f is not p for b in group for p in b.parts)] + group
+            got, drop = attempt(mesh, trial, mesh_tol, tol, fuse, faceted_volume)
+            if got is not None and not drop:
                 result, subset = got, trial
-                info["skipped"] = [f for f in info["skipped"] if f is not b]
+                info["skipped"] = [f for f in info["skipped"] if all(f is not b for b in group)]
+            elif len(group) > 1:
+                again(group[:len(group) // 2])
+                again(group[len(group) // 2:])
+
+        if result is not None:
+            again(blamed)
         return result, subset
 
     result, used = good(features)
@@ -378,7 +607,7 @@ def _build(mesh, features, mesh_tol, tol, fuse, info):
             nonlocal result
             if not group:
                 return
-            if time.time() - start > SEARCH_SECONDS:
+            if time.time() - start > SEARCH_SECONDS or time_left() < 0:
                 info["skipped"] += group      # out of time: leave the rest faceted
                 return
             trial, kept = good(accepted + group)
@@ -400,14 +629,34 @@ def _build(mesh, features, mesh_tol, tol, fuse, info):
     if result is None:
         raise RuntimeError("could not build a closed solid from this mesh")
     info["restored"] += used
-    return result
+    shape, nb, nv = result
+    if fuse and nb > 1:
+        shape = fuse_overlapping(shape)
+        nb = count(shape, TopAbs_SOLID)
+    return shape, nb, nv
 
 
-def stl_to_solid(path, tol, fuse=True, curves=True, true_size=False, blends=True, mend=True,
-                 simplify_to=None):
+def stl_to_solid(*args, time_limit=TIME_LIMIT, **kwargs):
+    """Convert one STL: (shape, info). See _stl_to_solid. time_limit (seconds, None for
+    none): fitting blends and hunting down troublemakers stop at their share of it, and
+    whatever has checked out by then is handed over."""
+    features_mod._budget = time_limit
+    features_mod._deadline = time.time() + time_limit if time_limit else None
+
+    try:
+        return _stl_to_solid(*args, **kwargs)
+    finally:
+        features_mod._deadline = features_mod._budget = None
+        workers.finish()
+
+
+def _stl_to_solid(path, tol, fuse=True, curves=True, true_size=False, blends=True, mend=True,
+                  simplify_to=None):
     """simplify_to: how far (mm) thinning out an over-dense mesh may move its surface;
     None: only above AUTO_SIMPLIFY triangles, at SIMPLIFY_ERROR; 0: never."""
-    pts, tris = load_stl(path)
+    pts, tris = load_stl(path) if isinstance(path, (str, os.PathLike)) else path
+    if len(tris) >= WORKERS_FROM:
+        workers.start()     # (worker processes, started while the mesh is repaired)
     info = {"triangles": len(tris), "restored": [], "skipped": [], "size": None, "snapped": 0,
             "repairs": [], "simplified": None}
     if mend:
@@ -447,12 +696,9 @@ def stl_to_solid(path, tol, fuse=True, curves=True, true_size=False, blends=True
         shape = compound(shapes)
         if fuse:
             apart = sum(volume(s) for s in shapes)
-            try:
-                fused = boolean(BRepAlgoAPI_Fuse, shapes[:1], shapes[1:])
-            except RuntimeError:
-                fused = None
-            if (fused is not None and BRepCheck_Analyzer(fused).IsValid()
-                    and abs(volume(fused) - apart) <= UNIFY_VOLUME * abs(apart) + 1e-3):
+            slack = UNIFY_VOLUME * abs(apart) + 1e-3
+            fused = fuse_checked(shapes[:1], shapes[1:], apart - slack, apart + slack)
+            if fused is not None:
                 shape = fused
         nb = count(shape, TopAbs_SOLID)
 
@@ -549,25 +795,39 @@ def main():
     ap.add_argument("--simplify", type=float, metavar="MM",
                     help=f"thin out the mesh first, moving its surface by at most MM (0: never; default: "
                          f"{SIMPLIFY_ERROR} mm for meshes over {AUTO_SIMPLIFY:,} triangles)")
+    ap.add_argument("--time-limit", type=float, metavar="SECONDS", default=TIME_LIMIT,
+                    help=f"stop fitting blends and hunting down troublemakers after about this long "
+                         f"and keep what checks out (0: no limit; default {TIME_LIMIT})")
     ap.add_argument("--true-size", action="store_true",
                     help="rebuild at the apparent design size, with radii snapped to round values")
     args = ap.parse_args()
 
     files = []
     for p in map(Path, args.inputs):
-        files += sorted(f for f in p.iterdir() if f.suffix.lower() == ".stl") if p.is_dir() else [p]
+        files += sorted(f for f in p.iterdir() if f.suffix.lower() in (".stl", ".3mf")) if p.is_dir() else [p]
     if not files:
-        sys.exit("No STL files found.")
+        sys.exit("No STL or 3MF files found.")
+    # (a 3MF file holds any number of objects: each is converted to a STEP of its own)
+    jobs = []
+    for f in files:
+        if f.suffix.lower() == ".3mf":
+            objects = read_3mf(f)
+            if not objects:
+                print(f"{f.name}: no objects to convert", flush=True)
+            jobs += [(f"{f.name}: {name}", (pts, tris), f, f"{f.stem} - {name}") for name, pts, tris in objects]
+        else:
+            jobs.append((f.name, f, f, f.stem))
 
     shapes = []
-    for f in files:
+    for label, source, f, stem in jobs:
         t = time.time()
-        print(f"{f.name}: converting...", flush=True)
-        shape, info = stl_to_solid(f, args.tol, not args.no_fuse, not args.no_curves, args.true_size,
-                                   not args.no_blends, not args.no_repair, args.simplify)
+        print(f"{label}: converting...", flush=True)
+        shape, info = stl_to_solid(source, args.tol, not args.no_fuse, not args.no_curves, args.true_size,
+                                   not args.no_blends, not args.no_repair, args.simplify,
+                                   time_limit=args.time_limit or None)
         out_dir = Path(args.out) if args.out else f.parent
         out_dir.mkdir(parents=True, exist_ok=True)
-        out = out_dir / (f.stem + ".step")
+        out = out_dir / (stem + ".step")
         write_step(shape, out)
         shapes.append(shape)
         nb, nv = info["bodies"], info["voids"]
