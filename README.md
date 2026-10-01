@@ -97,12 +97,16 @@ Without it the size is left alone (a slight scale is often deliberate, for fit).
    through all its corners at once, allowing a few outline corners that a neighbouring
    face's triangulation put slightly off the curve. Then neighbouring facets propose a
    surface (cylinder, cone, sphere; tori on axes already found), which is grown while
-   mesh corners stay within a micron of it. Strict passes first (a patch must follow its surface's natural
-   boundary lines, or meet its neighbours at creases), then fillets between flat faces
-   (`fillets.py`: two faces meeting at an angle, rounded off, give a cylinder touching
-   both, so only the radius is unknown and every strip corner pins it down; this finds
-   fillets however coarsely or irregularly they were cut into triangles), then a
-   permissive pass for what is left, then neighbouring patches on the same surface are
+   mesh corners stay within a micron of it. Fillets between flat faces are looked for
+   early (`fillets.py`: two faces meeting at an angle, rounded off, give a cylinder
+   touching both, so only the radius is unknown and every corner of the rounded band
+   pins it down). This finds fillets however coarsely or irregularly they were cut into
+   triangles, and forgives meshes that lost some accuracy there (most corners within
+   0.02 mm); and since a design usually uses one fillet radius throughout, a band that
+   nearly fits a radius found cleanly elsewhere in the part takes that radius. Strict
+   passes follow (a patch must follow its surface's natural boundary lines, or meet its
+   neighbours at creases), then a permissive pass for what is left, then neighbouring
+   patches on the same surface are
    merged, chains of short
    cylinder strips or sphere bits are replaced by the torus they approximate, and equal
    radii and near-axis-aligned axes are snapped to exact values (each snap kept only if

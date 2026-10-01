@@ -844,6 +844,21 @@ def analyze(pts, tris):
     # strip of three or four facets fits a cylinder of almost any radius and tilt.
     features += _axis_pass(mesh, regions, _distinct_axes(features, mesh), AXIS_NOISE * mesh.noise)
 
+    # Fillets between flat faces (fillets.py): a cylinder touching both faces, only its
+    # radius to find, with radii found already (holes, pins, rounded corners) as the
+    # likeliest. Before pass 1, which would cut a coarsely meshed fillet into strips
+    # that each fit some cylinder of their own.
+    import fillets
+    taken = np.zeros(len(mesh.farea), bool)
+    for f in features + screws:
+        taken[f.facets] = True
+    known = [r for r in (_radius(f.model) for f in features) if r]
+    rolled = fillets.find(mesh, regions, taken, known)
+    claimed = [int(f) for x in rolled for f in x.facets]
+    for region in regions:
+        region.free &= ~np.isin(region.facets, claimed)
+    features += rolled
+
     # Pass 1: from each pair of neighbouring facets, work out what surface they're on.
     features += _pairs_pass(mesh, regions)
 
@@ -862,17 +877,6 @@ def analyze(pts, tris):
         # (on a known axis only the radius is free, so a file that rounded its corners
         # can be allowed that much more: the CAD program's own export is often as loose)
         features += _axis_pass(mesh, regions, axes, AXIS_NOISE * mesh.noise)
-    # Pass 3: fillets between flat faces that the passes above couldn't make out (cut
-    # into few or irregular strips): a cylinder touching both faces, only its radius to find
-    import fillets
-    taken = np.zeros(len(mesh.farea), bool)
-    for f in features:
-        taken[f.facets] = True
-    rolled = fillets.find(mesh, regions, taken)
-    claimed = [int(f) for x in rolled for f in x.facets]
-    for region in regions:
-        region.free &= ~np.isin(region.facets, claimed)
-    features += rolled
     # a thread usually ends in a countersink or chamfer round its own axis, which the
     # passes above couldn't try (the thread wasn't known yet). Held to the thread's own
     # tolerance: the CAD program drew them together, both a hundredth or so off true.

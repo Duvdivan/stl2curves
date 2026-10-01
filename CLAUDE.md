@@ -70,12 +70,17 @@ Local regression data on this machine (not in the repo):
    patches in passes over the smooth regions (`Region`, whose `free` flags track what is
    still unexplained). The pass order matters:
    - Pass 0: whole regions as one surface.
+   - Screw threads (`threads.py`), before anything tries surfaces round known axes or
+     the loose pass (which would take thread pieces for cylinders and cones).
+   - Pass 0b: surfaces on the axes found so far (a lug round its screw hole).
+   - Fillets between flat faces (`fillets.py`, rolling ball): before pass 1, which
+     would cut a coarsely meshed fillet into strips of its own. Forgiving (most band
+     corners within 0.02 mm, all within 0.05), so its guards matter: faces at least 3x
+     the band's facets (finely cut pins), faces and fillet running at least one radius
+     along the edge (slices of rounded corners and curved edges), and radii found with
+     confidence preferred for near-misses (one radius is used all over a design).
    - Pass 1: surfaces hypothesised from pairs of neighbouring facets.
-   - Pass 2: tori around axes already found.
-   - Pass 3: rolling-ball fillets between flat faces (`fillets.py`). This must run
-     after the strict passes, or it false-matches finely cut pins.
-   - Pass 4: screw threads (`threads.py`). This must run before the loose pass, which
-     would otherwise take thread pieces for cylinders and cones.
+   - Pass 2: tori around axes already found; thread ends (countersinks, chamfers).
    - Loose pass, band tori, merge of same-surface neighbours.
 
    Thread features are appended after the merge: their models aren't surfaces of
