@@ -35,13 +35,15 @@ Usage:
 import argparse
 import math
 import os
+import shutil
 import sys
+import tempfile
 import time
 from pathlib import Path
 
 import numpy as np
 from OCP.TopoDS import TopoDS, TopoDS_Compound, TopoDS_Iterator, TopoDS_Shape
-from OCP.BRepTools import BRepTools
+from OCP.BRepTools import BRepTools, BRepTools_WireExplorer
 from OCP.BRep import BRep_Builder, BRep_Tool
 from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeSolid
 from OCP.BRepClass3d import BRepClass3d_SolidClassifier
@@ -53,10 +55,10 @@ from OCP.BRepCheck import BRepCheck_Analyzer
 from OCP.BRepGProp import BRepGProp
 from OCP.GProp import GProp_GProps
 from OCP.TopExp import TopExp, TopExp_Explorer
-from OCP.BRepAdaptor import BRepAdaptor_Curve
-from OCP.TopAbs import (TopAbs_EDGE, TopAbs_FACE, TopAbs_SHELL, TopAbs_SOLID, TopAbs_VERTEX, TopAbs_IN,
+from OCP.BRepAdaptor import BRepAdaptor_Curve, BRepAdaptor_Surface
+from OCP.TopAbs import (TopAbs_EDGE, TopAbs_FACE, TopAbs_SHELL, TopAbs_SOLID, TopAbs_VERTEX, TopAbs_WIRE, TopAbs_IN,
                         TopAbs_FORWARD, TopAbs_REVERSED)
-from OCP.STEPControl import STEPControl_Writer, STEPControl_AsIs
+from OCP.STEPControl import STEPControl_Writer, STEPControl_Reader, STEPControl_AsIs
 from OCP.Interface import Interface_Static
 from OCP.IFSelect import IFSelect_RetDone
 from OCP.BRepAlgoAPI import BRepAlgoAPI_Fuse
@@ -84,6 +86,10 @@ BARE_AHEAD = 5000       # facets from which the bare-facet build is made ahead, 
 WORKERS_FROM = 5000     # triangles from which a part is worth starting worker processes for
 BARE_DRIFT = 1e-4       # share of a sound mesh's volume its bare facets may differ by and still be a reference
 TESS_DEFLECTION = 0.0005    # mm: how closely a solid's faces are tessellated to measure its volume
+FILE_VOLUME = 1e-3      # share of the volume a finished part's STEP file may read back off by
+FILE_MATCH = 0.05       # mm (and share): how far a face's middle or outline may move read back from the file
+FILE_AREA = 0.5         # mm^2 (plus half a percent): how much a face's area may change read back from the file
+FILE_ROUNDS = 3         # rounds of patches dropped for what their STEP file does, at most, per body
                             # where OCC's integration and the expected volume disagree
 UNIFY_TOL = 0.001       # mm: faces this close to one surface are merged at the end ...
 UNIFY_DEG = 0.1         # ... if their normals agree this closely
@@ -459,7 +465,150 @@ def attempt(mesh, features, mesh_tol, tol, fuse, faceted_volume):
                 return None, blame
             # nothing to blame and the mesh as bare facets fails the same way: the
             # defect is in the mesh itself (it touches itself, say), not in the curves
+    trial = mesh.__dict__.get("file_trial", False)
+    if (features and not mesh.__dict__.get("file_off")
+            and (trial or mesh.__dict__.get("file_rounds", 0) < FILE_ROUNDS)):
+        # The solid is only as good as its STEP file. A file keeps no tolerances, and a
+        # reader works them out again from the geometry, tight: a face that checked out
+        # only within the wide tolerance sewing gave its edges can come back crossing
+        # itself, split up, or (an edge closed up by sewing) running round a whole circle.
+        trouble = file_trouble(shape, allowed)
+        if trouble:
+            blame = culprits(mesh, features, trouble)
+            if blame:
+                # (a few rounds at most: trouble the patches nearby don't cure is left to
+                # the final check's warning rather than costing every patch round it)
+                if not trial:
+                    mesh.file_rounds = mesh.__dict__.get("file_rounds", 0) + 1
+                attempt.why = "file"
+                return None, blame
+            # (nothing near to blame: the bare facets themselves, kept as they are)
     return (shape, nb, nv), []
+
+
+def read_step(path):
+    """The shape in a STEP file (OpenCascade's transfer statistics silenced)."""
+    sys.stdout.flush()
+    saved, devnull = os.dup(1), os.open(os.devnull, os.O_WRONLY)
+    os.dup2(devnull, 1)
+    try:
+        r = STEPControl_Reader()
+        r.ReadFile(str(path))
+        r.TransferRoots()
+        return r.OneShape()
+    finally:
+        os.dup2(saved, 1)
+        os.close(devnull)
+        os.close(saved)
+
+
+def file_trouble(shape, allowed):
+    """Write the shape to STEP and read it back: None if it comes back a valid solid of
+    the same faces and volume (within allowed, mm^3), else points where it doesn't (maybe
+    none found). Only real changes count: a face that comes back invalid, goes missing or
+    changes its area by more than FILE_AREA (small faces read back a percent or so off,
+    their tolerant edges laid out afresh, and that is harmless); and on a big face only
+    the outline (wire) that changed, not every hole in it."""
+    tmp = tempfile.mkdtemp(prefix="stl2curves_")
+    try:
+        path = os.path.join(tmp, "check.step")
+        write_step(shape, path)
+        back = read_step(path)
+    except Exception:
+        return []
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    check = BRepCheck_Analyzer(back)
+    if (check.IsValid() and count(back, TopAbs_FACE) == count(shape, TopAbs_FACE)
+            and abs(volume(back) - volume(shape)) <= allowed):
+        return None
+
+    def faces(s):
+        out, ex = [], TopExp_Explorer(s, TopAbs_FACE)
+        while ex.More():
+            face = TopoDS.Face(ex.Current())
+            ex.Next()
+            props = GProp_GProps()
+            BRepGProp.SurfaceProperties_s(face, props)
+            c = props.CentreOfMass()
+            out.append((face, int(BRepAdaptor_Surface(face).GetType()), props.Mass(), np.array([c.X(), c.Y(), c.Z()])))
+        return out
+
+    def partner(item, pool, table):
+        # the face in the other shape most like this one: same kind of surface, middle
+        # nearby (a big face's middle moves further when it changes), area closest
+        _, kind, area, centre = item
+        kinds, areas, centres = table
+        reach = FILE_MATCH + 0.02 * math.sqrt(abs(area))
+        near = np.nonzero((kinds == kind) & (np.linalg.norm(centres - centre, axis=1) <= reach))[0]
+        return pool[near[np.argmin(np.abs(areas[near] - area))]] if len(near) else None
+
+    def table(pool):
+        return (np.array([x[1] for x in pool]), np.array([x[2] for x in pool]),
+                np.array([x[3] for x in pool]).reshape(-1, 3))
+
+    mine, theirs = faces(shape), faces(back)
+    mine_t, theirs_t = table(mine), table(theirs)
+    points = []
+    for item in mine:
+        other = partner(item, theirs, theirs_t)
+        if other is None or abs(other[2] - item[2]) > FILE_AREA + 0.005 * abs(item[2]):
+            points += _changed_outline(item[0], None if other is None else other[0])
+    for item in theirs:
+        if not check.IsValid(item[0]):
+            other = partner(item, mine, mine_t)
+            points += (_changed_outline(other[0], item[0]) if other is not None
+                       else _vertex_points(item[0]))
+    return points or invalid_face_points(back, check)
+
+
+def _vertex_points(shape):
+    out, vx = [], TopExp_Explorer(shape, TopAbs_VERTEX)
+    while vx.More():
+        p = BRep_Tool.Pnt_s(TopoDS.Vertex(vx.Current()))
+        out.append((p.X(), p.Y(), p.Z()))
+        vx.Next()
+    return out
+
+
+def _outlines(face):
+    """(wire, length, middle, vector area) of each of the face's wires, from points along
+    its edges in order (the vector area turns round when the wire does)."""
+    out, wx = [], TopExp_Explorer(face, TopAbs_WIRE)
+    while wx.More():
+        wire = TopoDS.Wire(wx.Current())
+        wx.Next()
+        pts, we = [], BRepTools_WireExplorer(wire, face)
+        while we.More():
+            edge = we.Current()
+            we.Next()
+            c = BRepAdaptor_Curve(edge)
+            t = np.linspace(c.FirstParameter(), c.LastParameter(), 9)
+            if edge.Orientation() == TopAbs_REVERSED:
+                t = t[::-1]
+            pts += [(p.X(), p.Y(), p.Z()) for p in (c.Value(x) for x in t[:-1])]
+        if not pts:
+            continue
+        P = np.array(pts)
+        Q = np.roll(P, -1, axis=0)
+        step = np.linalg.norm(Q - P, axis=1)
+        # (the middle weighted by length: a reader may split an edge in two)
+        middle = ((P + Q) / 2 * step[:, None]).sum(axis=0) / max(step.sum(), 1e-12)
+        out.append((wire, float(step.sum()), middle, 0.5 * np.cross(P, Q).sum(axis=0)))
+    return out
+
+
+def _changed_outline(face, other):
+    """Points on each wire of the face that the other face (its version read back from
+    the file, or None) doesn't have alike; all the face's corners if every wire matches."""
+    theirs = _outlines(other) if other is not None else []
+    out = []
+    for wire, length, middle, turn in _outlines(face):
+        if not any(abs(l - length) <= FILE_MATCH * (1 + length) and np.linalg.norm(m - middle) <= FILE_MATCH
+                   and np.linalg.norm(t - turn) <= FILE_MATCH * (1 + np.linalg.norm(turn))
+                   for _, l, m, t in theirs):
+            out += _vertex_points(wire)
+    return out or _vertex_points(face)
 
 
 def _mesh_defective(mesh, tol, fuse):
@@ -593,6 +742,7 @@ def _build(mesh, features, mesh_tol, tol, fuse, info):
             # a smooth blend whose face won't fit is cut in two and tried again; failing
             # that (or if it was only blamed), it gives back the pieces it replaced
             back = []
+            by_file = attempt.why == "file"
             for k in failed:
                 f = subset[k]
                 rings = half_rings(mesh, f)
@@ -616,6 +766,8 @@ def _build(mesh, features, mesh_tol, tol, fuse, info):
                 else:
                     info["skipped"].append(f)
                     back += list(f.parts)
+                    if by_file:
+                        mesh.__dict__.setdefault("file_dropped", []).append(f)
                     if attempt.blamed:
                         blamed.append(f)
             subset = [f for k, f in enumerate(subset) if k not in failed] + back
@@ -628,7 +780,13 @@ def _build(mesh, features, mesh_tol, tol, fuse, info):
             if not group or time_left() < 0:
                 return
             trial = [f for f in subset if all(f is not p for b in group for p in b.parts)] + group
-            got, drop = attempt(mesh, trial, mesh_tol, tol, fuse, faceted_volume)
+            # (the STEP file checked whatever rounds are left: a patch dropped for it must
+            # not come back unchecked)
+            mesh.file_trial = True
+            try:
+                got, drop = attempt(mesh, trial, mesh_tol, tol, fuse, faceted_volume)
+            finally:
+                mesh.file_trial = False
             if got is not None and not drop:
                 result, subset = got, trial
                 info["skipped"] = [f for f in info["skipped"] if all(f is not b for b in group)]
@@ -671,6 +829,20 @@ def _build(mesh, features, mesh_tol, tol, fuse, info):
             result, used = good([])
     if result is None:
         raise RuntimeError("could not build a closed solid from this mesh")
+    dropped = [f for f in mesh.__dict__.pop("file_dropped", []) if all(f is not u for u in used)]
+    if dropped:
+        allowed = sum(f.tolerance for f in used) + 1e-6 * abs(faceted_volume) + 1e-3
+        if file_trouble(result[0], allowed) is not None:
+            # dropping the patches blamed for the STEP file didn't mend it: better have
+            # them back (the final check warns about the file either way)
+            mesh.file_off = True
+            skipped = list(info["skipped"])
+            info["skipped"] = [f for f in skipped if all(f is not b for b in dropped)]
+            got, kept = good([f for f in used if all(f is not p for b in dropped for p in b.parts)] + dropped)
+            if got is not None:
+                result, used = got, kept
+            else:
+                info["skipped"] = skipped
     info["restored"] += used
     shape, nb, nv = result
     if fuse and nb > 1:
@@ -752,7 +924,7 @@ def _stl_to_solid(path, tol, fuse=True, curves=True, true_size=False, blends=Tru
     # triangle), failing that just edges split along one line.
     checked = shape
     target = volume(checked)
-    shape = None
+    shape = untidy = None
     for faces in (True, False):
         try:
             unify = ShapeUpgrade_UnifySameDomain(checked, True, faces, False)
@@ -764,9 +936,11 @@ def _stl_to_solid(path, tol, fuse=True, curves=True, true_size=False, blends=Tru
             tidy = sf.Shape()
         except Exception:
             continue
-        if BRepCheck_Analyzer(tidy).IsValid() and abs(volume(tidy) - target) <= UNIFY_VOLUME * abs(target) + 1e-3:
-            shape = tidy
-            break
+        if abs(volume(tidy) - target) <= UNIFY_VOLUME * abs(target) + 1e-3:
+            if BRepCheck_Analyzer(tidy).IsValid():
+                shape = tidy
+                break
+            untidy = untidy or tidy
     if shape is None:
         shape = checked
     if not BRepCheck_Analyzer(shape).IsValid():
@@ -777,6 +951,15 @@ def _stl_to_solid(path, tol, fuse=True, curves=True, true_size=False, blends=Tru
             sf.Perform()
             if BRepCheck_Analyzer(sf.Shape()).IsValid():
                 shape = sf.Shape()
+            elif untidy is not None:
+                shape = untidy      # (no worse than the shape as checked, and tidier)
+    # (and the STEP file must read back as built: the tidied shape failing that, the
+    # shape as checked)
+    slack = FILE_VOLUME * abs(target) + 1e-3
+    trouble = file_trouble(shape, slack)
+    if trouble is not None and shape is not checked and file_trouble(checked, slack) is None:
+        shape, trouble = checked, None
+    info["file_ok"] = trouble is None
 
     info["bodies"], info["voids"] = nb, nv
     info["faces"] = count(shape, TopAbs_FACE)
@@ -878,6 +1061,7 @@ def main():
         print(f"  {info['triangles']} triangles -> {info['faces']} faces{extra}, "
               f"volume {info['volume']:,.1f} mm^3, "
               f"{'valid solid' if info['valid'] else 'WARNING: check geometry' + (' (the STL itself is not a clean solid: it touches or crosses itself)' if info.get('mesh_defects') else '')}, "
+              f"{'' if info.get('file_ok', True) else 'WARNING: the STEP file does not read back exactly as built, '}"
               f"{time.time() - t:.1f}s -> {out}")
         if info["repairs"]:
             print("  mended the mesh: " + "; ".join(info["repairs"]))

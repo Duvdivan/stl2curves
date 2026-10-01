@@ -20,6 +20,10 @@ pitch is the one that lines them up). Turned back along the helix into one plane
 through the axis, the corners of every turn then land on the same few points: the
 corners of the profile.
 
+Any smooth surface agrees with some screw motion over a small enough patch, so a
+thread must also wind most of the way round its axis (a finely meshed bend agrees with
+one over a narrow arc) and be no deeper than its lead.
+
 The thread is rebuilt one face per straight piece of its profile (each flank, the
 crest, the root): the piece swept along the helix, a ruled B-spline surface between
 two helices (exact for a straight piece), cut to the outline of its facets.
@@ -40,6 +44,7 @@ MIN_GATHER = 0.8       # share of a crest's or root's corners on a few helix lin
 ON_TOL = 0.01          # mm (plus the file's rounding): corners this near lie on the thread
 MIN_TURNS = 1.0        # the facets must wind round at least this far
 PROFILE_TOL = 0.004    # mm: profile simplified to straight pieces within this
+MIN_AROUND = 270       # deg: the facets must reach at least this far round the axis
 
 
 class Helical:
@@ -448,6 +453,10 @@ def _thread(mesh, pool, seed, c, a, pitch):
         near = (misfit_deg(X, N, c, a, pitch) < AGREE_DEG) & (_radius(X, c, a) <= reach)
         if near.sum() < MIN_FACETS:
             return None, agree
+        if _around(X[near], c, a) < MIN_AROUND:
+            # (a thread winds round its axis: a smooth bend's facets can agree with
+            # some screw motion, but only over a narrow arc of it)
+            return None, pool[near]
         if np.array_equal(pool[near], agree):
             break
         agree = pool[near]
@@ -481,6 +490,8 @@ def _thread(mesh, pool, seed, c, a, pitch):
         model, prof = _refine(model, prof, _corners(mesh, grown))
     if (np.diff(prof[:, 0]) <= 0).any():
         return None, agree              # the profile folded over itself: not a thread
+    if np.ptp(prof[:, 1]) > model.lead:
+        return None, agree              # deeper than its lead: no thread is
     prof = _simplify(prof, PROFILE_TOL)
     # a crest or root flat to within the file's rounding: exactly flat (only then: a
     # thread's own crest can slope or bow by a few microns, and flattening it would
@@ -496,13 +507,22 @@ def _thread(mesh, pool, seed, c, a, pitch):
     if len(facets) < MIN_FACETS:
         return None, agree
     Q = mesh.pts[np.unique(np.concatenate([mesh.fverts[f] for f in facets]))]
-    if np.ptp((Q - model.a) @ model.d) < MIN_TURNS * model.lead:
+    if np.ptp((Q - model.a) @ model.d) < MIN_TURNS * model.lead or _around(Q, model.d, model.a) < MIN_AROUND:
         return None, agree              # the facets must wind round the axis
     # which side is material: facets' normals point away from it
     X, N = mesh.fcent[facets], mesh.fn[facets]
     radial = X - model.a - np.outer((X - model.a) @ model.d, model.d)
     inside = (np.einsum("ij,ij->i", radial, N) * mesh.farea[facets]).sum() > 0
     return (Helical(model.a, model.d, model.pitch, prof, inside), facets), agree
+
+
+def _around(X, c, a):
+    """How far (degrees) the points reach round the axis through a along c: all the way
+    less the widest angle between them."""
+    _, e1, e2 = _frame(c)
+    v = X - a
+    u = np.sort(np.arctan2(v @ e2, v @ e1))
+    return 360.0 - math.degrees(np.diff(np.r_[u, u[0] + 2 * math.pi]).max())
 
 
 def _corners(mesh, facets):

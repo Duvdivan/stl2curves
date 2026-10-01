@@ -71,7 +71,10 @@ Local regression data on this machine (not in the repo):
    still unexplained). The pass order matters:
    - Pass 0: whole regions as one surface.
    - Screw threads (`threads.py`), before anything tries surfaces round known axes or
-     the loose pass (which would take thread pieces for cylinders and cones).
+     the loose pass (which would take thread pieces for cylinders and cones). A thread
+     must reach at least 270 deg round its axis and be no deeper than its lead: a finely
+     meshed smooth bend agrees with some screw motion over a narrow arc (a 58k-triangle
+     bracket gave three false threads and spent minutes on 130 candidates).
    - Pass 0b: surfaces on the axes found so far (a lug round its screw hole).
    - Fillets between flat faces (`fillets.py`, rolling ball): before pass 1, which
      would cut a coarsely meshed fillet into strips of its own. Forgiving (most band
@@ -99,7 +102,8 @@ Local regression data on this machine (not in the repo):
    sharing each boundary edge between the two faces beside it (`Edges` cache), then
    sews. `stl2curves._build`/`attempt` then checks the solid: valid, and volume equal to
    the faceted volume plus each feature's predicted `change` (within the summed
-   `tolerance`; OCC's volume, re-measured by `tessellated_volume` when it disagrees). Features that fail are dropped and left faceted (blends give back the
+   `tolerance`; OCC's volume, re-measured by `tessellated_volume` when it disagrees),
+   and its STEP file read back the same (`file_trouble`). Features that fail are dropped and left faceted (blends give back the
    pieces they replaced; failed exact patches are retried as blends; whole rings as two
    half rings; a halving search finds culprits, capped in time).
 
@@ -153,6 +157,13 @@ Key contracts:
   the chord, 0.05-0.09 mm apart on a rough mesh): several mm^3 off, the same wherever
   the part sits, while a watertight tessellation gives the predicted change. That is
   why `attempt` re-measures by tessellation before failing a volume check.
+- An in-memory solid that checks out can still write a broken STEP file (12 of 28
+  regression parts did, 2026-10-01): sewing and ShapeFix widen edge tolerances up to
+  ~0.3 mm, which hides edges crossing inside a face; STEP stores no tolerances and the
+  reader recomputes tight ones; and an edge shorter than the sewing tolerance gets both
+  ends merged, which a reader takes for a whole circle. Hence `file_trouble` in
+  `attempt` (write, read back, compare) and `build._without_collapsed` after sewing.
+  Check outputs with a read-back, not only `BRepCheck_Analyzer` on the shape in memory.
 - OCP 8 quirks: `TopoDS.Shell/Face` (no `_s`), `OCP.collections` for arrays and
   sequences, `Bnd_Box.Get()` is broken, `Quantity_Color` returns linear RGB,
   `BRepCheck_Result.Status()` can't be read (use `BRepCheck_Analyzer.IsValid(sub)`).

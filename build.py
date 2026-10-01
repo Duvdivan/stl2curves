@@ -29,6 +29,7 @@ from OCP.GeomAPI import GeomAPI_Interpolate
 from OCP.collections import HArray1_gp_Pnt
 from OCP.collections import List_TopoDS_Shape
 from OCP.GC import GC_MakeArcOfCircle
+from OCP.GCPnts import GCPnts_AbscissaPoint
 from OCP.BRepMesh import BRepMesh_IncrementalMesh
 from OCP.TopLoc import TopLoc_Location
 from OCP.GeomAPI import GeomAPI_ProjectPointOnSurf
@@ -37,9 +38,10 @@ from OCP.BRepFill import BRepFill_Filling
 from OCP.GeomAbs import GeomAbs_C0
 from OCP.ShapeFix import ShapeFix_Face, ShapeFix_Shape
 from OCP.TopAbs import TopAbs_EDGE, TopAbs_FACE, TopAbs_SHELL, TopAbs_REVERSED
-from OCP.TopExp import TopExp_Explorer
+from OCP.TopExp import TopExp, TopExp_Explorer
 from OCP.TopoDS import TopoDS, TopoDS_Compound, TopoDS_Iterator, TopoDS_Shape
-from OCP.BRepTools import BRepTools
+from OCP.BRepTools import BRepTools, BRepTools_ReShape
+from OCP.collections import IndexedMap_TopoDS_Shape_TopTools_ShapeMapHasher
 from OCP.gp import gp_Ax1, gp_Ax2, gp_Ax3, gp_Circ, gp_Dir, gp_Pln, gp_Pnt
 from OCP.Geom import Geom_ToroidalSurface
 
@@ -1445,15 +1447,38 @@ def sew(shape, tol, shells=()):
         c = BRepAdaptor_Curve(s.FreeEdge(i))
         p = c.Value((c.FirstParameter() + c.LastParameter()) / 2)
         free.append((p.X(), p.Y(), p.Z()))
+    sewn = _without_collapsed(s.SewedShape(), tol)
     if not shells:
-        return s.SewedShape(), free
+        return sewn, free
     comp = TopoDS_Compound()
     builder = BRep_Builder()
     builder.MakeCompound(comp)
-    builder.Add(comp, s.SewedShape())
+    builder.Add(comp, sewn)
     for shell in shells:
         builder.Add(comp, shell)
     return comp, free
+
+
+def _without_collapsed(shape, tol):
+    """The sewn shape less the edges sewing closed up: a sliver triangle's side, shorter
+    than the sewing tolerance, whose two ends were merged into one vertex. Left in, the
+    face beside it pinches into a loop that ShapeFix splits off as a face of its own, and
+    a STEP reader takes such an edge for the whole circle (or curve) it lies on."""
+    edges = IndexedMap_TopoDS_Shape_TopTools_ShapeMapHasher()
+    TopExp.MapShapes_s(shape, TopAbs_EDGE, edges)
+    reshape = None
+    for i in range(1, edges.Extent() + 1):
+        e = TopoDS.Edge(edges.FindKey(i))
+        if BRep_Tool.Degenerated_s(e) or not TopExp.FirstVertex_s(e).IsSame(TopExp.LastVertex_s(e)):
+            continue
+        c = BRepAdaptor_Curve(e)
+        a, b = c.Value(c.FirstParameter()), c.Value(c.LastParameter())
+        # (a whole circle or closed outline is closed in itself: its ends coincide)
+        if a.Distance(b) > 1e-6 and GCPnts_AbscissaPoint.Length_s(c) <= 2 * tol:
+            if reshape is None:
+                reshape = BRepTools_ReShape()
+            reshape.Remove(e)
+    return shape if reshape is None else reshape.Apply(shape)
 
 
 def point_facet_distance(mesh, facets, points):

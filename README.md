@@ -142,6 +142,15 @@ Without it the size is left alone (a slight scale is often deliberate, for fit).
    A final tidy-up is kept only if the solid is still valid. If the STL itself is not a
    clean solid (it touches or crosses itself), the result is checked against what its
    bare facets give and flagged with a warning.
+   Finally the solid must survive its own STEP file: it is written out and read back,
+   and must come back valid with the same faces and volume. A STEP file keeps no
+   tolerances, so a reader works them out again from the geometry, tightly; a face that
+   only checked out within the generous tolerance sewing gave its edges (two edges
+   crossing inside it, or a sliver's edge shorter than that tolerance closed up into a
+   loop) would come back broken. The patches at the outline that changed are dropped
+   like any other troublemaker, for a few rounds at most; whatever they don't cure is
+   reported as a warning. (Edges that sewing closes up are also removed straight after
+   sewing.)
 
 Limits: large freeform areas (organic shells, variable-radius rounds over big areas)
 mostly stay faceted: the smooth patch fitter manages small blends and corners, but not
