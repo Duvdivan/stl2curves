@@ -95,7 +95,10 @@ Without it the size is left alone (a slight scale is often deliberate, for fit).
 2. **Detection** (`features.py`) — first, each smooth area bounded by sharp edges is
    tried as a whole (a countersink, a plain hole): one cylinder, cone or sphere fitted
    through all its corners at once, allowing a few outline corners that a neighbouring
-   face's triangulation put slightly off the curve. Then neighbouring facets propose a
+   face's triangulation put slightly off the curve. A mesh exported coarsely keeps its
+   cylinders only to a hundredth of a millimetre or so; a whole area that turns far
+   enough and has every corner within 0.02 mm of one cylinder or cone (nearly all within
+   0.01) is taken as that surface rather than cut into strips of wrong radii. Then neighbouring facets propose a
    surface (cylinder, cone, sphere; tori on axes already found), which is grown while
    mesh corners stay within a micron of it. Fillets between flat faces are looked for
    early (`fillets.py`: two faces meeting at an angle, rounded off, give a cylinder
@@ -143,7 +146,7 @@ Without it the size is left alone (a slight scale is often deliberate, for fit).
    clean solid (it touches or crosses itself), the result is checked against what its
    bare facets give and flagged with a warning.
    Finally the solid must survive its own STEP file: it is written out and read back,
-   and must come back valid with the same faces and volume. A STEP file keeps no
+   and must come back valid with the same volume. A STEP file keeps no
    tolerances, so a reader works them out again from the geometry, tightly; a face that
    only checked out within the generous tolerance sewing gave its edges (two edges
    crossing inside it, or a sliver's edge shorter than that tolerance closed up into a

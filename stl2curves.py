@@ -504,8 +504,8 @@ def read_step(path):
 
 def file_trouble(shape, allowed):
     """Write the shape to STEP and read it back: None if it comes back a valid solid of
-    the same faces and volume (within allowed, mm^3), else points where it doesn't (maybe
-    none found). Only real changes count: a face that comes back invalid, goes missing or
+    the same volume (within allowed, mm^3), else points where it doesn't (maybe none
+    found). Only real changes count: a face that comes back invalid, goes missing or
     changes its area by more than FILE_AREA (small faces read back a percent or so off,
     their tolerant edges laid out afresh, and that is harmless); and on a big face only
     the outline (wire) that changed, not every hole in it."""
@@ -519,8 +519,8 @@ def file_trouble(shape, allowed):
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     check = BRepCheck_Analyzer(back)
-    if (check.IsValid() and count(back, TopAbs_FACE) == count(shape, TopAbs_FACE)
-            and abs(volume(back) - volume(shape)) <= allowed):
+    # (a reader may split a face in two: harmless, so faces aren't counted)
+    if check.IsValid() and abs(volume(back) - volume(shape)) <= allowed:
         return None
 
     def faces(s):

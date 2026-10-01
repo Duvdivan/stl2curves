@@ -47,6 +47,13 @@ MIN_CORNERS = {"cylinder": 8, "cone": 10, "sphere": 8, "torus": 12}
 # a "trimmed" patch. Without the outline check to lean on, it needs more evidence:
 WHOLE_ON_SURFACE = 0.6     # a region fitted whole: this share of its corners on the surface
 WHOLE_STRAY = 0.02          # mm: how far the rest (outline corners on a seam) may stray
+# A region taken whole although its corners stray from the surface (a mesh exported
+# coarsely, or rounded off, keeps its cylinders only to a hundredth of a millimetre or
+# so; cut into strips instead, every strip fits a cylinder of its own, wrong radius):
+NOISY_MAX = 0.02            # mm: every corner this close to the surface ...
+NOISY_TYPICAL = 0.01        # ... nearly all of them (95%) this close ...
+NOISY_TURN_DEG = 60         # ... the region turning at least this far (a gently curved patch fits anything)
+NOISY_MIN_FACETS = 12       # ... with at least this many facets
 TRIMMED_MIN_CORNERS = 12
 TRIMMED_MIN_FACETS = 6
 TRIMMED_MIN_TURN_DEG = 15   # the facets must face in directions at least this far apart
@@ -768,7 +775,36 @@ def _whole_region(mesh, region):
     ball = _sphere(P)
     if _fits(ball, P):
         found.append(_candidate(mesh, region, ball, [0]))
+    if not any(found):
+        # (only cylinders and cones: their straight lines pin them down where a mesh
+        # has strayed; a sphere would fit any gently rounded patch as well)
+        found = [_whole_noisy(mesh, region, _tube_fit(P, m)) for m in guesses if m is not None]
     return _best(found)
+
+
+def _whole_noisy(mesh, region, model):
+    """The whole region on this surface although its corners stray from it, by up to
+    NOISY_MAX: a big region, curving far, every facet facing the surface's way."""
+    if model is None or len(region.facets) < NOISY_MIN_FACETS:
+        return None
+    N = region.n
+    mean = N.mean(axis=0)
+    if np.linalg.norm(mean) > 0.5:
+        turn = 2 * math.degrees(math.acos(max(-1.0, min(1.0, float((N @ (mean / np.linalg.norm(mean))).min())))))
+        if turn < NOISY_TURN_DEG:
+            return None
+    off = np.abs(model.signed(region.P))
+    if off.max() > NOISY_MAX or np.percentile(off, 95) > NOISY_TYPICAL:
+        return None
+    idx = np.arange(len(region.facets))
+    ok, out, surface_n = region._test(model, idx)
+    facing = np.abs(np.einsum("ij,ij->i", region.n, surface_n))
+    if (out != out[0]).any() or (facing < math.cos(math.radians(NORMAL_DEG))).any():
+        return None
+    feature = _feature(mesh, model, region.facets, bool(out[0]))
+    if feature is None:
+        return None
+    return feature, idx, float(mesh.farea[region.facets].sum())
 
 
 def _whole_despite_seams(mesh, region, model):

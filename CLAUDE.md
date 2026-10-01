@@ -69,7 +69,9 @@ Local regression data on this machine (not in the repo):
 3. **`features.py` `analyze()`** groups triangles into flat facets (`Mesh`), then finds
    patches in passes over the smooth regions (`Region`, whose `free` flags track what is
    still unexplained). The pass order matters:
-   - Pass 0: whole regions as one surface.
+   - Pass 0: whole regions as one surface (strictly; failing that, a cylinder or cone
+     with every corner within 0.02 mm, `_whole_noisy`, for coarse exports: cut into
+     strips instead, each strip fits a cylinder of its own, wrong radius).
    - Screw threads (`threads.py`), before anything tries surfaces round known axes or
      the loose pass (which would take thread pieces for cylinders and cones). A thread
      must reach at least 270 deg round its axis and be no deeper than its lead: a finely
