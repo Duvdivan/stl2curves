@@ -58,7 +58,10 @@ thinned by 0.005 mm automatically), `--time-limit SECONDS` (default 600, 0 for n
 
 From a 3MF file (Bambu Studio, OrcaSlicer, PrusaSlicer...) every object on the build
 plates is converted to its own STEP, named after the file and the object, placed as on
-the plate. Modifier volumes, negative volumes and support blockers are left out.
+the plate. Modifier volumes, negative volumes and support blockers are left out. An
+object made of several parts (a multi-colour print, say) has each part mended and
+rebuilt on its own, and the parts joined into one solid at the end (they may touch or
+overlap: merged into one mesh first, they would make a mesh that crosses itself).
 
 ### Time
 

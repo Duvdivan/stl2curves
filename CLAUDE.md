@@ -65,7 +65,10 @@ Local regression data on this machine (not in the repo):
    orientation, holes, small self-crossings). **`simplify.py`** thins meshes over
    150k triangles with a strict error bound (vertices never move off the surface).
 2. **`bodies.py`** splits bodies that only touch along an edge; each is built on its own
-   and fused at the end.
+   and fused at the end. A 3MF object's parts (`read3mf` labels each triangle) are
+   likewise repaired and built one by one and fused (`_repair_parts`): Bambu
+   multi-colour objects have parts pressed into pockets of others, and repairing the
+   merged mesh cut away their shared walls and left it crossing itself.
 3. **`features.py` `analyze()`** groups triangles into flat facets (`Mesh`), then finds
    patches in passes over the smooth regions (`Region`, whose `free` flags track what is
    still unexplained). The pass order matters:

@@ -869,20 +869,40 @@ def _stl_to_solid(path, tol, fuse=True, curves=True, true_size=False, blends=Tru
                   simplify_to=None):
     """simplify_to: how far (mm) thinning out an over-dense mesh may move its surface;
     None: only above AUTO_SIMPLIFY triangles, at SIMPLIFY_ERROR; 0: never."""
-    pts, tris = load_stl(path) if isinstance(path, (str, os.PathLike)) else path
+    # (a mesh file, or (points, triangles) or (points, triangles, part of each triangle):
+    # a 3MF object's parts can overlap, and are each mended and built on their own, then
+    # joined by a boolean union)
+    part = None
+    if isinstance(path, (str, os.PathLike)):
+        pts, tris = load_stl(path)
+    else:
+        pts, tris = path[0], path[1]
+        if len(path) > 2 and len(np.unique(path[2])) > 1:
+            part = np.asarray(path[2])
     if len(tris) >= WORKERS_FROM:
         workers.start()     # (worker processes, started while the mesh is repaired)
     info = {"triangles": len(tris), "restored": [], "skipped": [], "size": None, "snapped": 0,
             "repairs": [], "simplified": None}
     if mend:
-        pts, tris, info["repairs"] = repair(pts, tris)
+        if part is None:
+            pts, tris, info["repairs"] = repair(pts, tris)
+        else:
+            pts, tris, part, info["repairs"] = _repair_parts(pts, tris, part)
     if simplify_to is None:
         simplify_to = SIMPLIFY_ERROR if len(tris) > AUTO_SIMPLIFY else 0
     if simplify_to:
         before = len(tris)
-        tris = simplify(pts, tris, simplify_to)
+        if part is None:
+            tris = simplify(pts, tris, simplify_to)
+        else:
+            labels = np.unique(part)
+            pieces = [simplify(pts, tris[part == p], simplify_to) for p in labels]
+            part = np.concatenate([np.full(len(t), p) for p, t in zip(labels, pieces)])
+            tris = np.vstack(pieces)
         info["simplified"] = (before, len(tris), simplify_to)
-    groups = split_bodies(pts, tris)          # bodies touching at an edge are built apart
+    # bodies touching at an edge are built apart (and so are a 3MF object's parts)
+    groups = (split_bodies(pts, tris) if part is None
+              else [g for p in np.unique(part) for g in split_bodies(pts, tris[part == p])])
     if curves:
         parts = [analyze(pts, g) for g in groups]
         info["size"] = guess = guess_size([p[:2] for p in parts])
@@ -912,7 +932,10 @@ def _stl_to_solid(path, tol, fuse=True, curves=True, true_size=False, blends=Tru
         if fuse:
             apart = sum(volume(s) for s in shapes)
             slack = UNIFY_VOLUME * abs(apart) + 1e-3
-            fused = fuse_checked(shapes[:1], shapes[1:], apart - slack, apart + slack)
+            # (a 3MF object's parts may overlap: then the union is less than their sum,
+            # but no less than the biggest)
+            low = apart if part is None else max(volume(s) for s in shapes)
+            fused = fuse_checked(shapes[:1], shapes[1:], low - slack, apart + slack)
             if fused is not None:
                 shape = fused
         nb = count(shape, TopAbs_SOLID)
@@ -968,6 +991,30 @@ def _stl_to_solid(path, tol, fuse=True, curves=True, true_size=False, blends=Tru
     info["volume"] = volume(shape)
     info["valid"] = BRepCheck_Analyzer(shape).IsValid()
     return shape, info
+
+
+def _repair_parts(pts, tris, part):
+    """repair() on each part of a 3MF object on its own (two parts pressed together are
+    no wall of zero thickness to cut out, nor overlapping ones a mesh crossing itself):
+    (points, triangles, part of each triangle, what was done)."""
+    P, T, L, done = [], [], [], {}
+    base = 0
+    for p in np.unique(part):
+        used, inv = np.unique(tris[part == p], return_inverse=True)
+        q, t, notes = repair(pts[used], inv.reshape(-1, 3))
+        P.append(q)
+        T.append(t + base)
+        L.append(np.full(len(t), p))
+        base += len(q)
+        for note in notes:
+            # (the same repair in two parts is reported once, with the counts added up)
+            head, _, rest = note.partition(" ")
+            if head.isdigit():
+                done[rest] = done.get(rest, 0) + int(head)
+            else:
+                done[note] = None
+    notes = [note if n is None else f"{n} {note}" for note, n in done.items()]
+    return np.vstack(P), np.vstack(T), np.concatenate(L), notes
 
 
 def write_step(shape, path):
@@ -1040,7 +1087,8 @@ def main():
             objects = read_3mf(f)
             if not objects:
                 print(f"{f.name}: no objects to convert", flush=True)
-            jobs += [(f"{f.name}: {name}", (pts, tris), f, f"{f.stem} - {name}") for name, pts, tris in objects]
+            jobs += [(f"{f.name}: {name}", (pts, tris, part), f, f"{f.stem} - {name}")
+                     for name, pts, tris, part in objects]
         else:
             jobs.append((f.name, f, f, f.stem))
 

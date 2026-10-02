@@ -7,7 +7,9 @@ own transform, possibly kept in other files of the zip, as Bambu Studio and Orca
 do). Every printed object comes out as one mesh, in millimetres, laid out as on the
 plate. Bambu Studio also marks the parts of an object as modifiers, negative volumes or
 support blockers/enforcers (Metadata/model_settings.config); only the real parts
-(normal_part) count, the others aren't material.
+(normal_part) count, the others aren't material. Each triangle is labelled with the
+part (mesh) it came from: parts may overlap, and are then joined by a boolean union,
+not by mending one mesh that crosses itself.
 """
 import re
 import zipfile
@@ -29,7 +31,8 @@ def _matrix(text):
 
 
 def read_3mf(path):
-    """[(name, points (n, 3), triangles (m, 3))]: every object the file's build prints."""
+    """[(name, points (n, 3), triangles (m, 3), part of each triangle (m,))]: every object
+    the file's build prints."""
     z = zipfile.ZipFile(path)
     names = set(z.namelist())
     root = "3D/3dmodel.model"
@@ -56,7 +59,7 @@ def read_3mf(path):
             for part in obj.iter("part"):
                 kinds[(obj.get("id"), part.get("id"))] = part.get("subtype", "normal_part")
 
-    def collect(part, oid, M, top, P, T):
+    def collect(part, oid, M, top, P, T, L):
         scale, objects, _ = model(part)
         obj = objects.get(oid)
         if obj is None or obj.get("type", "model") != "model":
@@ -68,18 +71,19 @@ def read_3mf(path):
             if len(V) and len(F):
                 T.append(F + sum(len(p) for p in P))
                 P.append((np.c_[V, np.ones(len(V))] @ M)[:, :3])
+                L.append(np.full(len(F), len(L)))
         comps = obj.find(CORE + "components")
         for c in comps if comps is not None else []:
             if kinds.get((top, c.get("objectid")), "normal_part") != "normal_part":
                 continue                    # a modifier, negative volume or support helper
             sub = (c.get(PRODUCTION + "path") or part).lstrip("/")
-            collect(sub, c.get("objectid"), _matrix(c.get("transform")) @ M, top, P, T)
+            collect(sub, c.get("objectid"), _matrix(c.get("transform")) @ M, top, P, T, L)
 
     out, seen = [], {}
     for item in model(root)[2].iter(CORE + "item"):
         oid = item.get("objectid")
-        P, T = [], []
-        collect(root, oid, _matrix(item.get("transform")), oid, P, T)
+        P, T, L = [], [], []
+        collect(root, oid, _matrix(item.get("transform")), oid, P, T, L)
         if not T:
             continue
         name = titles.get(oid) or model(root)[1][oid].get("name") or f"object {oid}"
@@ -87,16 +91,16 @@ def read_3mf(path):
         seen[name] = seen.get(name, 0) + 1
         if seen[name] > 1:
             name = f"{name} ({seen[name]})"
-        out.append((name,) + _weld(np.vstack(P), np.vstack(T)))
+        out.append((name,) + _weld(np.vstack(P), np.vstack(T), np.concatenate(L)))
     return out
 
 
-def _weld(verts, tris):
+def _weld(verts, tris, labels):
     """Merge corners that coincide (as load_stl does for an STL's loose triangles)."""
     key = np.round(verts * 1e4).astype(np.int64)
     uniq, inv = np.unique(key, axis=0, return_inverse=True)
     pts = np.zeros((len(uniq), 3))
     pts[inv.ravel()] = verts
     tris = inv.ravel()[tris]
-    tris = tris[(tris[:, 0] != tris[:, 1]) & (tris[:, 1] != tris[:, 2]) & (tris[:, 2] != tris[:, 0])]
-    return pts, tris
+    keep = (tris[:, 0] != tris[:, 1]) & (tris[:, 1] != tris[:, 2]) & (tris[:, 2] != tris[:, 0])
+    return pts, tris[keep], labels[keep]
