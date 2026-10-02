@@ -880,7 +880,7 @@ def _stl_to_solid(path, tol, fuse=True, curves=True, true_size=False, blends=Tru
         if len(path) > 2 and len(np.unique(path[2])) > 1:
             part = np.asarray(path[2])
     if len(tris) >= WORKERS_FROM:
-        workers.start()     # (worker processes, started while the mesh is repaired)
+        workers.start(len(tris))    # (worker processes, started while the mesh is repaired)
     info = {"triangles": len(tris), "restored": [], "skipped": [], "size": None, "snapped": 0,
             "repairs": [], "simplified": None}
     if mend:
@@ -1096,9 +1096,14 @@ def main():
     for label, source, f, stem in jobs:
         t = time.time()
         print(f"{label}: converting...", flush=True)
-        shape, info = stl_to_solid(source, args.tol, not args.no_fuse, not args.no_curves, args.true_size,
-                                   not args.no_blends, not args.no_repair, args.simplify,
-                                   time_limit=args.time_limit or None)
+        try:
+            shape, info = stl_to_solid(source, args.tol, not args.no_fuse, not args.no_curves, args.true_size,
+                                       not args.no_blends, not args.no_repair, args.simplify,
+                                       time_limit=args.time_limit or None)
+        except Exception as e:
+            # (one part that can't be converted shouldn't stop the rest of the batch)
+            print(f"  FAILED: {e} ({time.time() - t:.1f}s); no STEP written", flush=True)
+            continue
         out_dir = Path(args.out) if args.out else f.parent
         out_dir.mkdir(parents=True, exist_ok=True)
         out = out_dir / (stem + ".step")

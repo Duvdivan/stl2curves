@@ -67,9 +67,15 @@ def repair(pts, tris):
         cut = _self_crossing_specks(pts, tris, SPECK * size)
         if cut is None:
             break
-        tris = tris[~cut]
+        holes = len(_open_edges(tris))
+        patched_pts, patched, filled = _fill_holes(pts, tris[~cut])
+        if len(_open_edges(patched)) > holes:
+            # (the hole it leaves didn't patch: on a fine mesh a knot a few millimetres
+            # across is thousands of triangles. Better a mesh crossing itself there,
+            # which still converts, than one with a hole, which makes no solid at all)
+            break
+        pts, tris = patched_pts, patched
         specks += 1
-        pts, tris, filled = _fill_holes(pts, tris)
     if specks:
         notes.append(f"{specks} self-crossing speck{'s' if specks > 1 else ''} cut out and patched")
 

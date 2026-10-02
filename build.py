@@ -491,7 +491,8 @@ def _revolved_face(bound, lo, hi, u0, span, exact=True):
     else:
         edge = _arc(bound.profile_point(lo, u0), bound.profile_point((lo + hi) / 2, u0),
                     bound.profile_point(hi, u0))
-    return BRepPrimAPI_MakeRevol(edge, gp_Ax1(_pnt(m.a), gp_Dir(*m.d)), span).Shape()
+    revol = BRepPrimAPI_MakeRevol(edge, gp_Ax1(_pnt(m.a), gp_Dir(*m.d)), span)
+    return revol.Shape() if revol.IsDone() else None
 
 
 def _profile_circle(bound, u):
@@ -1399,14 +1400,20 @@ def build_faces(mesh, features, tol):
         key = ("patch", id(f), who(f._across))
         if key in cache:
             faces = cache[key]
-        elif f.model.kind == "thread":
-            faces = [_thread_face(f, k, mesh, owner, bounds, edge_tri)]
-        elif f.kind == "trimmed":
-            faces = [_trimmed_face(f, k, bound, mesh, owner, bounds, edge_tri, edges, tol)]
-        elif f.kind == "blend":
-            faces = [_blend_face(f, k, mesh, owner, bounds, edge_tri, edges)]
         else:
-            faces = _patch_faces(f, bound, mesh)
+            try:
+                if f.model.kind == "thread":
+                    faces = [_thread_face(f, k, mesh, owner, bounds, edge_tri)]
+                elif f.kind == "trimmed":
+                    faces = [_trimmed_face(f, k, bound, mesh, owner, bounds, edge_tri, edges, tol)]
+                elif f.kind == "blend":
+                    faces = [_blend_face(f, k, mesh, owner, bounds, edge_tri, edges)]
+                else:
+                    faces = _patch_faces(f, bound, mesh)
+            except Exception:
+                # (OpenCascade gave up on one patch, a sweep of a degenerate profile say:
+                # that patch fails like any other, not the whole conversion)
+                faces = [None]
         cache[key] = faces
         if any(x is None for x in faces):
             failed.append(k)

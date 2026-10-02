@@ -19,7 +19,13 @@ import threading
 # workers still waiting for jobs never do)
 from concurrent.futures import ProcessPoolExecutor
 
-WORKERS = max(1, min(16, (os.cpu_count() or 2) - 2))     # processes working at once
+WORKERS = max(1, min(16, (os.cpu_count() or 2) - 2))     # processes working at once, at most
+# Each worker holds its own copy of the mesh and what is worked out from it; on a big
+# mesh that is over a gigabyte apiece. They are only as many as the free memory takes:
+WORKER_MB = 150             # MB a worker takes besides the mesh
+WORKER_KB = 1.5             # KB a worker takes per triangle of the part
+MAIN_KB = 4.0               # KB this process takes per triangle
+MEMORY_SHARE = 0.75         # share of the free memory the conversion may take
 
 _pool = None                        # the pool, once its workers are all up
 _launching = None                   # the pool while its workers are being launched
@@ -31,25 +37,55 @@ _loaded = {}                        # (in a worker) key -> object, the few read 
 memo = {}                           # (in a worker) anything worth keeping between jobs
 
 
-def start():
-    """Start the worker processes in the background (no-op if running or not wanted).
-    They are kept for further parts and stopped when the program ends."""
+def start(triangles=0):
+    """Start the worker processes in the background (no-op if running or not wanted),
+    as many as fit in the free memory for a part of this many triangles. They are kept
+    for further parts and stopped when the program ends."""
     global _starting, _cancel
-    if WORKERS > 1 and _pool is None and _starting is None:
+    n = _workers_for(triangles)
+    if n > 1 and _pool is None and _starting is None:
         _cancel = False
-        _starting = threading.Thread(target=_start, daemon=True)
+        _starting = threading.Thread(target=_start, args=(n,), daemon=True)
         _starting.start()
 
 
-def _start():
+def _workers_for(triangles):
+    free = _free_memory()
+    if free is None:
+        return WORKERS
+    each = WORKER_MB * 2**20 + WORKER_KB * 2**10 * triangles
+    return max(1, min(WORKERS, int((MEMORY_SHARE * free - MAIN_KB * 2**10 * triangles) // each)))
+
+
+def _free_memory():
+    """Bytes of physical memory free now, or None if that can't be found out."""
+    try:
+        if os.name == "nt":
+            import ctypes
+
+            class Status(ctypes.Structure):
+                _fields_ = [("length", ctypes.c_ulong), ("load", ctypes.c_ulong)] + [
+                    (name, ctypes.c_ulonglong) for name in ("total", "free", "total_page", "free_page",
+                                                             "total_virtual", "free_virtual", "free_extended")]
+            status = Status()
+            status.length = ctypes.sizeof(Status)
+            if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+                return None
+            return status.free
+        return os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+    except (AttributeError, OSError, ValueError):
+        return None
+
+
+def _start(n):
     global _pool, _launching
     try:
-        pool = _launching = ProcessPoolExecutor(WORKERS)
+        pool = _launching = ProcessPoolExecutor(n)
         # (on Windows a worker is only launched when a job finds none idle, one at a
         # time, in the middle of sending work out: launch them all now, one by one,
         # minding stop() meanwhile)
         try:
-            while len(pool._processes) < WORKERS and not _cancel:
+            while len(pool._processes) < n and not _cancel:
                 pool._spawn_process()
         except Exception:
             pass

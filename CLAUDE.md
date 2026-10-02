@@ -113,8 +113,10 @@ Local regression data on this machine (not in the repo):
    half rings; a halving search finds culprits, capped in time).
 
 Speed (`workers.py`): OpenCascade and small-array numpy hold the GIL, so parallel work
-runs in a shared process pool (up to 16 workers), started in the background once a mesh
-has 3,000+ triangles and kept for further parts of the same run. Shapes cross processes
+runs in a shared process pool (up to 16 workers, fewer if free memory is short: each
+holds its own copy of the mesh, ~1.5 KB a triangle, over a gigabyte on a 900k-triangle
+mesh), started in the background once a mesh has 3,000+ triangles and kept for further
+parts of the same run. Shapes cross processes
 as BRep files, the mesh once per pass via `workers.share`/`load`. What runs there:
 
 - The seed passes (pass 1, loose pass, axis passes: `features._seed_pass`), per region,
@@ -180,6 +182,9 @@ Key contracts:
 - Profiling: cProfile inflates small functions; py-spy on Windows hangs or samples the
   launcher. A sampling thread over `sys._current_frames()`, weighted by elapsed time
   (long OCC calls hold the GIL), works well.
+- `repair` cuts out small self-crossing knots and patches the hole; on a fine mesh the
+  "knot" can be thousands of triangles whose hole doesn't patch, which left a watertight
+  900k-triangle mesh open and unbuildable. A cut is kept only if its patch closes.
 - Big multi-body meshes sew into hundreds of zero-volume shells (coincident face pairs);
   `solids_from_shells` drops them (`EMPTY_SHELL`), or body counts and fuses go wrong.
 
