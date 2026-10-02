@@ -102,7 +102,21 @@ Local regression data on this machine (not in the repo):
 4. **`sizing.py`** guesses the design size (one scale factor making radii round);
    `features.snap()` equalises radii and snaps near-axis-aligned axes.
 5. **`blends.py`** groups leftover curved facets (and "scrap" pieces that only stand in
-   for a surface) into smooth freeform blend regions.
+   for a surface) into smooth areas. A big area (over `MAX_FACETS` facets or 5 mm
+   across) is first tried as one **`freeform.py`** surface: a P-spline height field
+   over a plane or a cylinder, fitted to every corner within `FIT_DEV` (0.002 mm), knots
+   refined only as needed (at most one control point per corner, spans per direction
+   by corner density), bulge-checked between corners like blends. An area that doesn't
+   fit is halved by facet direction (`_freeform_pieces`); narrow exact strips between
+   freeform pieces are absorbed when one surface fits all (`_absorb_strips`: Fusion's
+   curvature-continuous fillets are splines whose middle fits a cylinder over a narrow
+   band); loose facets already on a piece's surface are taken in (`_grown`: fringes
+   left by halving have edges shorter than any sewing tolerance). Freeform patches are
+   `kind="trimmed"` with a `Freeform` model (`signed`, `normal` like any surface); a
+   big one blamed for trouble loses only its facets near it (`blends.carve`, trouble
+   points kept on `mesh.trouble` by `culprits`), one that fails to build falls back to
+   the 60-facet blends of its area (`blends.fallback`). Whatever no freeform takes
+   becomes N-sided blends.
 6. **`build.py`** makes one face per feature plus a planar face per remaining flat facet,
    sharing each boundary edge between the two faces beside it (`Edges` cache), then
    sews. `stl2curves._build`/`attempt` then checks the solid: valid, and volume equal to
@@ -110,7 +124,20 @@ Local regression data on this machine (not in the repo):
    `tolerance`; OCC's volume, re-measured by `tessellated_volume` when it disagrees),
    and its STEP file read back the same (`file_trouble`). Features that fail are dropped and left faceted (blends give back the
    pieces they replaced; failed exact patches are retried as blends; whole rings as two
-   half rings; a halving search finds culprits, capped in time).
+   half rings; a halving search finds culprits, capped in time). After
+   `TROUBLE_SECONDS` per body the drop loop "hurries": `culprits` blames every patch
+   within 0.5 mm of trouble, four times further each round (a 920k-triangle mesh spent
+   95 min dropping a few patches per 3-minute sew). Blame ties (trouble on an edge
+   between patches) go to the smallest patch. On a part of 20,000+ faces the final
+   tidy-up runs in a worker, given up after `TIDY_SECONDS` (UnifySameDomain on 218k
+   faces ran over 20 min); smaller parts are tidied in place, because a shape read back
+   from a BRep file in a worker no longer merged at all (Rak N 1780 faces, not 1279).
+   A merged face that comes out invalid has its pieces kept apart in a retry
+   (`_bad_merges`, `KeepShape` on the edges between them; KeepShape takes edges or
+   vertices, not faces), so one bad merge no longer throws away hundreds of good ones.
+   A flat facet whose outline touches itself (holes meeting its edge at a corner) is
+   built as a few faces over unpinched groups of its triangles (`build._unpinched`), not
+   as hundreds of triangles left for the tidy-up to merge.
 
 Speed (`workers.py`): OpenCascade and small-array numpy hold the GIL, so parallel work
 runs in a shared process pool (up to 16 workers, fewer if free memory is short: each
@@ -185,6 +212,15 @@ Key contracts:
 - `repair` cuts out small self-crossing knots and patches the hole; on a fine mesh the
   "knot" can be thousands of triangles whose hole doesn't patch, which left a watertight
   900k-triangle mesh open and unbuildable. A cut is kept only if its patch closes.
+- Splines through a run of mesh corners swing far out where the corners are unevenly
+  spaced (dense round a bend, one 20 mm step on the straight: 0.57 mm off), and no
+  surface then contains the edge; `build._even` adds points along long steps.
+- OCC's BRepMesh tessellates a big B-spline face coarsely whatever deflection is asked
+  (0.07 mm off a 64x13-span surface at 0.002), so `deviation.py` reports such faces
+  worse than they are; measure against the surface itself (GeomAPI_ProjectPointOnSurf).
+- A smooth area that fits only with a dense knot grid has a crease or a tight round
+  inside it: capping control points by corner count (and splitting) beat refining
+  (131x131 control points made the splitter take minutes per face).
 - Big multi-body meshes sew into hundreds of zero-volume shells (coincident face pairs);
   `solids_from_shells` drops them (`EMPTY_SHELL`), or body counts and fuses go wrong.
 

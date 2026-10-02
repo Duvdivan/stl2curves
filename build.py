@@ -246,6 +246,7 @@ class Edges:
         pts = pts[keep]
         if len(pts) == 2 and not closed:
             return _line(pts[0], pts[1])
+        pts = _even(pts, closed)
         arr = HArray1_gp_Pnt(1, len(pts))
         for i, p in enumerate(pts):
             arr.SetValue(i + 1, _pnt(p))
@@ -254,6 +255,28 @@ class Edges:
         if not interp.IsDone():
             return None
         return BRepBuilderAPI_MakeEdge(interp.Curve()).Edge()
+
+
+LONG_STEP = 3.0     # a step this many times the run's typical one gets points along it
+
+
+def _even(pts, closed):
+    """The run's points with points added along its long steps. A tessellator puts few
+    points on a straight stretch and many round a bend; a spline through such a run
+    swings far out between the sparse ones (half a millimetre off a bend's straight
+    run-out), and no surface it should lie on contains it."""
+    ring = np.vstack([pts, pts[:1]]) if closed else pts
+    step = np.linalg.norm(np.diff(ring, axis=0), axis=1)
+    typical = float(np.median(step))
+    if step.max() <= LONG_STEP * typical:
+        return pts
+    out = []
+    for a, b, d in zip(ring[:-1], ring[1:], step):
+        n = int(min(16, math.ceil(d / typical))) if d > LONG_STEP * typical else 1
+        out += [a + (b - a) * t for t in np.arange(n) / n]
+    if not closed:
+        out.append(ring[-1])
+    return np.array(out)
 
 
 def _run_edge(edges, bounds, tag, ids, patch_side=False):
@@ -265,7 +288,10 @@ def _run_edge(edges, bounds, tag, ids, patch_side=False):
     """
     k, label = tag[0], tag[1]
     if label is None and len(ids) == 2:
-        if not patch_side or bounds[k].f.kind == "blend":
+        # (a smooth blend's or freeform surface's face is fitted to its outline, so the
+        # chord serves it; a bow would leave the flat face beside it an edge off its plane,
+        # which then won't merge with the flat faces round it)
+        if not patch_side or bounds[k].f.kind == "blend" or bounds[k].m.kind == "freeform":
             return _line(edges.pts[ids[0]], edges.pts[ids[1]])
         m = bounds[k].m
         a, b = edges.pts[ids[0]], edges.pts[ids[1]]
@@ -391,22 +417,81 @@ def _wire(mesh, loop, tags, edges, bounds):
 # ---------------------------------------------------------------- faces
 
 def _planar_face(mesh, fid, owner, bounds, edge_tri, edges):
+    """The flat facet's face; a facet whose outline touches itself (two holes meeting
+    its edge at one corner, say) as one face per group of its triangles whose outline
+    doesn't (a compound), rather than hundreds of triangles; None if that fails too."""
     tris = mesh.tris[mesh.ftris[fid]]
+    face = _plane_face(mesh, fid, tris, owner, bounds, edge_tri, edges)
+    if face is not _PINCHED:
+        return face
+    groups = _unpinched(tris)
+    if len(groups) < 2 or len(groups) > PINCH_GROUPS:
+        return None
+    faces = [_plane_face(mesh, fid, tris[g], owner, bounds, edge_tri, edges) for g in groups]
+    if any(f is None or f is _PINCHED for f in faces):
+        return None
+    comp = TopoDS_Compound()
+    builder = BRep_Builder()
+    builder.MakeCompound(comp)
+    for f in faces:
+        builder.Add(comp, f)
+    return comp
+
+
+_PINCHED = object()
+PINCH_GROUPS = 8        # a pinched flat facet is built in at most this many pieces
+
+
+def _unpinched(tris):
+    """The triangles in groups (index arrays), each grown across shared edges but never
+    onto a triangle that would touch the group at a corner alone (a pinch)."""
+    by_edge = {}
+    for t, (a, b, c) in enumerate(tris):
+        for e in ((a, b), (b, c), (c, a)):
+            by_edge.setdefault(frozenset(e), []).append(t)
+    group = np.full(len(tris), -1)
+    out = []
+    for start in range(len(tris)):
+        if group[start] >= 0:
+            continue
+        g = len(out)
+        group[start] = g
+        members, verts, stack = [start], set(tris[start].tolist()), [start]
+        while stack:
+            t = stack.pop()
+            a, b, c = tris[t]
+            for e in ((a, b), (b, c), (c, a)):
+                for u in by_edge[frozenset(e)]:
+                    if group[u] >= 0:
+                        continue
+                    third = [v for v in tris[u].tolist() if v not in e][0]
+                    if third in verts and not any(
+                            group[w] == g for x in e for w in by_edge.get(frozenset((x, third)), ()) if w != u):
+                        continue
+                    group[u] = g
+                    members.append(u)
+                    verts.add(third)
+                    stack.append(u)
+        out.append(np.array(members))
+    return out
+
+
+def _plane_face(mesh, fid, tris, owner, bounds, edge_tri, edges):
+    """A planar face over these triangles of the facet; _PINCHED if their outline
+    touches itself (that makes an invalid face)."""
     loops = _loops(tris)
     if loops is None:
         return None
-    # an outline that touches itself (a pinched facet) makes an invalid face: the
-    # facet's own triangles are used instead
     ring = [v for loop in loops for v in loop]
     if len(ring) != len(set(ring)):
-        return None
+        return _PINCHED
     pts = mesh.pts
     # outer boundary first: the loop enclosing the most area
     normal = mesh.fn[fid]
     area = lambda loop: abs(np.cross(pts[loop], pts[np.roll(loop, -1)]).sum(axis=0) @ normal)
     loops.sort(key=area, reverse=True)
     if area(loops[-1]) < 1e-9 * area(loops[0]) + 1e-9:
-        return None     # a slit (an outline enclosing nothing): also left as triangles
+        return None     # a slit (an outline enclosing nothing): left as triangles
     wires = []
     for loop in loops:
         n = len(loop)
@@ -521,6 +606,8 @@ def _generous_surface(feature, bound, mesh, exact=True):
     m = feature.model
     if isinstance(m, Sphere):
         return _sphere_face(m.c, m.r, [mesh.fn[f] for f in feature.facets])
+    if m.kind == "freeform":
+        return m.face()     # (fitted with a margin all round already)
     lo, hi, u0, span = feature.lo, feature.hi, feature.u0, feature.span
     if m.line:
         margin = 0.2 * (hi - lo) + 0.5
@@ -823,7 +910,9 @@ def _split_face(feature, mesh, base, tools, loops, tol):
     splitter = BRepAlgoAPI_Splitter()
     splitter.SetArguments(_shapes([base]))
     splitter.SetTools(_shapes(tools))
-    splitter.SetFuzzyValue(max(10 * tol, 1e-4))
+    # (a fitted freeform surface passes a little off the outline's corners, which the
+    # outline edges run through)
+    splitter.SetFuzzyValue(max(10 * tol, 1e-4, 2 * getattr(m, "rim_dev", 0.0)))
     splitter.Build()
     if not splitter.IsDone():
         return None

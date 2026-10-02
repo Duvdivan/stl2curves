@@ -16,16 +16,17 @@ works out which surface each part of the mesh really lies on and rebuilds it exa
 | spheres | domes, dimples, ball ends, corners where three rounded edges meet |
 | tori | rounded edges that follow a curve (rounded box corners, fillets round a pin) |
 | screw threads | bolts, threaded holes and sockets (helical surfaces, with the thread named) |
+| freeform surfaces | crowns that fade out round a bend, curvature-continuous ("smooth") fillets, walls of slots milled along a curve |
 | smooth blends | where rounded edges meet at a corner, fillets along spline-shaped edges |
 
 Surfaces can be cut to any outline (a hole running out through a sloped face, two
 holes crossing), and overlapping bodies in one STL are fused automatically, as are
 bodies that only touch along an edge.
 
-Curved areas that none of the exact surfaces fit (corner blends, rounded edges
-following a spline) become one smooth freeform face each, fitted through the mesh
-corners and rolling tangentially into the faces beside them. Anything else stays as
-flat facets, so the result always matches the mesh.
+Curved areas that none of the exact surfaces fit become freeform faces: a big smooth
+area one B-spline surface fitted to all its mesh corners (within 0.002 mm), a small one
+(where rounded edges meet at a corner) one smooth patch spanning its outline. Anything
+else stays as flat facets, so the result always matches the mesh.
 
 ## Install
 
@@ -120,15 +121,28 @@ Without it the size is left alone (a slight scale is often deliberate, for fit).
    cylinder strips or sphere bits are replaced by the torus they approximate, and equal
    radii and near-axis-aligned axes are snapped to exact values (each snap kept only if
    the patch still lies on the mesh).
-3. **Blends** (`blends.py`) — dense curved areas left over (unrecognised facets, and
-   small pieces that only stand in for a surface they don't really fit) are grouped
-   into regions that each turn no more than one smooth face can follow.
-4. **Build** (`build.py`) — one exact face per patch, one smooth N-sided patch per
+3. **Freeform surfaces and blends** (`freeform.py`, `blends.py`) — curved areas left
+   over (unrecognised facets, and small pieces that only stand in for a surface they
+   don't really fit, such as narrow cylinder strips across a spline-shaped bend) are
+   grouped into smooth areas, not reaching across creases. A big one gets one B-spline
+   surface: a height field over a plane (or, for an area curling further round, a
+   cylinder) fitted to its mesh corners by penalised least squares (P-splines, Eilers
+   and Marx 1996), with knots refined only until it passes within 0.002 mm of every
+   corner and doesn't bow between them; an area no surface fits is halved by facet
+   direction and each half tried again, and a narrow exact strip lying between freeform
+   pieces (the middle of a curvature-continuous fillet fits a cylinder over a narrow
+   band) joins them if one surface fits all; loose facets next to a freeform surface
+   that already lie on it are taken in. Smaller areas, and what no surface fits,
+   are grouped into blend regions that each turn no more than one smooth patch can
+   follow.
+4. **Build** (`build.py`) — one exact face per patch, one freeform surface cut to its
+   area's outline, one smooth N-sided patch per
    blend (through the mesh corners; blends are built on their own first, a blend that
    won't fit is cut in two and retried) and one planar face per flat area, with shared
    edges (exact lines/arcs where a patch's boundary
    follows its natural lines, splines through the mesh points otherwise, split at sharp
-   corners), sewn into a solid. Bodies that touch along an edge (`bodies.py`) are built
+   corners, with points added along long straight stretches so the spline doesn't swing
+   out between them), sewn into a solid. Bodies that touch along an edge (`bodies.py`) are built
    separately and fused.
 5. **Checks** — every result must be a valid closed solid whose volume matches the
    mesh plus the predicted change from the curves (measured again from a fine
@@ -142,10 +156,18 @@ Without it the size is left alone (a slight scale is often deliberate, for fit).
    faces left by sewing, or next to a face that came out flipped, are dropped
    individually (blends first, then the nearest patch), and once the part builds they
    get a second chance together; if the volume check fails, the feature list is halved
-   to find the culprits (until the time limit; whatever is left then stays faceted). A
+   to find the culprits (until the time limit; whatever is left then stays faceted).
+   Each try builds and sews the whole part, minutes on a mesh of a quarter million
+   triangles, so after ten minutes of this every patch near a problem is dropped at
+   once, reaching four times further each round (0.5 mm, 2 mm, 8 mm...): a few more
+   tries at most, losing curves only round the trouble, rather than hours of them. A
+   big freeform surface blamed for a problem at its edge gives up only its facets near
+   the problem; one that fails outright gives way to the smaller blends its area would
+   have had. A
    patch that runs all the way
    round its axis but is cut to shape is built as two half rings if it won't build whole.
-   A final tidy-up is kept only if the solid is still valid. If the STL itself is not a
+   A final tidy-up merges faces on one surface (any merge that comes out broken is
+   undone and the rest kept) and is kept only if the solid is still valid. If the STL itself is not a
    clean solid (it touches or crosses itself), the result is checked against what its
    bare facets give and flagged with a warning.
    Finally the solid must survive its own STEP file: it is written out and read back,
@@ -158,10 +180,10 @@ Without it the size is left alone (a slight scale is often deliberate, for fit).
    reported as a warning. (Edges that sewing closes up are also removed straight after
    sewing.)
 
-Limits: large freeform areas (organic shells, variable-radius rounds over big areas)
-mostly stay faceted: the smooth patch fitter manages small blends and corners, but not
-yet whole freeform surfaces. Lettering and other shapes extruded from free curves stay
-faceted too.
+Limits: a freeform surface is a height field over a plane or a cylinder, so an area
+that curls round in two directions at once (an organic shell, a knob) is cut into
+several, and their seams follow mesh edges. Lettering and other shapes extruded from
+free curves stay faceted.
 
 ## Tests
 

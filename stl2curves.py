@@ -72,16 +72,22 @@ from sizing import guess_size
 from build import build_faces, sew, features_near, point_facet_distance, settle_blends
 import workers
 from bodies import split_bodies
-from blends import add_blends, split as split_blend, _blend as as_blend
+from blends import add_blends, split as split_blend, _blend as as_blend, fallback as blend_fallback, carve
 from repair import repair
 from simplify import simplify
 from read3mf import read_3mf
 
 SEARCH_SECONDS = 600    # time allowed for hunting down patches that spoil the solid
+TROUBLE_SECONDS = 600   # time for dropping troublemakers one by one, per body; then every patch
+HURRY_REACH = 0.5       # mm: this near trouble goes at once, four times as far each further round
+BLAME_TIE = 0.01        # mm: patches this much nearer trouble than another count as level with it
 TIME_LIMIT = 600        # seconds after which the optional refinements stop (--time-limit); see stl_to_solid
 FIX_PRECISIONS = (1e-5, 1e-4)   # mm: precisions ShapeFix tries on an invalid solid after its default
 EMPTY_SHELL = 1e-6      # closed shells with less volume than this share of the biggest are dropped
 FUSE_SECONDS = 30       # bodies whose fuse takes longer than this are handed over side by side
+TIDY_SECONDS = 120      # a final tidy-up taking longer than this is given up (the part is kept as checked)
+TIDY_WORKER_FACES = 20000   # ...on a part of at least this many faces (smaller ones are tidied in place)
+TIDY_TRIES = 3          # tidy-ups tried, each keeping apart the faces whose merge came out invalid
 BARE_AHEAD = 5000       # facets from which the bare-facet build is made ahead, in a worker process
 WORKERS_FROM = 5000     # triangles from which a part is worth starting worker processes for
 BARE_DRIFT = 1e-4       # share of a sound mesh's volume its bare facets may differ by and still be a reference
@@ -659,7 +665,12 @@ def _bare_ahead(mesh, tol):
 def culprits(mesh, features, points):
     """Which patches to drop for trouble at these points: the smooth blends right there if
     any (they give back the exact pieces they replaced), else just the patch nearest to
-    each trouble spot (the next attempt shows whether that was enough)."""
+    each trouble spot (the next attempt shows whether that was enough). Out of time for
+    that (mesh.hurry rounds past TROUBLE_SECONDS): every patch near any of them."""
+    mesh.trouble = points       # (a big freeform patch blamed gives up just its facets near them)
+    hurry = mesh.__dict__.get("hurry", 0)
+    if hurry:
+        return features_near(mesh, features, points, reach=HURRY_REACH * 4 ** (hurry - 1))
     near = features_near(mesh, features, points)
     if not near:
         return []
@@ -674,6 +685,10 @@ def culprits(mesh, features, points):
         pool = [k for k in blends if dist[k][i] <= 0.5] or near
         k = min(pool, key=lambda k: dist[k][i])
         if dist[k][i] <= 0.5:
+            # (on an edge between patches every one beside it is as near: the smallest
+            # goes first, the cheapest loss; the next attempt shows if that was enough)
+            k = min((j for j in pool if dist[j][i] <= dist[k][i] + BLAME_TIE),
+                    key=lambda j: (len(features[j].facets), dist[j][i]))
             out.add(k)
     return sorted(out)
 
@@ -734,6 +749,12 @@ def _build(mesh, features, mesh_tol, tol, fuse, info):
     faceted_volume = mesh_volume(mesh)
     _bare_ahead(mesh, tol)
     features = settle_blends(mesh, features, mesh_tol, split_blend, info["skipped"])
+    # Each attempt builds and sews the whole body: on a mesh of a quarter million facets
+    # that is minutes, and dropping troublemakers a few at a time took over an hour. So
+    # after TROUBLE_SECONDS every patch near trouble goes at once (culprits), reaching
+    # further each round: a few rounds at most, losing curves only round the trouble.
+    deadline = time.time() + TROUBLE_SECONDS if features_mod._budget else math.inf
+    mesh.hurry = 0
 
     def good(subset):
         result, failed = attempt(mesh, subset, mesh_tol, tol, fuse, faceted_volume)
@@ -751,7 +772,17 @@ def _build(mesh, features, mesh_tol, tol, fuse, info):
                     # the surface's seam; the same surface as two half rings doesn't
                     back += rings
                     continue
-                if attempt.blamed:
+                if f.model.kind == "freeform":
+                    # a big freeform patch blamed for trouble at its edge gives up just its
+                    # facets there; one that won't build (or would lose half of itself)
+                    # the smooth blends its area would have had otherwise
+                    carved = attempt.blamed and carve(mesh, f, mesh.__dict__.get("trouble"),
+                                                      HURRY_REACH * 4 ** max(0, mesh.hurry - 1))
+                    if carved:
+                        back += carved
+                        continue
+                    halves = blend_fallback(mesh, f)
+                elif attempt.blamed:
                     halves = None
                 elif f.kind == "blend":
                     halves = split_blend(mesh, f)
@@ -771,6 +802,9 @@ def _build(mesh, features, mesh_tol, tol, fuse, info):
                     if attempt.blamed:
                         blamed.append(f)
             subset = [f for k, f in enumerate(subset) if k not in failed] + back
+            if attempt.blamed and time.time() > deadline:
+                # (a whole build and sew is at stake each time: blame widely from now on)
+                mesh.hurry += 1
             result, failed = attempt(mesh, subset, mesh_tol, tol, fuse, faceted_volume)
 
         # Patches dropped for trouble nearby may have been innocent: once the part
@@ -799,7 +833,7 @@ def _build(mesh, features, mesh_tol, tol, fuse, info):
         return result, subset
 
     result, used = good(features)
-    if result is None and used:
+    if result is None and used and not mesh.hurry:
         # Find the troublemakers by halving: keep every half that builds cleanly.
         accepted = []
         start = time.time()
@@ -825,8 +859,10 @@ def _build(mesh, features, mesh_tol, tol, fuse, info):
 
         search(used)
         used = accepted
-        if result is None:
-            result, used = good([])
+    elif result is None:
+        info["skipped"] += used         # (out of time: the patches left stay faceted)
+    if result is None:
+        result, used = good([])
     if result is None:
         raise RuntimeError("could not build a closed solid from this mesh")
     dropped = [f for f in mesh.__dict__.pop("file_dropped", []) if all(f is not u for u in used)]
@@ -944,26 +980,11 @@ def _stl_to_solid(path, tol, fuse=True, curves=True, true_size=False, blends=Tru
     # otherwise hand over the checked shape as it was built. First faces on one surface
     # are merged into one (a flat face whose outline defeated the face builder, a step or
     # ridge a thousandth of a millimetre high in an export, was built triangle by
-    # triangle), failing that just edges split along one line.
+    # triangle), failing that just edges split along one line (see tidied: given up on
+    # a part so big that it would take more than TIDY_SECONDS).
     checked = shape
     target = volume(checked)
-    shape = untidy = None
-    for faces in (True, False):
-        try:
-            unify = ShapeUpgrade_UnifySameDomain(checked, True, faces, False)
-            unify.SetLinearTolerance(UNIFY_TOL)
-            unify.SetAngularTolerance(math.radians(UNIFY_DEG))
-            unify.Build()
-            sf = ShapeFix_Shape(unify.Shape())
-            sf.Perform()
-            tidy = sf.Shape()
-        except Exception:
-            continue
-        if abs(volume(tidy) - target) <= UNIFY_VOLUME * abs(target) + 1e-3:
-            if BRepCheck_Analyzer(tidy).IsValid():
-                shape = tidy
-                break
-            untidy = untidy or tidy
+    shape, untidy = tidied(checked, target)
     if shape is None:
         shape = checked
     if not BRepCheck_Analyzer(shape).IsValid():
@@ -991,6 +1012,120 @@ def _stl_to_solid(path, tol, fuse=True, curves=True, true_size=False, blends=Tru
     info["volume"] = volume(shape)
     info["valid"] = BRepCheck_Analyzer(shape).IsValid()
     return shape, info
+
+
+def tidied(shape, target):
+    """(tidy, untidy): the shape tidied up (_tidy); on a part of TIDY_WORKER_FACES faces
+    or more in a worker process, given up after TIDY_SECONDS (merging faces across a
+    part of a hundred thousand faces can take the best part of an hour). (None, None)
+    if nothing came. (Only then: read back from a BRep file in a worker, a shape no
+    longer merged at all, Rak N kept 1780 faces instead of 1279.)"""
+    pool = workers.get() if count(shape, TopAbs_FACE) >= TIDY_WORKER_FACES else None
+    if pool is None:
+        return _tidy(shape, target)
+    from concurrent.futures import TimeoutError as Timeout
+    tmp = tempfile.mkdtemp(prefix="stl2curves_")
+    try:
+        paths = [os.path.join(tmp, n) for n in ("shape.brep", "tidy.brep", "untidy.brep")]
+        BRepTools.Write_s(shape, paths[0])
+        job = pool.submit(_tidy_job, (paths, target))
+        try:
+            done = job.result(timeout=TIDY_SECONDS)
+        except Timeout:
+            workers.abandoned()     # (the worker is left to finish; then restarted)
+            return None, None
+        except Exception:
+            workers.broken()
+            return None, None
+        out = []
+        for path, there in zip(paths[1:], done):
+            got = None
+            if there:
+                got = TopoDS_Shape()
+                BRepTools.Read_s(got, path, BRep_Builder())
+            out.append(got)
+        return tuple(out)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _tidy_job(job):
+    """In a worker process: _tidy on a shape read from a BRep file, the results written
+    to two more. Which of them there are."""
+    paths, target = job
+    shape = TopoDS_Shape()
+    BRepTools.Read_s(shape, paths[0], BRep_Builder())
+    out = _tidy(shape, target)
+    return tuple(x is not None and BRepTools.Write_s(x, path) for x, path in zip(out, paths[1:]))
+
+
+def _tidy(checked, target):
+    """(tidy, untidy): faces on one surface merged into one, failing that just edges
+    split along one line, kept if still a valid solid of the same volume (tidy), or of
+    the same volume but invalid (untidy, used only if nothing better turns up). A merged
+    face that comes out invalid (a floor of 450 triangles beside a freeform surface)
+    has its pieces kept apart in the next try, so the other merges still count."""
+    untidy = None
+    for faces in (True, False):
+        apart = []          # edges the faces either side of which must stay apart
+        for _ in range(TIDY_TRIES if faces else 1):
+            try:
+                unify = ShapeUpgrade_UnifySameDomain(checked, True, faces, False)
+                unify.SetLinearTolerance(UNIFY_TOL)
+                unify.SetAngularTolerance(math.radians(UNIFY_DEG))
+                for edge in apart:
+                    unify.KeepShape(edge)
+                unify.Build()
+                sf = ShapeFix_Shape(unify.Shape())
+                sf.Perform()
+                tidy = sf.Shape()
+            except Exception:
+                break
+            if abs(volume(tidy) - target) <= UNIFY_VOLUME * abs(target) + 1e-3:
+                if BRepCheck_Analyzer(tidy).IsValid():
+                    return tidy, untidy
+                untidy = untidy or tidy
+            more = _bad_merges(checked, unify)
+            if not faces or not more:
+                break
+            apart += more
+    return None, untidy
+
+
+def _bad_merges(checked, unify):
+    """The edges inside each merged face that came out invalid (between the faces it
+    was merged from)."""
+    merged = unify.Shape()
+    check = BRepCheck_Analyzer(merged)
+    history = unify.History()
+    index = IndexedMap_TopoDS_Shape_TopTools_ShapeMapHasher()
+    TopExp.MapShapes_s(merged, TopAbs_FACE, index)
+    sources = {}
+    ex = TopExp_Explorer(checked, TopAbs_FACE)
+    while ex.More():
+        face = ex.Current()
+        ex.Next()
+        for image in history.Modified(face):
+            k = index.FindIndex(image)
+            if k:
+                sources.setdefault(k, []).append(face)
+    out = []
+    for k, group in sources.items():
+        if len(group) < 2 or check.IsValid(index.FindKey(k)):
+            continue
+        edges = IndexedMap_TopoDS_Shape_TopTools_ShapeMapHasher()
+        seen = IndexedMap_TopoDS_Shape_TopTools_ShapeMapHasher()
+        for face in group:
+            ee = TopExp_Explorer(face, TopAbs_EDGE)
+            while ee.More():
+                e = ee.Current()
+                ee.Next()
+                if seen.Contains(e):
+                    edges.Add(e)
+                else:
+                    seen.Add(e)
+        out += [edges.FindKey(i) for i in range(1, edges.Extent() + 1)]
+    return out
 
 
 def _repair_parts(pts, tris, part):
