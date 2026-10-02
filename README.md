@@ -171,7 +171,8 @@ Without it the size is left alone (a slight scale is often deliberate, for fit).
    clean solid (it touches or crosses itself), the result is checked against what its
    bare facets give and flagged with a warning.
    Finally the solid must survive its own STEP file: it is written out and read back,
-   and must come back valid with the same volume. A STEP file keeps no
+   and must come back valid with the same volume (except on parts of over 50,000
+   faces, where that would take longer than the whole conversion). A STEP file keeps no
    tolerances, so a reader works them out again from the geometry, tightly; a face that
    only checked out within the generous tolerance sewing gave its edges (two edges
    crossing inside it, or a sliver's edge shorter than that tolerance closed up into a

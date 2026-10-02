@@ -258,6 +258,7 @@ class Edges:
 
 
 LONG_STEP = 3.0     # a step this many times the run's typical one gets points along it
+OUTLINE_FIRST = 300     # facets: a freeform patch this big gets its face from its outline first
 
 
 def _even(pts, closed):
@@ -825,9 +826,17 @@ def _trimmed_face(feature, k, bound, mesh, owner, bounds, edge_tri, edges, tol):
         base = _generous_surface(feature, bound, mesh, exact)
         if base is None:
             return None
-        face = _split_face(feature, mesh, base, tools, loops, tol)
-        if face is None:
+        # (a big freeform surface's outline is laid on it first: splitting a big B-spline
+        # surface along hundreds of outline edges took minutes a face on a fine mesh, and
+        # often failed; a small one is split, which suits the faces beside it better)
+        if m.kind == "freeform" and len(feature.facets) >= OUTLINE_FIRST:
             face = _outline_face(feature, mesh, base, loops, per_loop)
+            if face is None:
+                face = _split_face(feature, mesh, base, tools, loops, tol)
+        else:
+            face = _split_face(feature, mesh, base, tools, loops, tol)
+            if face is None:
+                face = _outline_face(feature, mesh, base, loops, per_loop)
         if face is None:
             face = _polygon_face(feature, mesh, base, loops)
         if face is not None:

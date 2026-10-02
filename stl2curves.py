@@ -96,6 +96,8 @@ FILE_VOLUME = 1e-3      # share of the volume a finished part's STEP file may re
 FILE_MATCH = 0.05       # mm (and share): how far a face's middle or outline may move read back from the file
 FILE_AREA = 0.5         # mm^2 (plus half a percent): how much a face's area may change read back from the file
 FILE_ROUNDS = 3         # rounds of patches dropped for what their STEP file does, at most, per body
+FILE_CHECK_FACES = 50000    # a part of more faces (facets, while building) isn't written and read back:
+                            # on 218k faces that took longer than the whole build
                             # where OCC's integration and the expected volume disagree
 UNIFY_TOL = 0.001       # mm: faces this close to one surface are merged at the end ...
 UNIFY_DEG = 0.1         # ... if their normals agree this closely
@@ -472,7 +474,7 @@ def attempt(mesh, features, mesh_tol, tol, fuse, faceted_volume):
             # nothing to blame and the mesh as bare facets fails the same way: the
             # defect is in the mesh itself (it touches itself, say), not in the curves
     trial = mesh.__dict__.get("file_trial", False)
-    if (features and not mesh.__dict__.get("file_off")
+    if (features and not mesh.__dict__.get("file_off") and len(mesh.farea) <= FILE_CHECK_FACES
             and (trial or mesh.__dict__.get("file_rounds", 0) < FILE_ROUNDS)):
         # The solid is only as good as its STEP file. A file keeps no tolerances, and a
         # reader works them out again from the geometry, tight: a face that checked out
@@ -764,8 +766,14 @@ def _build(mesh, features, mesh_tol, tol, fuse, info):
             # that (or if it was only blamed), it gives back the pieces it replaced
             back = []
             by_file = attempt.why == "file"
+            late = time.time() > deadline
             for k in failed:
                 f = subset[k]
+                if late:
+                    # (out of time: no more halves, refits or fallbacks to try one by one)
+                    info["skipped"].append(f)
+                    back += list(f.parts)
+                    continue
                 rings = half_rings(mesh, f)
                 if rings:
                     # a whole ring cut to shape often fails where its outline crosses
@@ -1000,10 +1008,13 @@ def _stl_to_solid(path, tol, fuse=True, curves=True, true_size=False, blends=Tru
     # (and the STEP file must read back as built: the tidied shape failing that, the
     # shape as checked)
     slack = FILE_VOLUME * abs(target) + 1e-3
-    trouble = file_trouble(shape, slack)
-    if trouble is not None and shape is not checked and file_trouble(checked, slack) is None:
-        shape, trouble = checked, None
-    info["file_ok"] = trouble is None
+    if count(shape, TopAbs_FACE) <= FILE_CHECK_FACES:
+        trouble = file_trouble(shape, slack)
+        if trouble is not None and shape is not checked and file_trouble(checked, slack) is None:
+            shape, trouble = checked, None
+        info["file_ok"] = trouble is None
+    else:
+        info["file_ok"] = None      # (not checked: too big to write and read back in time)
 
     info["bodies"], info["voids"] = nb, nv
     info["faces"] = count(shape, TopAbs_FACE)
@@ -1249,7 +1260,7 @@ def main():
         print(f"  {info['triangles']} triangles -> {info['faces']} faces{extra}, "
               f"volume {info['volume']:,.1f} mm^3, "
               f"{'valid solid' if info['valid'] else 'WARNING: check geometry' + (' (the STL itself is not a clean solid: it touches or crosses itself)' if info.get('mesh_defects') else '')}, "
-              f"{'' if info.get('file_ok', True) else 'WARNING: the STEP file does not read back exactly as built, '}"
+              f"{'WARNING: the STEP file does not read back exactly as built, ' if info.get('file_ok') is False else ''}"
               f"{time.time() - t:.1f}s -> {out}")
         if info["repairs"]:
             print("  mended the mesh: " + "; ".join(info["repairs"]))
