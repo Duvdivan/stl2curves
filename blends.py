@@ -13,6 +13,7 @@ from collections import deque
 import numpy as np
 
 import freeform
+import pipes
 from features import Feature, Revolved, Sphere
 
 SMOOTH_DEG = 50       # facets bending less than this meet smoothly
@@ -112,6 +113,9 @@ def add_blends(mesh, features):
     """Features with small mismatched pieces and unrecognised curved facets regrouped into
     smooth blends. Each blend remembers the pieces it replaced (`parts`), so they can be
     put back if its face can't be built."""
+    # (first the pieces of fillets along curved edges joined into pipes: they are pieces
+    # of tori, cylinders and spheres the passes below would take for scraps)
+    features = pipes.add_pipes(mesh, features)
     nf = len(mesh.farea)
     owner = np.full(nf, -1)
     for k, f in enumerate(features):
@@ -173,6 +177,15 @@ def fallback(mesh, feature):
     # (pieces no blend took, and the facets left over, stay as they were)
     return ([_blend(mesh, facets, tuple(feature.parts[k] for k in parts)) for facets, parts in regions]
             + [p for k, p in enumerate(feature.parts) if k not in used])
+
+
+def pipe_fallback(mesh, feature):
+    """The pieces a pipe joined, as they were, and smooth blends of up to MAX_FACETS
+    facets over the loose facets it took in besides (for when its face can't be built)."""
+    taken = {int(a) for p in feature.parts for a in p.facets}
+    free = {int(a) for a in feature.facets} - taken
+    regions = _regions(mesh, free, lambda a: [a], lambda a: -1)
+    return list(feature.parts) + [_blend(mesh, facets, ()) for facets, _ in regions]
 
 
 def _freeform_pieces(mesh, facets, unit, depth=0):

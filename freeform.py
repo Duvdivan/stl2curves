@@ -112,7 +112,7 @@ class Freeform:
     def surface(self):
         """The surface as an OpenCascade B-spline surface over the whole fitted domain:
         exact over a plane (the control points of a height field, at the knots' Greville
-        abscissae), approximated within 1e-5 mm over a cylinder."""
+        abscissae), approximated over a cylinder (see approximate)."""
         if self._surface is None:
             self._surface = _plane_surface(self) if self.base == "plane" else _sampled_surface(self)
         return self._surface
@@ -364,18 +364,55 @@ def _plane_surface(model):
 
 
 def _sampled_surface(model):
-    from OCP.GeomAPI import GeomAPI_PointsToBSplineSurface
-    from OCP.GeomAbs import GeomAbs_C2
-    from OCP.collections import Array2_gp_Pnt
-    from OCP.gp import gp_Pnt
     tu, tv = model.tu, model.tv
     U = np.linspace(tu[0], tu[-1], 4 * (len(tu) - 7) + 1)
     V = np.linspace(tv[0], tv[-1], 4 * (len(tv) - 7) + 1)
+    return approximate(model.point, U, V)
+
+
+APPROX_TRIES = 4        # ways of laying a B-spline surface through a grid of points, tried in turn
+APPROX_GOOD = 0.0004    # mm: the first passing this close to the surface between the points is taken
+APPROX_CHECKS = 80      # points between the grid points it is measured at
+
+
+def approximate(point, U, V):
+    """An OpenCascade B-spline surface through the points point(U x V) (a grid, U and V
+    each in step with the surface's own parameters), as close as one of a few ways of
+    laying it can get between them. None of them is close everywhere:
+    GeomAPI_PointsToBSplineSurface allowed degrees up to 8 reports success while missing
+    its own points by millimetres on some grids, and kept cubic it waves between them by
+    a tenth of a millimetre on others. Each is measured at points midway between the
+    grid's, and the first within APPROX_GOOD (or else the closest) is taken."""
+    from OCP.Approx import Approx_ChordLength, Approx_IsoParametric
+    from OCP.GeomAPI import GeomAPI_PointsToBSplineSurface, GeomAPI_ProjectPointOnSurf
+    from OCP.GeomAbs import GeomAbs_C2
+    from OCP.collections import Array2_gp_Pnt
+    from OCP.gp import gp_Pnt
     uu, vv = np.meshgrid(U, V, indexing="ij")
-    X = model.point(uu.ravel(), vv.ravel()).reshape(len(U), len(V), 3)
+    X = point(uu.ravel(), vv.ravel()).reshape(len(U), len(V), 3)
     grid = Array2_gp_Pnt(1, len(U), 1, len(V))
     for i in range(len(U)):
         for j in range(len(V)):
             grid.SetValue(i + 1, j + 1, gp_Pnt(*map(float, X[i, j])))
-    approx = GeomAPI_PointsToBSplineSurface(grid, 3, 8, GeomAbs_C2, 1e-5)
-    return approx.Surface() if approx.IsDone() else None
+    rng = np.random.default_rng(0)
+    i = rng.integers(0, len(U) - 1, APPROX_CHECKS)
+    j = rng.integers(0, len(V) - 1, APPROX_CHECKS)
+    checks = point((U[i] + U[i + 1]) / 2, (V[j] + V[j + 1]) / 2)
+    best, best_gap = None, math.inf
+    for kind, degree in ((Approx_ChordLength, 8), (Approx_IsoParametric, 3),
+                         (Approx_ChordLength, 3), (Approx_IsoParametric, 8))[:APPROX_TRIES]:
+        approx = GeomAPI_PointsToBSplineSurface(grid, kind, 3, degree, GeomAbs_C2, 1e-5)
+        if not approx.IsDone():
+            continue
+        surface = approx.Surface()
+        gap = 0.0
+        for p in checks:
+            project = GeomAPI_ProjectPointOnSurf(gp_Pnt(*map(float, p)), surface)
+            gap = max(gap, project.LowerDistance() if project.NbPoints() else math.inf)
+            if gap >= best_gap:
+                break
+        if gap < best_gap:
+            best, best_gap = surface, gap
+        if best_gap <= APPROX_GOOD:
+            break
+    return best

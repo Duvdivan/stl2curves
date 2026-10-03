@@ -101,7 +101,24 @@ Local regression data on this machine (not in the repo):
    revolution.
 4. **`sizing.py`** guesses the design size (one scale factor making radii round);
    `features.snap()` equalises radii and snaps near-axis-aligned axes.
-5. **`blends.py`** groups leftover curved facets (and "scrap" pieces that only stand in
+5. **`blends.py`** first joins fillets along curved edges (**`pipes.py`**): a
+   constant-radius fillet whose edge is neither a line nor a circle (a flat face meeting
+   a tilted cylinder: the ball's path is an ellipse) comes out of detection as a chain of
+   narrow tori, cylinders, spheres and cones of the fillet's radius, each centred
+   elsewhere. A chain grows from its longest piece over same-radius neighbours (each kept
+   if one tube still fits all: a tube of radius r round a cubic B-spline spine, fitted by
+   point-distance minimisation, each step fitting the spline through the ball centres at
+   the corners' foot points; Gauss-Newton on the distances alone let the spine slide
+   along itself and blow up) and over loose facets and pieces already on the tube (ones
+   reaching past the tube's end join only if it refits with them: the face is cut from
+   the tube, which must run on past its outline). A piece is left alone if it is a real fillet:
+   the two faces along its sides agree with its axis (`_real`: planes square to a torus's
+   axis, cylinders round it; planes and cylinders along a cylinder's). A spline can't
+   tell (it bridges a line-to-arc junction within 0.002 mm once the arc is 3 mm or more),
+   and reach can't either (round an ellipse's ends a torus fits for 90 deg). Pipes are
+   `kind="trimmed"` with a `Pipe` model (`kind="pipe"`, built like freeform faces); one
+   that fails to build gives back its pieces.
+   Then `blends.py` groups leftover curved facets (and "scrap" pieces that only stand in
    for a surface) into smooth areas. A big area (over `MAX_FACETS` facets or 5 mm
    across) is first tried as one **`freeform.py`** surface: a P-spline height field
    over a plane or a cylinder, fitted to every corner within `FIT_DEV` (0.002 mm), knots
@@ -218,6 +235,13 @@ Key contracts:
 - OCC's BRepMesh tessellates a big B-spline face coarsely whatever deflection is asked
   (0.07 mm off a 64x13-span surface at 0.002), so `deviation.py` reports such faces
   worse than they are; measure against the surface itself (GeomAPI_ProjectPointOnSurf).
+- `GeomAPI_PointsToBSplineSurface` is unreliable on a sampled grid: allowed degrees up
+  to 8 it can report success while missing its own points by millimetres (a sampled
+  tube, a cylinder-based freeform surface), and kept cubic it can wave a tenth of a
+  millimetre between them (the tray's pockets: 268 -> 360 faces). No one setting is
+  right for every surface, so `freeform.approximate` tries a few (chord-length or
+  iso-parametric, degree 8 or 3), measures each midway between the grid points, and
+  keeps the first within 0.0004 mm.
 - A smooth area that fits only with a dense knot grid has a crease or a tight round
   inside it: capping control points by corner count (and splitting) beat refining
   (131x131 control points made the splitter take minutes per face).

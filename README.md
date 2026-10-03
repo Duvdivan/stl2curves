@@ -15,6 +15,7 @@ works out which surface each part of the mesh really lies on and rebuilds it exa
 | cones | countersinks, chamfers around round edges, cone tips |
 | spheres | domes, dimples, ball ends, corners where three rounded edges meet |
 | tori | rounded edges that follow a curve (rounded box corners, fillets round a pin) |
+| swept fillets | constant-radius rounded edges along any other curve (where a flat face meets a tilted hole or slot, along a spline-shaped outline) |
 | screw threads | bolts, threaded holes and sockets (helical surfaces, with the thread named) |
 | freeform surfaces | crowns that fade out round a bend, curvature-continuous ("smooth") fillets, walls of slots milled along a curve |
 | smooth blends | where rounded edges meet at a corner, fillets along spline-shaped edges |
@@ -121,7 +122,14 @@ Without it the size is left alone (a slight scale is often deliberate, for fit).
    cylinder strips or sphere bits are replaced by the torus they approximate, and equal
    radii and near-axis-aligned axes are snapped to exact values (each snap kept only if
    the patch still lies on the mesh).
-3. **Freeform surfaces and blends** (`freeform.py`, `blends.py`) — curved areas left
+3. **Swept fillets** (`pipes.py`) — a constant-radius fillet along an edge that is
+   neither straight nor circular is the tube a ball sweeps rolling along it, and
+   detection covers it with narrow pieces of tori, cylinders and spheres of its radius,
+   each fitting a short stretch. Such a chain becomes one tube round a fitted spline
+   (the path of the ball's centre), passing within 0.002 mm of every mesh corner. Pieces
+   that are real fillets (lying between faces that share their axis, like a torus round
+   a hole's rim) stay as they are.
+4. **Freeform surfaces and blends** (`freeform.py`, `blends.py`) — curved areas left
    over (unrecognised facets, and small pieces that only stand in for a surface they
    don't really fit, such as narrow cylinder strips across a spline-shaped bend) are
    grouped into smooth areas, not reaching across creases. A big one gets one B-spline
@@ -135,7 +143,7 @@ Without it the size is left alone (a slight scale is often deliberate, for fit).
    that already lie on it are taken in. Smaller areas, and what no surface fits,
    are grouped into blend regions that each turn no more than one smooth patch can
    follow.
-4. **Build** (`build.py`) — one exact face per patch, one freeform surface cut to its
+5. **Build** (`build.py`) — one exact face per patch, one freeform surface cut to its
    area's outline, one smooth N-sided patch per
    blend (through the mesh corners; blends are built on their own first, a blend that
    won't fit is cut in two and retried) and one planar face per flat area, with shared
@@ -144,7 +152,7 @@ Without it the size is left alone (a slight scale is often deliberate, for fit).
    corners, with points added along long straight stretches so the spline doesn't swing
    out between them), sewn into a solid. Bodies that touch along an edge (`bodies.py`) are built
    separately and fused.
-5. **Checks** — every result must be a valid closed solid whose volume matches the
+6. **Checks** — every result must be a valid closed solid whose volume matches the
    mesh plus the predicted change from the curves (measured again from a fine
    tessellation where OpenCascade's own volume disagrees: its integration goes astray
    where the sewing had to close gaps of a few hundredths of a millimetre, as beside a

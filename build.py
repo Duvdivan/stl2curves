@@ -292,7 +292,7 @@ def _run_edge(edges, bounds, tag, ids, patch_side=False):
         # (a smooth blend's or freeform surface's face is fitted to its outline, so the
         # chord serves it; a bow would leave the flat face beside it an edge off its plane,
         # which then won't merge with the flat faces round it)
-        if not patch_side or bounds[k].f.kind == "blend" or bounds[k].m.kind == "freeform":
+        if not patch_side or bounds[k].f.kind == "blend" or bounds[k].m.kind in ("freeform", "pipe"):
             return _line(edges.pts[ids[0]], edges.pts[ids[1]])
         m = bounds[k].m
         a, b = edges.pts[ids[0]], edges.pts[ids[1]]
@@ -607,7 +607,7 @@ def _generous_surface(feature, bound, mesh, exact=True):
     m = feature.model
     if isinstance(m, Sphere):
         return _sphere_face(m.c, m.r, [mesh.fn[f] for f in feature.facets])
-    if m.kind == "freeform":
+    if m.kind in ("freeform", "pipe"):
         return m.face()     # (fitted with a margin all round already)
     lo, hi, u0, span = feature.lo, feature.hi, feature.u0, feature.span
     if m.line:
@@ -829,7 +829,7 @@ def _trimmed_face(feature, k, bound, mesh, owner, bounds, edge_tri, edges, tol):
         # (a big freeform surface's outline is laid on it first: splitting a big B-spline
         # surface along hundreds of outline edges took minutes a face on a fine mesh, and
         # often failed; a small one is split, which suits the faces beside it better)
-        if m.kind == "freeform" and len(feature.facets) >= OUTLINE_FIRST:
+        if m.kind in ("freeform", "pipe") and len(feature.facets) >= OUTLINE_FIRST:
             face = _outline_face(feature, mesh, base, loops, per_loop)
             if face is None:
                 face = _split_face(feature, mesh, base, tools, loops, tol)

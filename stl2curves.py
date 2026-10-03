@@ -72,7 +72,7 @@ from sizing import guess_size
 from build import build_faces, sew, features_near, point_facet_distance, settle_blends
 import workers
 from bodies import split_bodies
-from blends import add_blends, split as split_blend, _blend as as_blend, fallback as blend_fallback, carve
+from blends import add_blends, split as split_blend, _blend as as_blend, fallback as blend_fallback, carve, pipe_fallback
 from repair import repair
 from simplify import simplify
 from read3mf import read_3mf
@@ -790,6 +790,8 @@ def _build(mesh, features, mesh_tol, tol, fuse, info):
                         back += carved
                         continue
                     halves = blend_fallback(mesh, f)
+                elif f.model.kind == "pipe":
+                    halves = pipe_fallback(mesh, f)     # (its pieces as they were, blends between)
                 elif attempt.blamed:
                     halves = None
                 elif f.kind == "blend":
