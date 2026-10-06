@@ -204,6 +204,15 @@ Builds five CAD test parts (holes, pins, chamfers, crossing holes, a filleted li
 domes, balls...), meshes them, converts them back and checks each against the original
 design (volume, validity, face count).
 
+## License
+
+This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for
+full text.
+
+The MIT license allows commercial use, modification, distribution, and private use,
+while requiring that the copyright notice and permission notice remain in all copies or
+substantial portions of the software.
+
 ## Credits
 
 The permissive final pass, the outline-polygon fallback face builder, torus-from-strips
