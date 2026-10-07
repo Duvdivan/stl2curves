@@ -4,3 +4,5 @@ tests/parts/
 *.step
 *.stp
 *.png
+/*.stl
+/*.3mf

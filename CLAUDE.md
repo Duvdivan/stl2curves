@@ -255,6 +255,7 @@ Key contracts:
   top of each module with a one-line comment giving the unit and meaning.
 - Commits: plain-sentence subject lines (e.g. "Find fillets between flat faces by
   rolling-ball fitting"), committed with the repo-local noreply email; remote is the
-  private GitHub repo `Duvdivan/stl2curves`, branch `main`.
+  public GitHub repo `Duvdivan/stl2curves` (MIT licence), branch `main`: never commit
+  downloaded meshes or other people's models.
 - Keep `README.md` (user-facing: what is rebuilt, options, how it works, limits) in step
   with behaviour changes.
