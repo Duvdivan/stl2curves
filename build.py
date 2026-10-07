@@ -304,11 +304,25 @@ def _run_edge(edges, bounds, tag, ids, patch_side=False):
     bound = bounds[k]
     if label in ("lo", "hi") and len(ids) > 3 and ids[0] == ids[-1] and bound.f.kind != "wedge":
         # a whole natural boundary circle: the exact circle (as the face beside it uses)
-        return bound.full_circle(label)
+        return _following(bound.full_circle(label), edges.pts[ids])
     if (label in ("u0", "u1") and len(ids) > 3 and ids[0] == ids[-1] and bound.f.kind != "wedge"
             and not bound.m.line):
-        return bound.full_profile(label)    # likewise the whole profile circle of a torus
+        # likewise the whole profile circle of a torus
+        return _following(bound.full_profile(label), edges.pts[ids])
     return edges.get(ids, lambda canon: bound.edge(label, edges.pts[canon]))
+
+
+def _following(edge, pts):
+    """A whole-circle edge turned to run the way the loop of points round it does (a
+    circle is made running anticlockwise about its axis; a hole wire running the same
+    way as its face's outer wire made the face invalid, and its solid's volume
+    thousands of cubic millimetres off)."""
+    circle = BRepAdaptor_Curve(edge).Circle()
+    axis = circle.Axis().Direction()
+    centre = circle.Location()
+    rel = pts - np.array([centre.X(), centre.Y(), centre.Z()])
+    turn = np.cross(rel[:-1], rel[1:]).sum(axis=0) @ np.array([axis.X(), axis.Y(), axis.Z()])
+    return TopoDS.Edge(edge.Reversed()) if turn < 0 else edge
 
 
 def _safe_arc(a, mid, b):

@@ -440,14 +440,14 @@ def attempt(mesh, features, mesh_tol, tol, fuse, faceted_volume):
         # the bare build itself going wrong, and is no reference)
         if drift is None or (not defective and drift > BARE_DRIFT * abs(faceted_volume) + 1e-3):
             attempt.why = "volume"
-            return None, []
+            return None, _invalid_blame(mesh, features, shape)
         expected = mesh.bare_volume + change
         # (a defective mesh give or take what the defect itself does: it sews a little
         # differently each time)
         slack = drift if defective else 0.0
         if abs(signed - expected) > allowed + slack:
             attempt.why = "volume2"
-            return None, []
+            return None, _invalid_blame(mesh, features, shape)
     check = BRepCheck_Analyzer(shape)
     if not check.IsValid():
         fixed_shape = None
@@ -693,6 +693,17 @@ def culprits(mesh, features, points):
                     key=lambda j: (len(features[j].facets), dist[j][i]))
             out.add(k)
     return sorted(out)
+
+
+def _invalid_blame(mesh, features, shape):
+    """When the volume is off: the patches next to faces that fail the validity check, if
+    any (OCC's volume of a solid with an invalid face can be thousands of cubic
+    millimetres out; with nothing blamed, the halving search can leave half the part's
+    curves out)."""
+    check = BRepCheck_Analyzer(shape)
+    if check.IsValid():
+        return []
+    return culprits(mesh, features, invalid_face_points(shape, check))
 
 
 def invalid_face_points(shape, check=None):

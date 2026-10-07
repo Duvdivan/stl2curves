@@ -16,13 +16,13 @@ approximation", CAGD 1988). The face is a B-spline surface sampled from the tube
 cross-sections laid out in a rotation-minimising frame (Wang, Juettler, Zheng and Liu,
 "Computation of rotation minimizing frames", ACM TOG 2008).
 """
+import functools
 import math
 
 import numpy as np
 import scipy.sparse as sp
 from scipy.interpolate import BSpline
 from scipy.sparse.csgraph import connected_components, minimum_spanning_tree, shortest_path
-from scipy.sparse.linalg import spsolve
 from scipy.spatial import cKDTree
 
 import freeform
@@ -39,6 +39,8 @@ ANGLE_MARGIN = math.radians(10)     # ...and how much further round it reaches
 SMOOTHING = 1e-6                # penalty weight on the spine's bending: only settles it where corners are sparse
 EVEN_SPEED = 0.01               # ...and (relative to that) on its speed changing
 MIN_FACETS = 100                # a pipe joining no two pieces must take in at least this many facets
+ORDER_LINKS = 6                 # ball centres are ordered along the spine through their nearest this many
+SEED_HELPERS = 3                # a piece too small to fit a tube alone tries this many neighbours with it
 NEAR = 0.3                      # radii: a piece this far off a chain's tube so far isn't tried with it
 GROW_COS = math.cos(math.radians(10))   # a facet a pipe takes in faces within 10 deg of it
 
@@ -194,27 +196,29 @@ def _knots(lo, hi, n, k=3):
     return np.r_[[lo] * k, np.linspace(lo, hi, n + 1), [hi] * k]
 
 
+@functools.lru_cache(maxsize=256)
 def _penalty(m):
     """Third differences of the control points (the bending changing: where corners are
     sparse, and past the last corners, the spine keeps curving as it did), and weakly
     second differences (the control points' spacing changing: past the last corners
-    nothing else keeps the spine's speed even)."""
-    out = sp.csr_matrix((3 * m, 3 * m))
-    D = sp.eye(m, format="csr")
+    nothing else keeps the spine's speed even). One coordinate's: they don't mix."""
+    out = np.zeros((m, m))
+    D = np.eye(m)
     for order in range(1, min(3, m - 1) + 1):
         D = D[1:] - D[:-1]
         if order >= 2:
-            out = out + (1.0 if order == 3 else EVEN_SPEED) * sp.kron(D.T @ D, sp.eye(3))
-    return out.tocsr()
+            out += (1.0 if order == 3 else EVEN_SPEED) * (D.T @ D)
+    out.flags.writeable = False
+    return out
 
 
 def _through(s, Q, t):
-    """Control points of the spline (knots t) passing closest to the points Q at s."""
+    """Control points of the spline (knots t) passing closest to the points Q at s
+    (each coordinate on its own: a small dense system, solved for all three at once)."""
     m = len(t) - 4
     B = BSpline.design_matrix(np.clip(s, t[3], t[-4]), t, 3).tocsr()
-    pen = _penalty(m)
-    A = sp.kron(B.T @ B, sp.eye(3)) + SMOOTHING * max(len(s) / m, 1.0) * pen + 1e-12 * sp.eye(3 * m)
-    return spsolve(A.tocsc(), (B.T @ Q).ravel()).reshape(m, 3)
+    A = (B.T @ B).toarray() + SMOOTHING * max(len(s) / m, 1.0) * _penalty(m) + 1e-12 * np.eye(m)
+    return np.linalg.solve(A, B.T @ Q)
 
 
 def _refine(P, s, t, C, r, steps=40):
@@ -243,7 +247,9 @@ def _refine(P, s, t, C, r, steps=40):
 def _order(Q, h):
     """A parameter for each of the points Q, which lie along one open curve: arc length
     along the longest path through a spanning tree of them (smoothed); None if they
-    don't form one open curve (a gap, a branch, a closed loop)."""
+    don't form one open curve (a branch, a closed loop). The tree links each point to
+    its nearest few whatever the distance: on a coarse mesh the corners lie far apart
+    along a fillet compared with its radius."""
     keys = np.floor(Q / h).astype(np.int64)
     _, inv = np.unique(keys, axis=0, return_inverse=True)
     inv = inv.ravel()
@@ -251,13 +257,13 @@ def _order(Q, h):
     R = np.zeros((n, 3))
     np.add.at(R, inv, Q)
     R /= np.bincount(inv, minlength=n)[:, None]
-    if n < 4:
+    if n < 2:
         return None
-    pairs = cKDTree(R).query_pairs(2.5 * h, output_type="ndarray")
-    if not len(pairs):
-        return None
-    w = np.linalg.norm(R[pairs[:, 0]] - R[pairs[:, 1]], axis=1) + 1e-9
-    tree = minimum_spanning_tree(sp.csr_matrix((w, (pairs[:, 0], pairs[:, 1])), shape=(n, n)))
+    k = min(ORDER_LINKS, n - 1)
+    dist, idx = cKDTree(R).query(R, k + 1)
+    rows = np.repeat(np.arange(n), k)
+    w = dist[:, 1:].ravel() + 1e-9
+    tree = minimum_spanning_tree(sp.csr_matrix((w, (rows, idx[:, 1:].ravel())), shape=(n, n)))
     if connected_components(tree, directed=False)[0] > 1:
         return None
     a = int(np.argmax(shortest_path(tree, directed=False, indices=0)))
@@ -270,7 +276,7 @@ def _order(Q, h):
         X[1:-1] = (X[:-2] + 2 * X[1:-1] + X[2:]) / 4
     step = np.linalg.norm(np.diff(X, axis=0), axis=1)
     length = float(step.sum())
-    if len(X) < 3 or length < 4 * h or np.linalg.norm(X[-1] - X[0]) < 0.2 * length:
+    if length < 4 * h or np.linalg.norm(X[-1] - X[0]) < 0.2 * length:
         return None         # (too short, or curling round into a loop)
     cum = np.r_[0.0, np.cumsum(step)]
     # each point's place along the path: its foot on the nearest of the segments
@@ -284,7 +290,7 @@ def _order(Q, h):
         dd = np.linalg.norm(Q - A - f[:, None] * AB, axis=1)
         better = dd < best_d
         best_d[better], best_s[better] = dd[better], (cum[j] + f * step[j])[better]
-    if best_d.max() > 4 * h:
+    if best_d.max() > max(4 * h, float(np.median(step))):
         return None         # (a branch off the path: not one curve)
     return best_s
 
@@ -479,9 +485,14 @@ def add_pipes(mesh, features):
             continue
         facets, model, dev, parts = got
         pieces = [k for k in parts if k in radius]
-        if len({surface[k] for k in pieces}) < 2 and (len(facets) < 1.5 * len(features[seed].facets)
-                                                      or len(facets) < MIN_FACETS):
+        if len({surface[k] for k in pieces}) < 2 and len(facets) < max(MIN_FACETS, 1.5 * len(features[seed].facets)):
             continue        # (one surface's pieces and little else: nothing to join)
+        # (nor if one of its pieces' own surfaces fits it all: a cylinder or torus with
+        # stray pieces of itself, which is no fillet along a curve)
+        P = mesh.pts[np.unique(np.concatenate([mesh.fverts[g] for g in facets]))]
+        if any(np.abs(features[k].model.signed(P)).max() <= FIT_DEV
+               for k in sorted(pieces, key=lambda k: -len(features[k].facets))[:3]):
+            continue
         used.update(parts)
         out.append(feature(mesh, model, facets, tuple(features[k] for k in parts), dev))
     mesh.__dict__.pop("_vn", None)      # (the mesh goes to every worker: no extra baggage)
@@ -498,7 +509,19 @@ def _chain(mesh, features, owner, seed, radius, used):
     members = set(features[seed].facets.tolist())
     model, dev = _fit_members(mesh, features, members, parts, r)
     if model is None:
-        return None
+        # (a piece too small to fit a tube alone, a few facets of a coarsely meshed
+        # fillet: with its biggest same-radius neighbours, one by one)
+        helpers = {int(owner[b]) for a in members for b in mesh.nbrs[a]}
+        helpers = sorted((k for k in helpers if k >= 0 and k != seed and k in radius and k not in used
+                          and abs(radius[k] - r) <= SAME_RADIUS * r), key=lambda k: -len(features[k].facets))
+        for k in helpers[:SEED_HELPERS]:
+            parts.append(k)
+            members.update(features[k].facets.tolist())
+            model, dev = _fit_members(mesh, features, members, parts, r)
+            if model is not None:
+                break
+        if model is None:
+            return None
     rejected = set()
     while True:
         near = {}
