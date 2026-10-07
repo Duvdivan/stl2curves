@@ -12,6 +12,7 @@ from collections import deque
 
 import numpy as np
 
+import extrude
 import freeform
 import pipes
 from features import Feature, Revolved, Sphere
@@ -147,8 +148,15 @@ def add_blends(mesh, features):
                  if (_radius(features[k].model, mesh.fcent[features[k].facets]) or 0) >= FREEFORM_MIN_RADIUS}
     soft = {a for a in range(nf) if (owner[a] in stand_ins if owner[a] >= 0
                                      else mesh.farea[a] <= small and mesh.nbrs[a])}
-    pieces = [p for area in _areas(mesh, soft, unit) for p in _freeform_pieces(mesh, area, unit)]
-    pieces = _absorb_strips(mesh, features, owner, pieces)
+    # (profiles pushed along a design direction first: a freeform patch would take
+    # their strips too, but as a surface that isn't one)
+    ext, ext_parts, ext_taken = extrude.add_extrusions(mesh, features, soft, owner, unit)
+    out += ext
+    dropped.update(ext_parts)
+    soft -= ext_taken
+    free -= ext_taken
+    pieces =[p for area in _areas(mesh, soft, unit) for p in _freeform_pieces(mesh, area, unit)]
+    pieces = _absorb_strips(mesh, features, owner, pieces, ext_parts)
     pieces = _grown(mesh, pieces, soft, unit)
     for facets, model, dev in pieces:
         parts = sorted({int(owner[a]) for a in facets if owner[a] >= 0})
@@ -223,7 +231,7 @@ def _freeform_pieces(mesh, facets, unit, depth=0):
     return out
 
 
-def _absorb_strips(mesh, features, owner, pieces):
+def _absorb_strips(mesh, features, owner, pieces, skip=()):
     """Freeform pieces with the narrow exact patches beside them taken in, where one
     surface fits both: a curvature-continuous fillet (a spline in the original) fits a
     cylinder exactly along a narrow band in its middle, with freeform pieces either side;
@@ -237,6 +245,8 @@ def _absorb_strips(mesh, features, owner, pieces):
     limit = math.cos(math.radians(CREASE_DEG))
     for k, f in enumerate(features):
         m = f.model
+        if k in skip:
+            continue
         if f.kind not in ("revolve", "trimmed") or not isinstance(m, (Revolved, Sphere))                 or _turn(mesh, f.facets) * 2 >= STRIP_DEG or (piece_of[f.facets] >= 0).any():
             continue
         # the pieces it meets smoothly

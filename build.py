@@ -16,7 +16,7 @@ import time
 
 import numpy as np
 from OCP.BRep import BRep_Builder, BRep_Tool
-from OCP.BRepBuilderAPI import (BRepBuilderAPI_MakeEdge, BRepBuilderAPI_MakeFace, BRepBuilderAPI_MakeWire,
+from OCP.BRepBuilderAPI import (BRepBuilderAPI_Copy, BRepBuilderAPI_MakeEdge, BRepBuilderAPI_MakeFace, BRepBuilderAPI_MakeWire,
                                 BRepBuilderAPI_Sewing, BRepBuilderAPI_MakeVertex)
 from OCP.BRepPrimAPI import BRepPrimAPI_MakeRevol, BRepPrimAPI_MakeSphere, BRepPrimAPI_MakeBox
 from OCP.BRepAlgoAPI import BRepAlgoAPI_Common, BRepAlgoAPI_Splitter
@@ -37,7 +37,7 @@ from OCP.GeomLProp import GeomLProp_SLProps
 from OCP.BRepFill import BRepFill_Filling
 from OCP.GeomAbs import GeomAbs_C0
 from OCP.ShapeFix import ShapeFix_Face, ShapeFix_Shape
-from OCP.TopAbs import TopAbs_EDGE, TopAbs_FACE, TopAbs_SHELL, TopAbs_REVERSED
+from OCP.TopAbs import TopAbs_COMPOUND, TopAbs_EDGE, TopAbs_FACE, TopAbs_SHELL, TopAbs_REVERSED
 from OCP.TopExp import TopExp, TopExp_Explorer
 from OCP.TopoDS import TopoDS, TopoDS_Compound, TopoDS_Iterator, TopoDS_Shape
 from OCP.BRepTools import BRepTools, BRepTools_ReShape
@@ -258,6 +258,7 @@ class Edges:
 
 
 LONG_STEP = 3.0     # a step this many times the run's typical one gets points along it
+PARALLEL_CUTS = 8   # patches: this many faces to cut at once go to the worker processes
 OUTLINE_FIRST = 300     # facets: a freeform patch this big gets its face from its outline first
 
 
@@ -294,7 +295,7 @@ def _run_edge(edges, bounds, tag, ids, patch_side=False):
         # (a smooth blend's or freeform surface's face is fitted to its outline, so the
         # chord serves it; a bow would leave the flat face beside it an edge off its plane,
         # which then won't merge with the flat faces round it)
-        if not patch_side or bounds[k].f.kind == "blend" or bounds[k].m.kind in ("freeform", "pipe"):
+        if not patch_side or bounds[k].f.kind == "blend" or bounds[k].m.kind in ("freeform", "pipe", "extrusion"):
             return _line(edges.pts[ids[0]], edges.pts[ids[1]])
         m = bounds[k].m
         a, b = edges.pts[ids[0]], edges.pts[ids[1]]
@@ -623,7 +624,7 @@ def _generous_surface(feature, bound, mesh, exact=True):
     m = feature.model
     if isinstance(m, Sphere):
         return _sphere_face(m.c, m.r, [mesh.fn[f] for f in feature.facets])
-    if m.kind in ("freeform", "pipe"):
+    if m.kind in ("freeform", "pipe", "extrusion"):
         return m.face()     # (fitted with a margin all round already)
     lo, hi, u0, span = feature.lo, feature.hi, feature.u0, feature.span
     if m.line:
@@ -819,7 +820,15 @@ def _facing_against(face, mesh):
 def _trimmed_face(feature, k, bound, mesh, owner, bounds, edge_tri, edges, tol):
     """A patch cut to an arbitrary outline: split a generous piece of its surface along
     the outline edges and keep the piece the patch's facets lie on."""
-    m = feature.model
+    outline = _trimmed_outline(feature, k, mesh, owner, bounds, edge_tri, edges)
+    if outline is None:
+        return None
+    return _trimmed_cut(feature, bound, mesh, *outline, tol)
+
+
+def _trimmed_outline(feature, k, mesh, owner, bounds, edge_tri, edges):
+    """(tools, loops, per_loop): the patch's outline loops of mesh vertices and their edges
+    (shared with the faces beside it through edges), or None."""
     tris = np.concatenate([mesh.tris[mesh.ftris[f]] for f in feature.facets])
     loops = _loops(tris)
     if not loops:
@@ -835,6 +844,13 @@ def _trimmed_face(feature, k, bound, mesh, owner, bounds, edge_tri, edges, tol):
                 return None
             tools.append(edge)
             per_loop[-1].append(edge)
+    return tools, loops, per_loop
+
+
+def _trimmed_cut(feature, bound, mesh, tools, loops, per_loop, tol):
+    """The patch's face cut from a generous piece of its surface by its outline edges (the
+    slow part: run in worker processes when there are many, see _cut_all)."""
+    m = feature.model
     # (a torus made directly doesn't always cut where its swept twin does: then the
     # same surface as a swept profile)
     swept = isinstance(m, Revolved) and _plain_torus(m, feature.lo, feature.hi)
@@ -844,8 +860,11 @@ def _trimmed_face(feature, k, bound, mesh, owner, bounds, edge_tri, edges, tol):
             return None
         # (a big freeform surface's outline is laid on it first: splitting a big B-spline
         # surface along hundreds of outline edges took minutes a face on a fine mesh, and
-        # often failed; a small one is split, which suits the faces beside it better)
-        if m.kind in ("freeform", "pipe") and len(feature.facets) >= OUTLINE_FIRST:
+        # often failed; a small one is split, which suits the faces beside it better. A
+        # pipe's always: its degree-8 tube took the splitter 78 s to fail on, and on the
+        # GPS case 165 of 177 pipes built from their outline, 117 by splitting, ten times
+        # slower)
+        if m.kind == "pipe" or (m.kind in ("freeform", "extrusion") and len(feature.facets) >= OUTLINE_FIRST):
             face = _outline_face(feature, mesh, base, loops, per_loop)
             if face is None:
                 face = _split_face(feature, mesh, base, tools, loops, tol)
@@ -858,6 +877,72 @@ def _trimmed_face(feature, k, bound, mesh, owner, bounds, edge_tri, edges, tol):
         if face is not None:
             return face
     return None
+
+
+def _cut_job(job):
+    """In a worker process: _trimmed_cut for one patch, its outline edges read from and
+    its face written to BRep files."""
+    mesh_key, feature, tools_path, counts, loops, tol, face_path = job
+    import workers
+    mesh = workers.load(mesh_key)
+    comp = TopoDS_Shape()
+    BRepTools.Read_s(comp, tools_path, BRep_Builder())
+    tools, it = [], TopoDS_Iterator(comp)
+    while it.More():
+        tools.append(TopoDS.Edge(it.Value()))
+        it.Next()
+    per_loop, i = [], 0
+    for n in counts:
+        per_loop.append(tools[i:i + n])
+        i += n
+    try:
+        face = _trimmed_cut(feature, Boundary(feature, 10 * tol), mesh, tools, loops, per_loop, tol)
+    except Exception:
+        face = None
+    return face is not None and BRepTools.Write_s(face, face_path)
+
+
+def _cut_all(mesh, jobs, tol):
+    """Run _trimmed_cut for many patches [(key, feature, tools, loops, per_loop)] in the
+    worker processes: {key: face or None}. Keys missing from the answer (no workers, or
+    they broke down) are left for the caller to cut here."""
+    out = {}
+    pool = workers.get()
+    if pool is None or len(jobs) < PARALLEL_CUTS:
+        return out
+    tmp = tempfile.mkdtemp(prefix="stl2curves_")
+    try:
+        if "shared_as" not in mesh.__dict__:
+            mesh.shared_as = workers.share(mesh)
+        futures = {}
+        for i, (key, feature, tools, loops, per_loop) in enumerate(jobs):
+            comp = TopoDS_Compound()
+            builder = BRep_Builder()
+            builder.MakeCompound(comp)
+            for edge in tools:
+                builder.Add(comp, edge)
+            tools_path, face_path = os.path.join(tmp, f"{i}_in.brep"), os.path.join(tmp, f"{i}_out.brep")
+            BRepTools.Write_s(comp, tools_path)
+            job = (mesh.shared_as, feature, tools_path, [len(x) for x in per_loop], loops, tol, face_path)
+            futures[pool.submit(_cut_job, job)] = (key, face_path)
+        for f, (key, face_path) in futures.items():
+            if f.exception() is not None:
+                continue
+            face = None
+            if f.result():
+                shape = TopoDS_Shape()
+                BRepTools.Read_s(shape, face_path, BRep_Builder())
+                if shape.ShapeType() == TopAbs_FACE:
+                    face = TopoDS.Face(shape)
+                elif TopExp_Explorer(shape, TopAbs_FACE).More():
+                    face = shape        # (a patch in several pieces: their compound)
+            out[key] = face
+    except Exception:
+        out = {}                        # (the worker processes broke down: cut them here)
+        workers.broken()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    return out
 
 
 def _outline_face(feature, mesh, base, loops, per_loop):
@@ -877,7 +962,10 @@ def _outline_face(feature, mesh, base, loops, per_loop):
             w.Add(e)
         if not w.IsDone():
             return None
-        wires.append(w.Wire())
+        # (a copy: ShapeFix widens the tolerances of the edges it is given, in place, even
+        # when the face then fails; these are shared with the faces beside it, so one
+        # failed fallback changed its neighbours, and how the part sewed)
+        wires.append(TopoDS.Wire(BRepBuilderAPI_Copy(w.Wire()).Shape()))
     for flip in (False, True):
         ws = [TopoDS.Wire(w.Reversed()) for w in wires] if flip else wires
         maker = BRepBuilderAPI_MakeFace(surface, ws[0], False)
@@ -1508,20 +1596,44 @@ def build_faces(mesh, features, tol):
     builder.MakeCompound(comp)
     failed, shells = [], []
     edges = Edges(mesh.pts)
-    for k, (f, bound) in enumerate(zip(features, bounds)):
+    keys = []
+    for f in features:
         if "_across" not in f.__dict__:
             f._across = np.setdiff1d(np.unique(np.concatenate([across[x] for x in f.facets])), f.facets)
-        key = ("patch", id(f), who(f._across))
+        keys.append(("patch", id(f), who(f._across)))
+    # The new trimmed patches' outlines first, and the new blends' faces, in the patches'
+    # order (an outline run two patches share is built once, by whichever comes first):
+    # then the trimmed faces are cut from their surfaces all at once in the worker
+    # processes (cutting is slow, and one patch at a time took minutes on a big part).
+    outlines, early = {}, {}
+    for k, (f, bound) in enumerate(zip(features, bounds)):
+        if keys[k] in cache or f.model.kind == "thread":
+            continue
+        try:
+            if f.kind == "trimmed":
+                outlines[k] = _trimmed_outline(f, k, mesh, owner, bounds, edge_tri, edges)
+            elif f.kind == "blend":
+                early[k] = [_blend_face(f, k, mesh, owner, bounds, edge_tri, edges)]
+        except Exception:
+            early[k] = [None]
+    cut = _cut_all(mesh, [(k, features[k], *o) for k, o in outlines.items() if o is not None], tol)
+    for k, (f, bound) in enumerate(zip(features, bounds)):
+        key = keys[k]
         if key in cache:
             faces = cache[key]
+        elif k in early:
+            faces = early[k]
         else:
             try:
                 if f.model.kind == "thread":
                     faces = [_thread_face(f, k, mesh, owner, bounds, edge_tri)]
                 elif f.kind == "trimmed":
-                    faces = [_trimmed_face(f, k, bound, mesh, owner, bounds, edge_tri, edges, tol)]
-                elif f.kind == "blend":
-                    faces = [_blend_face(f, k, mesh, owner, bounds, edge_tri, edges)]
+                    if outlines.get(k) is None:
+                        faces = [None]
+                    elif k in cut:
+                        faces = [cut[k]]
+                    else:
+                        faces = [_trimmed_cut(f, bound, mesh, *outlines[k], tol)]
                 else:
                     faces = _patch_faces(f, bound, mesh)
             except Exception:

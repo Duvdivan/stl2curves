@@ -167,6 +167,10 @@ as BRep files, the mesh once per pass via `workers.share`/`load`. What runs ther
   and big regions in slices whose answers are replayed in order. The result must stay
   **identical** to the sequential run: check with an analysis fingerprint (md5 of the
   features' sorted facets) on Rak N and the full toolbox after any change there.
+- Cutting trimmed faces from their surfaces (`build._cut_all`): outlines are worked out
+  in the main process in patch order (`_trimmed_outline`; a run two patches share is
+  built once, by whichever comes first), the slow cut (`_trimmed_cut`) in the workers.
+  The first build of the GPS case went from 148 s to 12 s.
 - Blend fills (each capped at `FILL_SECONDS`) and their fit checks (`_assess_blend`),
   the bare-facet build (`_bare_ahead`), and the final fuse (capped at `FUSE_SECONDS`).
 - `TIME_LIMIT` (`--time-limit`) only stops optional refinement (blends, culprit search,
@@ -245,6 +249,25 @@ Key contracts:
 - A smooth area that fits only with a dense knot grid has a crease or a tight round
   inside it: capping control points by corner count (and splitting) beat refining
   (131x131 control points made the splitter take minutes per face).
+- Never hand shared outline edges to ShapeFix (or anything that mends shapes): it widens
+  their tolerances in place, even when the face it builds then fails, and the faces
+  beside them change with it. That made every build depend on the order faces were
+  built in (the same cut twice gave different faces; workers, with fresh copies, gave
+  different parts). `_outline_face` works on copies. Check with a cut-twice test.
+- OCC's splitter on a degree-8 swept-fillet surface took 78 s to fail where laying the
+  outline on it took 0.1 s: pipes get their face from their outline first.
+- Sewing costs ~1 s per 1,000 faces whatever the options; faces share no edges before
+  it. Re-sewing an already sewn shell takes 0.4 s, but sewing changed faces into a
+  shell with holes did not join them (an idea for incremental sewing, not working yet).
+- Blaming every patch near trouble that recurs (85-100% of each round's trouble lies
+  within 1 mm of an earlier round's) cut rounds but lost curves and no time (GPS 8,598
+  -> 11,805 faces): more faces make every later sew slower.
+- `extrude.py` (profiles pushed along a design direction) is switched off
+  (`ENABLED`): on the GPS case its few patches mostly failed and took neighbours with
+  them. To try on parts made of extruded profiles (gears, cams).
+- ShapeFix_Solid can split a zero-volume bubble (two faces lying on each other) off as a
+  second shell of the solid: invalid with every face valid and nothing to blame
+  (`_without_empty_shells`).
 - Big multi-body meshes sew into hundreds of zero-volume shells (coincident face pairs);
   `solids_from_shells` drops them (`EMPTY_SHELL`), or body counts and fuses go wrong.
 

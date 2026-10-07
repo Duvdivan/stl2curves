@@ -92,6 +92,7 @@ BARE_AHEAD = 5000       # facets from which the bare-facet build is made ahead, 
 WORKERS_FROM = 5000     # triangles from which a part is worth starting worker processes for
 BARE_DRIFT = 1e-4       # share of a sound mesh's volume its bare facets may differ by and still be a reference
 TESS_DEFLECTION = 0.0005    # mm: how closely a solid's faces are tessellated to measure its volume
+VOLUME_EPS = 1e-5       # relative precision of the volume integration
 TESS_SPECK = 0.05       # mm^2: a face this small that won't tessellate is left out of that measure
 LOOSE_EDGE = 3.0        # an edge whose tolerance is this many times the sewing's strays from its faces
 FILE_VOLUME = 1e-3      # share of the volume a finished part's STEP file may read back off by
@@ -119,9 +120,10 @@ def count(shape, kind):
 
 def volume(shape):
     # adaptive integration: the default's fixed sample points undercount long spline
-    # faces (a thread flank winding five turns came out ~80 mm^3 short)
+    # faces (a thread flank winding five turns came out ~80 mm^3 short); 1e-5 is within
+    # 0.005 mm^3 of 1e-6 on a 16,000 mm^3 part, and a fifth quicker
     props = GProp_GProps()
-    BRepGProp.VolumeProperties_s(shape, props, 1e-6)
+    BRepGProp.VolumeProperties_s(shape, props, VOLUME_EPS)
     return props.Mass()
 
 
@@ -219,6 +221,7 @@ def solids_from_shells(sewn, inward=True):
                 ex.Next()
                 continue                    # not a closed piece: ignore it
             solid = TopoDS.Solid(ex2.Current())
+        solid = _without_empty_shells(solid)
         v = volume(solid)
         if v < 0:
             solid = TopoDS.Solid(solid.Reversed())
@@ -303,6 +306,27 @@ def solids_from_shells(sewn, inward=True):
     # checked out, see fuse_overlapping; on an assembly of many bodies it is slow)
     solid = solids[0] if len(solids) == 1 else compound(solids)
     return solid, len(solids), len(cavities), total
+
+
+def _without_empty_shells(solid):
+    """The solid less any shell in it with next to no volume. Sewing can join a bubble of
+    two faces lying on each other (tiny sphere pieces, a fifth of a millimetre across) to
+    the part's shell; ShapeFix then splits it off as a second shell of the same solid,
+    which makes the solid invalid with every face in it valid, and nothing to blame."""
+    shells, ex = [], TopExp_Explorer(solid, TopAbs_SHELL)
+    while ex.More():
+        shells.append(TopoDS.Shell(ex.Current()))
+        ex.Next()
+    if len(shells) < 2:
+        return solid
+    sizes = [abs(volume(BRepBuilderAPI_MakeSolid(s).Solid())) for s in shells]
+    keep = [s for s, v in zip(shells, sizes) if v > EMPTY_SHELL * max(sizes)]
+    if len(keep) == len(shells):
+        return solid
+    maker = BRepBuilderAPI_MakeSolid()
+    for s in keep:
+        maker.Add(s)
+    return maker.Solid()
 
 
 def inward_shells(mesh):
@@ -399,7 +423,7 @@ def _fuse_checked(args, tools, low, high):
         fused = boolean(BRepAlgoAPI_Fuse, args, tools)
     except RuntimeError:
         return None
-    if count(fused, TopAbs_FACE) and BRepCheck_Analyzer(fused).IsValid() and low <= volume(fused) <= high:
+    if count(fused, TopAbs_FACE) and BRepCheck_Analyzer(fused, True, True).IsValid() and low <= volume(fused) <= high:
         return fused
     return None
 
@@ -462,9 +486,9 @@ def attempt(mesh, features, mesh_tol, tol, fuse, faceted_volume):
         if abs(signed - expected) > allowed + slack:
             attempt.why = "volume2"
             return None, _invalid_blame(mesh, features, shape, sewing)
-    check = BRepCheck_Analyzer(shape)
+    check = BRepCheck_Analyzer(shape, True, True)
     if not check.IsValid():
-        fixed_shape = None
+        mended = None
         if not mesh.__dict__.get("defective"):      # (no repair mends a mesh that crosses itself)
             # (a straight edge running on tangent into an arc can pass for a crossing at
             # the default precision; a coarser one, still far below the sewing, mends it)
@@ -474,11 +498,11 @@ def attempt(mesh, features, mesh_tol, tol, fuse, faceted_volume):
                     fix.SetPrecision(precision)
                 fix.Perform()
                 fixed_shape = fix.Shape()
-                if BRepCheck_Analyzer(fixed_shape).IsValid() and abs(volume(fixed_shape) - expected) <= allowed:
+                if BRepCheck_Analyzer(fixed_shape, True, True).IsValid() and abs(volume(fixed_shape) - expected) <= allowed:
+                    mended = fixed_shape
                     break
-        if (fixed_shape is not None and BRepCheck_Analyzer(fixed_shape).IsValid()
-                and abs(volume(fixed_shape) - expected) <= allowed):
-            shape = fixed_shape
+        if mended is not None:
+            shape = mended
         else:
             # patches next to faces that came out invalid: drop just those and try again
             blame = culprits(mesh, features, invalid_face_points(shape, check))
@@ -540,7 +564,7 @@ def file_trouble(shape, allowed):
         return []
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
-    check = BRepCheck_Analyzer(back)
+    check = BRepCheck_Analyzer(back, True, True)
     # (a reader may split a face in two: harmless, so faces aren't counted)
     if check.IsValid() and abs(volume(back) - volume(shape)) <= allowed:
         return None
@@ -654,7 +678,7 @@ def _bare(mesh, tol):
     sewn, free = sew(comp, tol, shells)
     try:
         shape, bodies, _, vol = solids_from_shells(sewn, inward_shells(mesh))
-        return bool(free) or not BRepCheck_Analyzer(shape).IsValid(), vol, bodies
+        return bool(free) or not BRepCheck_Analyzer(shape, True, True).IsValid(), vol, bodies
     except RuntimeError:
         return True, None, 0
 
@@ -719,7 +743,7 @@ def _invalid_blame(mesh, features, shape, sewing):
     tens of cubic millimetres off. And those next to faces that wouldn't tessellate: the
     volume can't be measured again without them (OCC's integration 17 mm^3 off, the
     tessellation of the rest right)."""
-    check = BRepCheck_Analyzer(shape)
+    check = BRepCheck_Analyzer(shape, True, True)
     if not check.IsValid():
         blame = culprits(mesh, features, invalid_face_points(shape, check))
         if blame:
@@ -838,7 +862,7 @@ def _build(mesh, features, mesh_tol, tol, fuse, info):
                         back += carved
                         continue
                     halves = blend_fallback(mesh, f)
-                elif f.model.kind == "pipe":
+                elif f.model.kind in ("pipe", "extrusion"):
                     halves = pipe_fallback(mesh, f)     # (its pieces as they were, blends between)
                 elif attempt.blamed:
                     halves = None
@@ -1045,13 +1069,13 @@ def _stl_to_solid(path, tol, fuse=True, curves=True, true_size=False, blends=Tru
     shape, untidy = tidied(checked, target)
     if shape is None:
         shape = checked
-    if not BRepCheck_Analyzer(shape).IsValid():
-        if BRepCheck_Analyzer(checked).IsValid():
+    if not BRepCheck_Analyzer(shape, True, True).IsValid():
+        if BRepCheck_Analyzer(checked, True, True).IsValid():
             shape = checked
         else:
             sf = ShapeFix_Shape(checked)
             sf.Perform()
-            if BRepCheck_Analyzer(sf.Shape()).IsValid():
+            if BRepCheck_Analyzer(sf.Shape(), True, True).IsValid():
                 shape = sf.Shape()
             elif untidy is not None:
                 shape = untidy      # (no worse than the shape as checked, and tidier)
@@ -1071,7 +1095,7 @@ def _stl_to_solid(path, tol, fuse=True, curves=True, true_size=False, blends=Tru
     if not info["faces"]:
         raise RuntimeError("the solid came out empty")
     info["volume"] = volume(shape)
-    info["valid"] = BRepCheck_Analyzer(shape).IsValid()
+    info["valid"] = BRepCheck_Analyzer(shape, True, True).IsValid()
     return shape, info
 
 
@@ -1143,7 +1167,7 @@ def _tidy(checked, target):
             except Exception:
                 break
             if abs(volume(tidy) - target) <= UNIFY_VOLUME * abs(target) + 1e-3:
-                if BRepCheck_Analyzer(tidy).IsValid():
+                if BRepCheck_Analyzer(tidy, True, True).IsValid():
                     return tidy, untidy
                 untidy = untidy or tidy
             more = _bad_merges(checked, unify)
@@ -1157,7 +1181,7 @@ def _bad_merges(checked, unify):
     """The edges inside each merged face that came out invalid (between the faces it
     was merged from)."""
     merged = unify.Shape()
-    check = BRepCheck_Analyzer(merged)
+    check = BRepCheck_Analyzer(merged, True, True)
     history = unify.History()
     index = IndexedMap_TopoDS_Shape_TopTools_ShapeMapHasher()
     TopExp.MapShapes_s(merged, TopAbs_FACE, index)
