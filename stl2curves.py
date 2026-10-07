@@ -92,6 +92,8 @@ BARE_AHEAD = 5000       # facets from which the bare-facet build is made ahead, 
 WORKERS_FROM = 5000     # triangles from which a part is worth starting worker processes for
 BARE_DRIFT = 1e-4       # share of a sound mesh's volume its bare facets may differ by and still be a reference
 TESS_DEFLECTION = 0.0005    # mm: how closely a solid's faces are tessellated to measure its volume
+TESS_SPECK = 0.05       # mm^2: a face this small that won't tessellate is left out of that measure
+LOOSE_EDGE = 3.0        # an edge whose tolerance is this many times the sewing's strays from its faces
 FILE_VOLUME = 1e-3      # share of the volume a finished part's STEP file may read back off by
 FILE_MATCH = 0.05       # mm (and share): how far a face's middle or outline may move read back from the file
 FILE_AREA = 0.5         # mm^2 (plus half a percent): how much a face's area may change read back from the file
@@ -129,7 +131,9 @@ def tessellated_volume(shape):
     sewing joined edges a few hundredths of a millimetre apart (a curved patch's outline
     bowed onto its surface, the flat facet beside it keeping the straight chord) the
     faces don't quite meet, and the integration can come out several mm^3 off, one way
-    or the other. The tessellation follows the shared edges, so it closes up."""
+    or the other. The tessellation follows the shared edges, so it closes up.
+    tessellated_volume.untessellated: a point on each face (bar specks) that wouldn't."""
+    tessellated_volume.untessellated = []
     BRepTools.Clean_s(shape)
     BRepMesh_IncrementalMesh(shape, TESS_DEFLECTION, False, 0.1, True)
     box = Bnd_Box()
@@ -144,8 +148,13 @@ def tessellated_volume(shape):
         loc = TopLoc_Location()
         tri = BRep_Tool.Triangulation_s(face, loc)
         if tri is None:
-            BRepTools.Clean_s(shape)
-            return None
+            # (a speck of a face, a sliver the sewing all but closed: nothing to measure)
+            props = GProp_GProps()
+            BRepGProp.SurfaceProperties_s(face, props)
+            if abs(props.Mass()) >= TESS_SPECK:
+                c = props.CentreOfMass()
+                tessellated_volume.untessellated.append((c.X(), c.Y(), c.Z()))
+            continue
         move = loc.Transformation()
         P = np.array([(n.X(), n.Y(), n.Z()) for n in (tri.Node(i).Transformed(move) for i in range(1, tri.NbNodes() + 1))])
         T = np.array([tri.Triangle(i).Get() for i in range(1, tri.NbTriangles() + 1)]) - 1
@@ -153,7 +162,10 @@ def tessellated_volume(shape):
         v = np.einsum("ij,ij->i", P[T[:, 0]], np.cross(P[T[:, 1]], P[T[:, 2]])).sum() / 6
         total += -v if face.Orientation() == TopAbs_REVERSED else v
     BRepTools.Clean_s(shape)
-    return float(total)
+    return None if tessellated_volume.untessellated else float(total)
+
+
+tessellated_volume.untessellated = []
 
 
 def fixed(solid):
@@ -407,7 +419,8 @@ def attempt(mesh, features, mesh_tol, tol, fuse, faceted_volume):
         return None, failed
     attempt.blamed = True
     worst = max((f.worst for f in features), default=0.0)
-    sewn, free = sew(comp, max(tol, min(0.2, 1.5 * worst)), shells)
+    sewing = max(tol, min(0.2, 1.5 * worst))
+    sewn, free = sew(comp, sewing, shells)
     if free:
         # patches whose faces left gaps: drop just those and try again
         attempt.why = "free"
@@ -424,6 +437,7 @@ def attempt(mesh, features, mesh_tol, tol, fuse, faceted_volume):
     change = sum(f.change for f in features)
     expected = faceted_volume + change
     allowed = sum(f.tolerance for f in features) + 1e-6 * abs(faceted_volume) + 1e-3
+    tessellated_volume.untessellated = []
     if abs(signed - expected) > allowed:
         # (OCC's integration can be off where the sewing closed wide gaps: measured
         # again from the faces' tessellation, which follows the edges they share)
@@ -440,14 +454,14 @@ def attempt(mesh, features, mesh_tol, tol, fuse, faceted_volume):
         # the bare build itself going wrong, and is no reference)
         if drift is None or (not defective and drift > BARE_DRIFT * abs(faceted_volume) + 1e-3):
             attempt.why = "volume"
-            return None, _invalid_blame(mesh, features, shape)
+            return None, _invalid_blame(mesh, features, shape, sewing)
         expected = mesh.bare_volume + change
         # (a defective mesh give or take what the defect itself does: it sews a little
         # differently each time)
         slack = drift if defective else 0.0
         if abs(signed - expected) > allowed + slack:
             attempt.why = "volume2"
-            return None, _invalid_blame(mesh, features, shape)
+            return None, _invalid_blame(mesh, features, shape, sewing)
     check = BRepCheck_Analyzer(shape)
     if not check.IsValid():
         fixed_shape = None
@@ -695,15 +709,38 @@ def culprits(mesh, features, points):
     return sorted(out)
 
 
-def _invalid_blame(mesh, features, shape):
+def _invalid_blame(mesh, features, shape, sewing):
     """When the volume is off: the patches next to faces that fail the validity check, if
     any (OCC's volume of a solid with an invalid face can be thousands of cubic
     millimetres out; with nothing blamed, the halving search can leave half the part's
-    curves out)."""
+    curves out). Failing that, those next to edges far looser than the sewing: an edge
+    that strays from the faces beside it (a spline swinging 0.9 mm off a straight run)
+    leaves the solid valid, OCC having widened its tolerance to match, but its volume
+    tens of cubic millimetres off. And those next to faces that wouldn't tessellate: the
+    volume can't be measured again without them (OCC's integration 17 mm^3 off, the
+    tessellation of the rest right)."""
     check = BRepCheck_Analyzer(shape)
-    if check.IsValid():
-        return []
-    return culprits(mesh, features, invalid_face_points(shape, check))
+    if not check.IsValid():
+        blame = culprits(mesh, features, invalid_face_points(shape, check))
+        if blame:
+            return blame
+    return culprits(mesh, features, loose_edge_points(shape, LOOSE_EDGE * sewing)
+                    + tessellated_volume.untessellated)
+
+
+def loose_edge_points(shape, tol):
+    """Points along each edge whose tolerance is over tol."""
+    out = []
+    edges = IndexedMap_TopoDS_Shape_TopTools_ShapeMapHasher()
+    TopExp.MapShapes_s(shape, TopAbs_EDGE, edges)
+    for i in range(1, edges.Extent() + 1):
+        edge = TopoDS.Edge(edges.FindKey(i))
+        if BRep_Tool.Tolerance_s(edge) > tol and not BRep_Tool.Degenerated_s(edge):
+            c = BRepAdaptor_Curve(edge)
+            for t in np.linspace(c.FirstParameter(), c.LastParameter(), 5):
+                p = c.Value(t)
+                out.append((p.X(), p.Y(), p.Z()))
+    return out
 
 
 def invalid_face_points(shape, check=None):

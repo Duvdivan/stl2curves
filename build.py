@@ -265,10 +265,12 @@ def _even(pts, closed):
     """The run's points with points added along its long steps. A tessellator puts few
     points on a straight stretch and many round a bend; a spline through such a run
     swings far out between the sparse ones (half a millimetre off a bend's straight
-    run-out), and no surface it should lie on contains it."""
+    run-out), and no surface it should lie on contains it. On a run of a few steps the
+    shortest is the measure (two steps, 48 mm and 1 mm: the median, their mean, made
+    neither long, and the spline swung 0.9 mm off the straight)."""
     ring = np.vstack([pts, pts[:1]]) if closed else pts
     step = np.linalg.norm(np.diff(ring, axis=0), axis=1)
-    typical = float(np.median(step))
+    typical = float(np.median(step)) if len(step) > 3 else float(step.min())
     if step.max() <= LONG_STEP * typical:
         return pts
     out = []
@@ -1582,7 +1584,10 @@ def _without_collapsed(shape, tol):
     """The sewn shape less the edges sewing closed up: a sliver triangle's side, shorter
     than the sewing tolerance, whose two ends were merged into one vertex. Left in, the
     face beside it pinches into a loop that ShapeFix splits off as a face of its own, and
-    a STEP reader takes such an edge for the whole circle (or curve) it lies on."""
+    a STEP reader takes such an edge for the whole circle (or curve) it lies on. A face
+    whose every edge went (a sliver narrower than the sewing tolerance) goes too: with no
+    outline it is the whole unbounded plane, which spoils the solid's volume and validity
+    with nothing near to blame."""
     edges = IndexedMap_TopoDS_Shape_TopTools_ShapeMapHasher()
     TopExp.MapShapes_s(shape, TopAbs_EDGE, edges)
     reshape = None
@@ -1597,7 +1602,18 @@ def _without_collapsed(shape, tol):
             if reshape is None:
                 reshape = BRepTools_ReShape()
             reshape.Remove(e)
-    return shape if reshape is None else reshape.Apply(shape)
+    if reshape is None:
+        return shape
+    shape = reshape.Apply(shape)
+    bare = None
+    ex = TopExp_Explorer(shape, TopAbs_FACE)
+    while ex.More():
+        if not TopExp_Explorer(ex.Current(), TopAbs_EDGE).More():
+            if bare is None:
+                bare = BRepTools_ReShape()
+            bare.Remove(ex.Current())
+        ex.Next()
+    return shape if bare is None else bare.Apply(shape)
 
 
 def point_facet_distance(mesh, facets, points):
