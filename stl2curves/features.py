@@ -866,7 +866,7 @@ def analyze(pts, tris):
     # tries surfaces round known axes (a thread's crest, root and flanks lie close to a
     # cylinder or cone on its own axis, which is often a hole's too) or the loose pass
     # (which would take pieces of them for cylinders and cones)
-    import threads
+    from . import threads
     free = [region.facets[region.free] for region in regions]
     screws = []
     for thread, fids in threads.find(mesh, np.concatenate(free) if free else np.zeros(0, int)):
@@ -884,7 +884,7 @@ def analyze(pts, tris):
     # radius to find, with radii found already (holes, pins, rounded corners) as the
     # likeliest. Before pass 1, which would cut a coarsely meshed fillet into strips
     # that each fit some cylinder of their own.
-    import fillets
+    from . import fillets
     taken = np.zeros(len(mesh.farea), bool)
     for f in features + screws:
         taken[f.facets] = True
@@ -1176,7 +1176,7 @@ def _seed_pass(mesh, regions, how):
     work = [k for k, r in enumerate(regions) if r.free.sum() >= 2]
     results, pool, jobs = {}, None, {}
     if sum(int(regions[k].free.sum()) for k in work) >= PARALLEL_FACETS:
-        import workers
+        from . import workers
         pool = workers.get()
     if how[0] == "axis" or how[1] is not None:         # (passes that start with nothing explored)
         for region in regions:
@@ -1303,7 +1303,7 @@ def _seed_region(mesh, region, how):
 
 def _worker_region(mesh_key, state_key, k):
     """In a worker: region k of the shared mesh as it stood when the pass began."""
-    import workers
+    from . import workers
     mesh = workers.load(mesh_key)
     facets, nbrs, free, explored, fits = workers.load(state_key)[k]
     if workers.memo.get("state") != state_key:
@@ -1509,7 +1509,7 @@ def snap(mesh, features, round_unit=None):
     """Design intent: equal radii made exactly equal, near-axis-aligned axes made exact,
     and (with round_unit "mm" or "inch") radii set to round values. Each change is kept
     only if the patch's mesh corners still lie on the surface; otherwise it is undone."""
-    from sizing import roundness, INCH
+    from .sizing import roundness, INCH
     tol = 2 * _tol()
     points = [mesh.pts[np.unique(np.concatenate([mesh.fverts[f] for f in x.facets]))] for x in features]
     changed = 0

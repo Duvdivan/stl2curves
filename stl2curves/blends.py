@@ -12,10 +12,10 @@ from collections import deque
 
 import numpy as np
 
-import extrude
-import freeform
-import pipes
-from features import Feature, Revolved, Sphere
+from . import extrude
+from . import freeform
+from . import pipes
+from .features import Feature, Revolved, Sphere
 
 SMOOTH_DEG = 50       # facets bending less than this meet smoothly
 SPREAD_DEG = 40       # one blend face turns at most this far from its first facet and its mean direction

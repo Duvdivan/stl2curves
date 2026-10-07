@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stl2curves"
+dynamic = ["version"]
+description = "Convert STL meshes and 3MF projects into solid STEP files with true curved surfaces"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+# cadquery-ocp 8 publishes wheels for CPython 3.11-3.14 on Windows, macOS and Linux,
+# and brings vtk (used by stl2curves-render) along.
+dependencies = ["cadquery-ocp>=8.0", "numpy", "scipy"]
+keywords = ["stl", "step", "mesh", "cad", "reverse-engineering", "3d-printing", "opencascade"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Multimedia :: Graphics :: 3D Modeling",
+]
+
+[project.scripts]
+stl2curves = "stl2curves.convert:main"
+stl2curves-render = "stl2curves.render:main"
+
+[project.urls]
+Homepage = "https://github.com/Duvdivan/stl2curves"
+Issues = "https://github.com/Duvdivan/stl2curves/issues"
+
+[tool.setuptools]
+packages = ["stl2curves"]
+
+[tool.setuptools.dynamic]
+version = { attr = "stl2curves.__version__" }

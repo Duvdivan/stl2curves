@@ -45,10 +45,10 @@ from OCP.collections import IndexedMap_TopoDS_Shape_TopTools_ShapeMapHasher
 from OCP.gp import gp_Ax1, gp_Ax2, gp_Ax3, gp_Circ, gp_Dir, gp_Pln, gp_Pnt
 from OCP.Geom import Geom_ToroidalSurface
 
-import features as features_mod
-import workers
-from features import TWO_PI, _angle_gap, _frame, Revolved, Sphere
-from blends import TANGENT_DEG, MAX_DEVIATION, MAX_BULGE, MAX_EDGE_GAP
+from . import features as features_mod
+from . import workers
+from .features import TWO_PI, _angle_gap, _frame, Revolved, Sphere
+from .blends import TANGENT_DEG, MAX_DEVIATION, MAX_BULGE, MAX_EDGE_GAP
 
 
 def _pnt(p):
@@ -721,7 +721,7 @@ def _thread_face(feature, k, mesh, owner, bounds, edge_tri):
     from OCP.Geom2dAPI import Geom2dAPI_Interpolate
     from OCP.collections import HArray1_gp_Pnt2d
     from OCP.gp import gp_Pnt2d
-    from threads import ON_TOL
+    from .threads import ON_TOL
     m = feature.model
     surface = _thread_surface(feature, m)
     if surface is None:
@@ -883,7 +883,7 @@ def _cut_job(job):
     """In a worker process: _trimmed_cut for one patch, its outline edges read from and
     its face written to BRep files."""
     mesh_key, feature, tools_path, counts, loops, tol, face_path = job
-    import workers
+    from . import workers
     mesh = workers.load(mesh_key)
     comp = TopoDS_Shape()
     BRepTools.Read_s(comp, tools_path, BRep_Builder())

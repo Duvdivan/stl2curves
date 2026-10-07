@@ -1,7 +1,7 @@
 """
 render - save a PNG preview of a STEP file, coloured by surface type.
 
-  python render.py part.step [more.step ...] [--out FOLDER]
+  stl2curves-render part.step [more.step ...] [--out FOLDER]
 
 Grey = flat, blue = cylinder, orange = cone, green = torus (curved rounded edge),
 purple = sphere. Black lines are the face edges: areas still made of many small flat

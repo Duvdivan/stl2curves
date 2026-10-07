@@ -6,3 +6,6 @@ tests/parts/
 *.png
 /*.stl
 /*.3mf
+/build/
+/dist/
+*.egg-info/

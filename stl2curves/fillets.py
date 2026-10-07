@@ -45,8 +45,8 @@ import math
 
 import numpy as np
 
-import features as F
-from features import Revolved
+from . import features as F
+from .features import Revolved
 
 MIN_FACE_AREA = 2       # mm^2: flat facets at least this big can be the faces a fillet joins
 MIN_ANGLE_DEG = 30      # the faces must meet at least this far from flat...

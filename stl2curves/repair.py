@@ -19,7 +19,7 @@ import math
 
 import numpy as np
 
-from features import grid_noise
+from .features import grid_noise
 
 CRACK = 1e-3            # mm (and a small share of the part's size): open edges this close are joined
 SPECK = 0.1             # a self-crossing cluster smaller than this share of the part is cut out

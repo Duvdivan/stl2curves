@@ -17,8 +17,10 @@ one of the recognised shapes cleanly (freeform surfaces, variable-radius blends,
 odd corner blends) stay as small flat facets.
 
 Usage:
-  python stl2curves.py file1.stl [file2.stl ...] [--out FOLDER] [--merge NAME]
-  python stl2curves.py some_folder            (converts every .stl in it)
+  stl2curves file1.stl [file2.stl ...] [--out FOLDER] [--merge NAME]
+  stl2curves some_folder            (converts every .stl and .3mf in it)
+
+  (or "python -m stl2curves ..." when it isn't installed as a command)
 
   --merge NAME     also write all inputs together into one NAME.step
   --tol X          sewing tolerance in mm (default 0.01)
@@ -66,16 +68,17 @@ from OCP.BRepMesh import BRepMesh_IncrementalMesh
 from OCP.TopLoc import TopLoc_Location
 from OCP.collections import List_TopoDS_Shape, IndexedMap_TopoDS_Shape_TopTools_ShapeMapHasher
 
-import features as features_mod
-from features import load_stl, analyze, summarize, snap, half_rings, Mesh, TOL, time_left
-from sizing import guess_size
-from build import build_faces, sew, features_near, point_facet_distance, settle_blends
-import workers
-from bodies import split_bodies
-from blends import add_blends, split as split_blend, _blend as as_blend, fallback as blend_fallback, carve, pipe_fallback
-from repair import repair
-from simplify import simplify
-from read3mf import read_3mf
+from . import __version__
+from . import features as features_mod
+from .features import load_stl, analyze, summarize, snap, half_rings, Mesh, TOL, time_left
+from .sizing import guess_size
+from .build import build_faces, sew, features_near, point_facet_distance, settle_blends
+from . import workers
+from .bodies import split_bodies
+from .blends import add_blends, split as split_blend, _blend as as_blend, fallback as blend_fallback, carve, pipe_fallback
+from .repair import repair
+from .simplify import simplify
+from .read3mf import read_3mf
 
 SEARCH_SECONDS = 600    # time allowed for hunting down patches that spoil the solid
 TROUBLE_SECONDS = 600   # time for dropping troublemakers one by one, per body; then every patch
@@ -1273,6 +1276,7 @@ def describe_features(info, details=False):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("inputs", nargs="+")
+    ap.add_argument("--version", action="version", version=f"stl2curves {__version__}")
     ap.add_argument("--out", help="output folder (default: next to each STL)")
     ap.add_argument("--merge", help="also write all parts into one STEP with this name")
     ap.add_argument("--tol", type=float, default=0.01)

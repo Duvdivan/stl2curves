@@ -11,16 +11,29 @@ from published papers ourselves rather than copying GPL code.
 
 ## Commands
 
-Python 3.14, main install, no venv (deliberate: the tool is installed permanently and
-runs from a Windows "Send To" shortcut via `stl2curves.bat`).
+Python 3.14, main install, no venv (deliberate: the tool runs permanently from this
+clone via a Windows "Send To" shortcut to `stl2curves.bat`, which puts the clone on
+`PYTHONPATH` and runs `python -m stl2curves`). The code is the package `stl2curves/`
+(`convert.py` is the pipeline and CLI; modules import each other relatively), installable
+with `pip install .` / `pip install git+https://github.com/Duvdivan/stl2curves`, which
+gives the `stl2curves` and `stl2curves-render` commands. Keep it a package: installed
+flat, `build.py`, `features.py`, `workers.py`... would land in site-packages as top-level
+modules (`build` clashes with the PyPI `build` tool). The version is
+`stl2curves/__init__.py` `__version__` (pyproject reads it); bump it for each release
+tag. Supported Python: 3.11-3.14 (cadquery-ocp 8's wheels; it also pulls in vtk).
 
 ```
-pip install -r requirements.txt                 # cadquery-ocp>=8, numpy, scipy, vtk
-python stl2curves.py part.stl                   # -> part.step next to it
-python stl2curves.py part.stl --out DIR --details   # list every rebuilt / skipped feature
-python render.py part.step                      # PNG preview coloured by surface type
+pip install -r requirements.txt                 # cadquery-ocp>=8 (+vtk), numpy, scipy
+python -m stl2curves part.stl                   # -> part.step next to it (from the clone root)
+python -m stl2curves part.stl --out DIR --details   # list every rebuilt / skipped feature
+python -m stl2curves.render part.step           # PNG preview coloured by surface type
 python tests/run_tests.py                       # regression suite (5 CAD parts, a few minutes)
 ```
+
+From another directory, set `PYTHONPATH` to the clone root first (as `stl2curves.bat` and
+`compare/regress.sh` do). Scripts that import it use `import stl2curves.convert as S`
+(`S.stl_to_solid`, `S.attempt`...); `from stl2curves import stl_to_solid, count, volume,
+write_step` also works (loaded lazily, so `import stl2curves` alone doesn't load OCC).
 
 `tests/run_tests.py` generates its STLs into `tests/parts/` (gitignored) with the
 `make_*.py` scripts, converts them and checks validity, volume error and a maximum face
@@ -42,8 +55,8 @@ edited code.
 
 Local regression data on this machine (not in the repo):
 
-- `C:\Users\delta\Downloads\X2D+Accessory+Toolbox_stls` (4 STLs): baseline 203 / 194 /
-  243 / 230 faces, all valid. Re-check after every change.
+- `C:\Users\delta\Downloads\X2D+Accessory+Toolbox_stls` (4 STLs): baseline 114 / 188 /
+  211 / 120 faces (s2), all valid. Re-check after every change.
 - `C:\Users\delta\Tools\compare\rak` (20 parts, coordinates rounded to 0.001 mm):
   `run2.sh`, `summary.sh`, `devall.sh` there; outputs in `out_v*`.
 - `compare\bass` (instrument: bent tubes, cavities), `compare\box2` (`tray.stl`, and
@@ -59,7 +72,8 @@ Local regression data on this machine (not in the repo):
 
 ## Architecture
 
-`stl2curves.py` (`stl_to_solid`) runs the pipeline:
+`stl2curves/convert.py` (`stl_to_solid`) runs the pipeline (all modules below are in
+`stl2curves/`):
 
 1. **`repair.py`** mends the mesh (duplicates, zero-thickness pairs, slivers, cracks,
    orientation, holes, small self-crossings). **`simplify.py`** thins meshes over
@@ -136,7 +150,7 @@ Local regression data on this machine (not in the repo):
    becomes N-sided blends.
 6. **`build.py`** makes one face per feature plus a planar face per remaining flat facet,
    sharing each boundary edge between the two faces beside it (`Edges` cache), then
-   sews. `stl2curves._build`/`attempt` then checks the solid: valid, and volume equal to
+   sews. `convert._build`/`attempt` then checks the solid: valid, and volume equal to
    the faceted volume plus each feature's predicted `change` (within the summed
    `tolerance`; OCC's volume, re-measured by `tessellated_volume` when it disagrees),
    and its STEP file read back the same (`file_trouble`). Features that fail are dropped and left faceted (blends give back the

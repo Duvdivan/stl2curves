@@ -277,7 +277,7 @@ def patches(mesh, thread, facets):
 
 
 def _piece_feature(mesh, thread, piece, fids):
-    from features import Feature
+    from .features import Feature
     tids = np.concatenate([mesh.ftris[f] for f in fids])
     T = mesh.tris[tids]
     # how far each facet sits from the true surface, at its edge midpoints

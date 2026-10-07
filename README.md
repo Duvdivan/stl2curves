@@ -29,28 +29,47 @@ area one B-spline surface fitted to all its mesh corners (within 0.002 mm), a sm
 (where rounded edges meet at a corner) one smooth patch spanning its outline. Anything
 else stays as flat facets, so the result always matches the mesh.
 
+> **Beta.** stl2curves works on the parts it has been tested on (mostly 3D-printing
+> downloads and CAD exports), but every mesh is different. If a conversion fails, takes
+> very long or loses curves it should have kept, please
+> [report it](https://github.com/Duvdivan/stl2curves/issues/new/choose).
+
 ## Install
 
-Python 3.10+:
+You need Python 3.11, 3.12, 3.13 or 3.14 (from [python.org](https://www.python.org/downloads/);
+on Windows tick "Add python.exe to PATH" in the installer). Then, in a terminal:
 
 ```
-pip install -r requirements.txt
+pip install git+https://github.com/Duvdivan/stl2curves
 ```
+
+(Without git: download the repository as a ZIP from GitHub, unzip it and run
+`pip install .` in that folder.) This installs the `stl2curves` command and its
+dependencies: OpenCascade (`cadquery-ocp`, which brings VTK along), numpy and scipy,
+about 750 MB in all.
+
+Update with `pip install --upgrade --force-reinstall git+https://github.com/Duvdivan/stl2curves`,
+and check the version with `stl2curves --version`.
 
 ## Use
 
 ```
-python stl2curves.py part.stl                    # -> part.step next to it
-python stl2curves.py project.3mf                 # one STEP per object printed in it
-python stl2curves.py some_folder --out STEP      # every .stl and .3mf in a folder
-python stl2curves.py a.stl b.stl --merge all     # also one combined STEP
-python stl2curves.py part.stl --details          # list every rebuilt feature
-python stl2curves.py part.stl --true-size        # rebuild at the apparent design size
-python render.py part.step                       # PNG preview coloured by surface type
+stl2curves part.stl                    # -> part.step next to it
+stl2curves project.3mf                 # one STEP per object printed in it
+stl2curves some_folder --out STEP      # every .stl and .3mf in a folder
+stl2curves a.stl b.stl --merge all     # also one combined STEP
+stl2curves part.stl --details          # list every rebuilt feature
+stl2curves part.stl --true-size        # rebuild at the apparent design size
+stl2curves-render part.step            # PNG preview coloured by surface type
 ```
 
-On Windows, `stl2curves.bat` accepts drag-and-drop (or put a shortcut to it in
-`shell:sendto` for a right-click "Send to" entry).
+`python -m stl2curves ...` does the same as `stl2curves ...` (handy if the command isn't
+on your PATH).
+
+On Windows, `stl2curves.bat` (in the repository) accepts drag-and-drop of STL/3MF files
+or folders onto it; put a shortcut to it in `shell:sendto` for a right-click "Send to"
+entry. It runs the copy of stl2curves next to it, so it also works from an unzipped
+download (after `pip install -r requirements.txt` there) without installing the package.
 
 Options: `--tol` sewing tolerance (mm), `--no-fuse` keep overlapping bodies separate,
 `--no-curves` flat faces only, `--no-blends` no smooth freeform faces (exact surfaces
@@ -194,9 +213,20 @@ that curls round in two directions at once (an organic shell, a knob) is cut int
 several, and their seams follow mesh edges. Lettering and other shapes extruded from
 free curves stay faceted.
 
+## Reporting problems
+
+Open an [issue](https://github.com/Duvdivan/stl2curves/issues/new/choose) with the
+command you ran, `stl2curves --version`, your operating system, and the text the
+conversion printed (run it with `--details` if you can). A mesh to reproduce the problem
+helps most, but only attach one you have the right to share (your own design, or one
+whose licence allows it): the issue tracker is public.
+
 ## Tests
 
+From a clone of the repository:
+
 ```
+pip install -e .
 python tests/run_tests.py
 ```
 

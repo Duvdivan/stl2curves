@@ -1,6 +1,8 @@
 @echo off
-REM Drag and drop STL files (or a folder of them) onto this file.
+REM Drag and drop STL or 3MF files (or a folder of them) onto this file.
 REM STEP files are written next to the originals.
-python "%~dp0stl2curves.py" %*
+REM Runs the copy next to this file, whether or not stl2curves is pip-installed.
+set "PYTHONPATH=%~dp0;%PYTHONPATH%"
+python -m stl2curves %*
 echo.
 pause

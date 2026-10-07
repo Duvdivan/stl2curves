@@ -23,9 +23,9 @@ import numpy as np
 from scipy.interpolate import BSpline
 from scipy.spatial import cKDTree
 
-import freeform
-import pipes
-from features import Feature, Revolved, Sphere
+from . import freeform
+from . import pipes
+from .features import Feature, Revolved, Sphere
 
 ENABLED = False         # off for now: on the GPS case its few small patches mostly failed to build and
                         # took their neighbours with them (8814 -> 9265 faces); to try on extruded parts

@@ -1,4 +1,4 @@
+# for running from a clone without pip-installing it (pip install -e . does the same)
 cadquery-ocp>=8.0
 numpy
-vtk
 scipy

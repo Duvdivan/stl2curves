@@ -303,7 +303,7 @@ def feature(mesh, model, facets, parts, dev):
     """The patch for a fitted area (parts: the pieces it replaces, given back if its
     face can't be built). Its volume change is measured as for any exact surface, from
     how far each facet's edge midpoints sit off it."""
-    from features import Feature
+    from .features import Feature
     tids = np.concatenate([mesh.ftris[f] for f in facets])
     corners = mesh.pts[mesh.tris[tids]]
     s = model.signed(((corners + corners[:, [1, 2, 0]]) / 2).reshape(-1, 3)).reshape(-1, 3)

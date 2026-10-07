@@ -25,8 +25,8 @@ from scipy.interpolate import BSpline
 from scipy.sparse.csgraph import connected_components, minimum_spanning_tree, shortest_path
 from scipy.spatial import cKDTree
 
-import freeform
-from features import Feature, Revolved, Sphere
+from . import freeform
+from .features import Feature, Revolved, Sphere
 
 FIT_DEV = freeform.FIT_DEV      # mm: the tube passes this close to every mesh corner of its area
 MAX_RADIUS = 10.0               # mm: fillets up to this radius

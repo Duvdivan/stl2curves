@@ -1,0 +1,49 @@
+name: Conversion problem
+description: A mesh that fails to convert, converts badly, or takes far too long
+labels: ["conversion"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for testing stl2curves! The more of this you can fill in, the quicker it can be fixed.
+        **This tracker is public:** only attach a mesh you have the right to share (your own design,
+        or one whose licence allows it). If you can't share it, describe the part instead
+        (what it is, roughly how many triangles, which program exported it).
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What went wrong, and what you expected. Screenshots of the STEP in your CAD program help.
+    validations:
+      required: true
+  - type: input
+    id: command
+    attributes:
+      label: Command
+      description: The command you ran (or "drag-and-drop on stl2curves.bat", "FreeCAD add-on").
+      placeholder: stl2curves part.stl --details
+  - type: textarea
+    id: output
+    attributes:
+      label: Output
+      description: Everything the conversion printed. Running it again with `--details` adds a list of what was rebuilt.
+      render: text
+  - type: input
+    id: version
+    attributes:
+      label: stl2curves version
+      description: From `stl2curves --version`
+      placeholder: stl2curves 0.1.0
+    validations:
+      required: true
+  - type: input
+    id: system
+    attributes:
+      label: System
+      description: Operating system, Python version (`python --version`), and the CAD program you opened the STEP in
+      placeholder: Windows 11, Python 3.13, Fusion
+  - type: textarea
+    id: mesh
+    attributes:
+      label: Mesh
+      description: Attach the STL/3MF (zip it if GitHub refuses the file type), or link to where it can be downloaded.

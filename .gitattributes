@@ -1,0 +1,2 @@
+# cmd.exe wants CRLF in batch files (a ZIP download gets the files as stored)
+*.bat text eol=crlf
