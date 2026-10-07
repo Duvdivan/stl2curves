@@ -10,6 +10,7 @@ first surfaces found. Big data they all need (the mesh) is written once to a fil
 (share) and read by each worker once (load).
 """
 import atexit
+import multiprocessing
 import os
 import pickle
 import tempfile
@@ -33,6 +34,8 @@ _starting = None                    # the thread launching them
 _cancel = False                     # stop() was called while they were being launched
 _leftovers = False
 _files = []
+_job = None                         # (Windows) the job object the workers are put in
+_guarded = set()                    # pids of the workers put in it
 _loaded = {}                        # (in a worker) key -> object, the few read last
 memo = {}                           # (in a worker) anything worth keeping between jobs
 
@@ -80,7 +83,7 @@ def _free_memory():
 def _start(n):
     global _pool, _launching
     try:
-        pool = _launching = ProcessPoolExecutor(n)
+        pool = _launching = ProcessPoolExecutor(n, initializer=_watch_parent)
         # (on Windows a worker is only launched when a job finds none idle, one at a
         # time, in the middle of sending work out: launch them all now, one by one,
         # minding stop() meanwhile)
@@ -89,6 +92,7 @@ def _start(n):
                 pool._spawn_process()
         except Exception:
             pass
+        _guard(pool)
         if not _cancel:
             pool.submit(int).result()
             _pool = pool
@@ -105,6 +109,8 @@ def get(wait=True):
             return None
         _starting.join()
         _starting = None
+    if _pool is not None:
+        _guard(_pool)               # (the pool replaces a worker that died)
     return _pool
 
 
@@ -149,6 +155,7 @@ def stop():
         except OSError:
             pass
     _files.clear()
+    _guarded.clear()
 
 
 atexit.register(stop)
@@ -158,6 +165,65 @@ def _terminate(pool):
     for p in list((getattr(pool, "_processes", None) or {}).values()):
         p.terminate()
     pool.shutdown(wait=False, cancel_futures=True)
+
+
+def _guard(pool):
+    """Tie the pool's workers to this process's life. Exit handlers (stop) don't run when
+    this process is killed outright (Task Manager, a closed window, a stopped batch), and
+    Windows leaves children running when their parent dies: the workers sat waiting for
+    jobs for good, each holding its copy of the mesh. On Windows they go in a job object
+    that kills them when its last handle, held only by this process, closes (only the
+    workers: put in the job, a host program like FreeCAD would take its own later
+    children down with it). Elsewhere each worker watches for its parent itself."""
+    global _job
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        if _job is None:
+            kernel.CreateJobObjectW.restype = wintypes.HANDLE
+            job = kernel.CreateJobObjectW(None, None)      # (handle not inherited)
+            if not job:
+                return
+
+            class Limits(ctypes.Structure):
+                _fields_ = [("per_process_time", ctypes.c_int64), ("per_job_time", ctypes.c_int64),
+                            ("flags", wintypes.DWORD), ("min_ws", ctypes.c_size_t),
+                            ("max_ws", ctypes.c_size_t), ("active", wintypes.DWORD),
+                            ("affinity", ctypes.c_size_t), ("priority", wintypes.DWORD),
+                            ("scheduling", wintypes.DWORD)]
+
+            class Extended(ctypes.Structure):
+                _fields_ = [("basic", Limits), ("io", ctypes.c_uint64 * 6)] + [
+                    (name, ctypes.c_size_t) for name in ("process_memory", "job_memory",
+                                                         "peak_process_memory", "peak_job_memory")]
+            info = Extended()
+            info.basic.flags = 0x2000           # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            if not kernel.SetInformationJobObject(wintypes.HANDLE(job), 9,  # extended limits
+                                                  ctypes.byref(info), ctypes.sizeof(info)):
+                kernel.CloseHandle(wintypes.HANDLE(job))
+                return
+            _job = job
+        for pid, p in list((getattr(pool, "_processes", None) or {}).items()):
+            if pid not in _guarded and p.is_alive():
+                # (a Process's sentinel on Windows is its process handle)
+                if kernel.AssignProcessToJobObject(wintypes.HANDLE(_job), wintypes.HANDLE(p.sentinel)):
+                    _guarded.add(pid)
+    except Exception:
+        pass                        # (no job: the workers are only stopped at a normal exit)
+
+
+def _watch_parent():
+    """In a worker: end when the parent process does (outside Windows the job object of
+    _guard isn't there; the wait is on the parent's handle or pipe, no polling)."""
+    parent = multiprocessing.parent_process()
+    if parent is not None and os.name != "nt":
+        def watch():
+            parent.join()
+            os._exit(1)
+        threading.Thread(target=watch, daemon=True).start()
 
 
 def share(obj):
