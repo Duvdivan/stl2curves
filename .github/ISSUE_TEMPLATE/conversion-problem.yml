@@ -33,7 +33,7 @@ body:
     attributes:
       label: stl2curves version
       description: From `stl2curves --version`
-      placeholder: stl2curves 0.1.0
+      placeholder: stl2curves 0.2.0
     validations:
       required: true
   - type: input

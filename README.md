@@ -84,6 +84,27 @@ object made of several parts (a multi-colour print, say) has each part mended an
 rebuilt on its own, and the parts joined into one solid at the end (they may touch or
 overlap: merged into one mesh first, they would make a mesh that crosses itself).
 
+### In FreeCAD
+
+stl2curves is also a FreeCAD add-on (FreeCAD 1.0 or later). Until it is listed in the
+Addon Manager, install it by hand: download the repository (green "Code" button,
+"Download ZIP"), unzip it into FreeCAD's `Mod` folder (in FreeCAD: Macro > Macros...
+shows the user macro folder; `Mod` sits next to it, e.g.
+`%APPDATA%\FreeCAD\v1-1\Mod` on Windows) so that you get `Mod/stl2curves/package.xml`
+(rename the unzipped `stl2curves-main` folder to `stl2curves`), and restart FreeCAD.
+
+Select one or more mesh objects and choose **Part > Mesh to Curved Solid (stl2curves)**
+(or **Meshes > ...** in the Mesh workbench, or its toolbar button); with no mesh
+selected it asks for STL or 3MF files instead. The solid is added next to the mesh, at
+its placement, and the mesh hidden. The conversion runs in the background with its
+output shown, and Stop ends it.
+
+On first use it offers to download what it needs (OpenCascade as `cadquery-ocp`, numpy
+and scipy, about 750 MB on disk) into a folder of its own in FreeCAD's user data
+(`stl2curves/py311` for FreeCAD's Python 3.11); FreeCAD's own packages are not changed.
+If you already have a Python with stl2curves' dependencies (3.11 or later), you can
+choose it under Options instead.
+
 ### Time
 
 Small parts take seconds, typical printed parts of 5,000-15,000 triangles a minute or

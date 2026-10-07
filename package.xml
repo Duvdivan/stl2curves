@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no" ?>
+<package format="1" xmlns="https://wiki.freecad.org/Package_Metadata">
+  <name>stl2curves</name>
+  <description>Turn meshes (STL, 3MF) into solids with true curved surfaces: holes, fillets, chamfers, screw threads and smooth areas become real cylinders, cones, tori, helices and B-spline faces you can select, measure and edit. Adds "Mesh to Curved Solid" to the Part and Mesh workbenches. Downloads OpenCascade (cadquery-ocp), numpy and scipy for its own use on first run.</description>
+  <version>0.2.0</version>
+  <date>2026-10-07</date>
+  <maintainer email="10554718+Duvdivan@users.noreply.github.com">Daniel Copeland</maintainer>
+  <author email="10554718+Duvdivan@users.noreply.github.com">Daniel Copeland</author>
+  <license file="LICENSE">MIT</license>
+  <url type="repository" branch="main">https://github.com/Duvdivan/stl2curves</url>
+  <url type="bugtracker">https://github.com/Duvdivan/stl2curves/issues</url>
+  <url type="readme">https://github.com/Duvdivan/stl2curves/blob/main/README.md</url>
+  <icon>freecad_addon/Resources/icons/stl2curves.svg</icon>
+  <freecadmin>1.0.0</freecadmin>
+  <tag>mesh</tag>
+  <tag>stl</tag>
+  <tag>3mf</tag>
+  <tag>step</tag>
+  <tag>reverse engineering</tag>
+  <tag>3D printing</tag>
+
+  <content>
+    <workbench>
+      <name>stl2curves</name>
+      <description>Mesh to Curved Solid command, added to the Part and Mesh workbenches</description>
+      <subdirectory>freecad_addon</subdirectory>
+      <icon>Resources/icons/stl2curves.svg</icon>
+    </workbench>
+  </content>
+</package>

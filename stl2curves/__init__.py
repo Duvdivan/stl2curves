@@ -1,7 +1,7 @@
 """stl2curves: convert STL meshes and 3MF projects into solid STEP files with true
 curved surfaces (see README.md). The command line is `stl2curves` (convert.main)."""
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 
 def __getattr__(name):

@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+  <!-- left: a faceted arc (the mesh); right: the same arc as a true curve (the solid) -->
+  <path d="M6 54 L6 40 L9 28 L15 18 L24 11 L32 9 L32 54 Z" fill="#c9ced6" stroke="#4a5160" stroke-width="2" stroke-linejoin="round"/>
+  <path d="M9 28 L32 54 M15 18 L32 54 M24 11 L32 54 M6 40 L32 54" stroke="#4a5160" stroke-width="1.2" fill="none"/>
+  <path d="M32 9 A26 45 0 0 1 58 54 L32 54 Z" fill="#4f8de6" stroke="#1f4f99" stroke-width="2" stroke-linejoin="round"/>
+</svg>

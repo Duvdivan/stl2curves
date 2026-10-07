@@ -190,6 +190,23 @@ as BRep files, the mesh once per pass via `workers.share`/`load`. What runs ther
 - `TIME_LIMIT` (`--time-limit`) only stops optional refinement (blends, culprit search,
   second chances); analysis always runs to the end (cutting it gave garbage).
 
+FreeCAD add-on (`package.xml` at the root, code in `freecad_addon/`): the repository
+itself is the add-on (FreeCAD clones it into `Mod/stl2curves`; `package.xml`'s workbench
+`subdirectory` makes FreeCAD run `freecad_addon/InitGui.py`, which registers the
+`Stl2Curves_Convert` command and a workbench manipulator putting it after
+`Part_ShapeFromMesh` / `Mesh_FromPartShape` and on the Part Tools / Mesh Tools
+toolbars). The conversion runs out of process (`QProcess`: `python -m stl2curves`) with
+FreeCAD's bundled Python (`bin/python.exe`; `sys.executable` is FreeCAD.exe) and
+`PYTHONPATH` = a private `pip install --target` folder (`<UserAppData>/stl2curves/py311`,
+cadquery-ocp + numpy + scipy) + the repository root: FreeCAD's own OCC (Part, and
+pythonocc in its site-packages) is a different build from cadquery-ocp. So **the package
+must keep running on Python 3.11** (FreeCAD 1.0/1.1 bundle 3.11). Meshes are converted
+in local coordinates and the solid gets the mesh's global placement. Keep
+`package.xml`'s `<version>` equal to `__version__`. A portable FreeCAD 1.1.3 is in
+`C:\Users\delta\Tools\FreeCAD`; test the add-on with
+`FreeCAD.exe --user-cfg <copy of user.cfg> -M <repo> script.py` (loads it without
+installing; a script's prints don't reach the console, so write to a file).
+
 Key contracts:
 
 - **`Feature`** (dataclass in `features.py`): `model`, `kind` (`revolve`, `wedge`,
