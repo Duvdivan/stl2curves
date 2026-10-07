@@ -288,8 +288,17 @@ Key contracts:
 - OCC's splitter on a degree-8 swept-fillet surface took 78 s to fail where laying the
   outline on it took 0.1 s: pipes get their face from their outline first.
 - Sewing costs ~1 s per 1,000 faces whatever the options; faces share no edges before
-  it. Re-sewing an already sewn shell takes 0.4 s, but sewing changed faces into a
-  shell with holes did not join them (an idea for incremental sewing, not working yet).
+  it. Incremental sewing (keep the last round's sewn shell, swap in the changed faces,
+  local-sew them with `Load`/`Add`, mapping faces through `ModifiedSubShape`, not
+  `Modified`) sews a 10,000-face round in ~1 s, but was tried three ways (2026-10-07)
+  and lost every time: a sewn face's edges carry the gaps it closed as tolerance, so
+  sewn faces join new ones that a fresh sew leaves apart (2 free edges where a full sew
+  of the same faces left 41), forced-shut gaps come out invalid, and faces never sewn
+  afresh keep their defects round after round. The blame rounds then went differently:
+  GPS 8,598 faces / 666 s became 17,099 / 856, 9,163 / 682 (forgetting the shell after
+  a failed check) and 8,889 / 702 (re-sewing the faces round the change unsewn). The
+  attempt loop is tuned to what a fresh sew does; don't try this again without making
+  it give the same free edges as a full sew.
 - Blaming every patch near trouble that recurs (85-100% of each round's trouble lies
   within 1 mm of an earlier round's) cut rounds but lost curves and no time (GPS 8,598
   -> 11,805 faces): more faces make every later sew slower.

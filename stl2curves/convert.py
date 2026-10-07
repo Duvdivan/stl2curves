@@ -96,6 +96,7 @@ WORKERS_FROM = 5000     # triangles from which a part is worth starting worker p
 BARE_DRIFT = 1e-4       # share of a sound mesh's volume its bare facets may differ by and still be a reference
 TESS_DEFLECTION = 0.0005    # mm: how closely a solid's faces are tessellated to measure its volume
 VOLUME_EPS = 1e-5       # relative precision of the volume integration
+VOLUMES_KEPT = 4        # shapes whose volume is remembered (see volume)
 TESS_SPECK = 0.05       # mm^2: a face this small that won't tessellate is left out of that measure
 LOOSE_EDGE = 3.0        # an edge whose tolerance is this many times the sewing's strays from its faces
 FILE_VOLUME = 1e-3      # share of the volume a finished part's STEP file may read back off by
@@ -125,9 +126,24 @@ def volume(shape):
     # adaptive integration: the default's fixed sample points undercount long spline
     # faces (a thread flank winding five turns came out ~80 mm^3 short); 1e-5 is within
     # 0.005 mm^3 of 1e-6 on a 16,000 mm^3 part, and a fifth quicker
+    for known, v in _volumes:
+        if known.IsSame(shape):
+            if known.Orientation() == shape.Orientation():
+                return v
+            if {known.Orientation(), shape.Orientation()} == {TopAbs_FORWARD, TopAbs_REVERSED}:
+                return -v       # (the same solid turned inside out)
     props = GProp_GProps()
     BRepGProp.VolumeProperties_s(shape, props, VOLUME_EPS)
+    _volumes.append((shape, props.Mass()))
+    del _volumes[:-VOLUMES_KEPT]
     return props.Mass()
+
+
+# The last few shapes measured, with their volumes: an attempt measures its solid, and
+# the STEP check measures it again (4 s each on a 9,000-face part). Kept as references,
+# so a shape can't be freed and another made in its place; same shape means same
+# TShape and location (and the opposite orientation, the opposite volume).
+_volumes = []
 
 
 def tessellated_volume(shape):
@@ -141,31 +157,22 @@ def tessellated_volume(shape):
     tessellated_volume.untessellated = []
     BRepTools.Clean_s(shape)
     BRepMesh_IncrementalMesh(shape, TESS_DEFLECTION, False, 0.1, True)
-    box = Bnd_Box()
-    BRepBndLib.Add_s(shape, box)
-    p, q = box.CornerMin(), box.CornerMax()
-    centre = np.array([p.X() + q.X(), p.Y() + q.Y(), p.Z() + q.Z()]) / 2     # (less to cancel)
-    total = 0.0
     ex = TopExp_Explorer(shape, TopAbs_FACE)
     while ex.More():
         face = TopoDS.Face(ex.Current())
         ex.Next()
-        loc = TopLoc_Location()
-        tri = BRep_Tool.Triangulation_s(face, loc)
-        if tri is None:
+        if BRep_Tool.Triangulation_s(face, TopLoc_Location()) is None:
             # (a speck of a face, a sliver the sewing all but closed: nothing to measure)
             props = GProp_GProps()
             BRepGProp.SurfaceProperties_s(face, props)
             if abs(props.Mass()) >= TESS_SPECK:
                 c = props.CentreOfMass()
                 tessellated_volume.untessellated.append((c.X(), c.Y(), c.Z()))
-            continue
-        move = loc.Transformation()
-        P = np.array([(n.X(), n.Y(), n.Z()) for n in (tri.Node(i).Transformed(move) for i in range(1, tri.NbNodes() + 1))])
-        T = np.array([tri.Triangle(i).Get() for i in range(1, tri.NbTriangles() + 1)]) - 1
-        P = P - centre
-        v = np.einsum("ij,ij->i", P[T[:, 0]], np.cross(P[T[:, 1]], P[T[:, 2]])).sum() / 6
-        total += -v if face.Orientation() == TopAbs_REVERSED else v
+    # (summed over the triangles by OCC itself: reading half a million nodes into numpy
+    # took twice as long as the meshing)
+    props = GProp_GProps()
+    BRepGProp.VolumeProperties_s(shape, props, False, False, True)
+    total = props.Mass()
     BRepTools.Clean_s(shape)
     return None if tessellated_volume.untessellated else float(total)
 
