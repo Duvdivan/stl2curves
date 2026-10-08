@@ -217,8 +217,23 @@ be judged alone by full regressions (`compare/regress_try.sh` runs them all):
   mends shapes in place now spreads through shared corners (the splitter widened them to
   8 mm: `SetNonDestructive`, on for everyone now; ShapeFix on flat faces: tried on a copy
   first, `SHARED_TOLERANCE`; the checks after sewing: sew works on a copy); one blend fill
-  on such edges ground on for 20 min (fills keep unshared edges). Open: corners closer
-  than the sewing tolerance are no longer merged by sewing (Rak N-USB +217 faces).
+  on such edges ground on for 20 min (fills keep unshared edges). Mesh points within
+  `SHARED_CROWD` of another (duplicates, slivers 0.0001 mm across) keep corners of their
+  own (`_crowded`): sewing merges such points for unjoined faces, and faces joined there
+  kept the tiny edges and no longer met their unshared neighbours (ratchet: no solid).
+  ShapeFix mends a flat face on its shared edges only if a copy keeps every edge. Don't
+  close up edges shorter than the sewing tolerance yourself: fine meshes have real edges
+  of 0.005-0.05 mm (the tensioner came out invalid). Regression = baseline faces (14,741
+  vs 14,753); GPS 8,242 faces / 728 s vs 8,598 / 772 s. But curved faces cut in the
+  workers come back as copies, so with patches nearly every edge still needs sewing.
+- `rejoin` (build.REJOIN, `_rejoin` in `sew`): on sew's copy, corners at one mesh point
+  (within `REJOIN_SNAP`: copies read back from files) become one vertex, and free edges
+  with the same two corners and the same curve one edge (the curved face's kept, with
+  the other face's curve on its surface moved over; a flat face takes a line or arc
+  either way round). Arc-beside-chord pairs are gaps, left to sewing. GPS first round:
+  free edges 19,650 -> 9,340, sew 8.4 -> 4.5 s (+1.2 s rejoining). But with `shared`
+  the regression lost curves (15,186 faces; Rak SMA-USB 1,242 -> 1,754, Uni 1,395 ->
+  1,545, more STEP read-back trouble) and GPS was no faster (8,107 faces, 663 s).
 - `exact` (build.EXACT_EDGES): a run between two analytic surfaces (a flat facet's plane,
   cylinder, cone, sphere, torus) is their exact intersection (`GeomAPI_IntSS`), trimmed
   at the run's corners (widened to cover their distance off it), if every point of the
@@ -228,8 +243,16 @@ be judged alone by full regressions (`compare/regress_try.sh` runs them all):
   make the start; each patch's face is made on its surface from the edges round its
   facets (ShapeFix adds pcurves; tolerances restored if refused), checked alone (valid,
   area, outward, volume roughly, edges reused, `MAX_EDGE_TOL`) and swapped in, else its
-  fallbacks (as `_build` picks them) are tried. Version 0 keeps the mesh's chords as the
-  curved faces' outlines. GPS: 7,158 faces, valid, read back OK, build stage ~315 s.
+  fallbacks (as `_build` picks them) are tried. Version 0 kept the mesh's chords as the
+  curved faces' outlines (GPS: 7,158 faces, valid, read back OK, build stage ~315 s; but
+  regression 18,824 faces, turned parts worst). Version 1: whole rings as half rings
+  first, the solid checked as `attempt` does and blamed patches taken out again in place
+  (`SWAP_ROUNDS`, `Registry.revert`), runs along a flat or swapped face one spline in
+  both faces (`SMOOTH_RUNS`), spindle tori swept, surfaces trimmed to the patch. head:
+  340 faces vs 40 sewn: a patch is judged before its curved neighbours exist, so single
+  chords against a coarse neighbour stay, beyond `MAX_EDGE_TOL`. Every fix here redoes
+  what build's face construction already does: the likelier route is build's faces,
+  joined (`rejoin`), without the sewing.
 - `local.py` (helpers, always available): swap faces/edges in a big shape at the cost of
   the faces touched (`apply_local`: two-step ReShape), local edge maps; `tests/test_local.py`.
 

@@ -85,6 +85,7 @@ TROUBLE_SECONDS = 600   # time for dropping troublemakers one by one, per body; 
 HURRY_REACH = 0.5       # mm: this near trouble goes at once, four times as far each further round
 BLAME_TIE = 0.01        # mm: patches this much nearer trouble than another count as level with it
 TIME_LIMIT = 600        # seconds after which the optional refinements stop (--time-limit); see stl_to_solid
+SWAP_ROUNDS = 6        # STL2CURVES_TRY=swap: rounds of taking blamed patches out again
 FIX_PRECISIONS = (1e-5, 1e-4)   # mm: precisions ShapeFix tries on an invalid solid after its default
 EMPTY_SHELL = 1e-6      # closed shells with less volume than this share of the biggest are dropped
 FUSE_SECONDS = 30       # bodies whose fuse takes longer than this are handed over side by side
@@ -454,7 +455,7 @@ def attempt(mesh, features, mesh_tol, tol, fuse, faceted_volume):
     attempt.blamed = True
     worst = max((f.worst for f in features), default=0.0)
     sewing = max(tol, min(0.2, 1.5 * worst))
-    sewn, free = sew(comp, sewing, shells)
+    sewn, free = sew(comp, sewing, shells, mesh.pts)
     if free:
         # patches whose faces left gaps: drop just those and try again
         attempt.why = "free"
@@ -685,7 +686,7 @@ def _mesh_defective(mesh, tol, fuse):
 def _bare(mesh, tol):
     """(defective, volume, bodies) of the mesh built from bare facets."""
     comp, shells, _ = build_faces(mesh, [], TOL)
-    sewn, free = sew(comp, tol, shells)
+    sewn, free = sew(comp, tol, shells, mesh.pts)
     try:
         shape, bodies, _, vol = solids_from_shells(sewn, inward_shells(mesh))
         return bool(free) or not BRepCheck_Analyzer(shape, True, True).IsValid(), vol, bodies
@@ -827,23 +828,65 @@ def misjoined_edge_points(shape):
     return out
 
 
-def _swap_build(mesh, features, mesh_tol, tol, info):
+def _swap_build(mesh, features, mesh_tol, tol, info, faceted_volume):
     """STL2CURVES_TRY=swap (an experiment): the body assembled patch by patch on the bare
     facets' shared edges (assemble.py) rather than built, sewn and checked whole in rounds.
-    (shape, bodies, cavities), or None if that solid doesn't check out (then the sewing
+    The solid gets attempt's checks (volume, validity, its STEP file); the patches blamed
+    for trouble are taken out again on the spot, for up to SWAP_ROUNDS rounds.
+    (shape, bodies, cavities), or None if it still doesn't check out (then the sewing
     build runs as usual)."""
-    from .assemble import assemble
+    from .assemble import assemble, revert
     try:
         solid, kept, report = assemble(mesh, features, mesh_tol, tol)
-        shape, nb, nv, _ = solids_from_shells(solid, inward_shells(mesh))
     except Exception:
         return None
-    if not BRepCheck_Analyzer(shape, True, True).IsValid():
-        return None
-    used = {id(f) for f in kept}
-    info["skipped"] += [f for f in features if id(f) not in used]
-    info["assembly"] = report
-    return shape, nb, nv
+    reg = report.pop("registry")
+    report["rounds"] = []
+    for _ in range(SWAP_ROUNDS):
+        try:
+            shape, nb, nv, signed = solids_from_shells(solid, inward_shells(mesh))
+        except Exception:
+            return None
+        expected = faceted_volume + sum(f.change for f in kept)
+        allowed = sum(f.tolerance for f in kept) + 1e-6 * abs(faceted_volume) + 1e-3
+        blame, why = [], None
+        if abs(signed - expected) > allowed:
+            tess = tessellated_volume(shape)
+            if tess is None or abs(tess - expected) > allowed:
+                why = "volume"
+                blame = _invalid_blame(mesh, kept, shape, tol)
+        if why is None:
+            check = BRepCheck_Analyzer(shape, True, True)
+            if not check.IsValid():
+                mended = None
+                for precision in (None,) + FIX_PRECISIONS:
+                    fix = ShapeFix_Shape(shape)
+                    if precision:
+                        fix.SetPrecision(precision)
+                    fix.Perform()
+                    if BRepCheck_Analyzer(fix.Shape(), True, True).IsValid() and abs(volume(fix.Shape()) - expected) <= allowed:
+                        mended = fix.Shape()
+                        break
+                if mended is None:
+                    why = "invalid"
+                    blame = culprits(mesh, kept, invalid_face_points(shape, check))
+                else:
+                    shape = mended
+        if why is None and kept and len(mesh.farea) <= FILE_CHECK_FACES:
+            trouble = file_trouble(shape, allowed)
+            if trouble:
+                why = "file"
+                blame = culprits(mesh, kept, trouble)
+        report["rounds"].append((why, len(blame)))
+        if why is None:
+            used = {id(f) for f in kept} | {id(report.get("ring_of", {}).get(id(f))) for f in kept}
+            info["skipped"] += [f for f in features if id(f) not in used]
+            info["assembly"] = report
+            return shape, nb, nv
+        if not blame:
+            return None
+        solid, kept = revert(reg, kept, blame)
+    return None
 
 
 def _build(mesh, features, mesh_tol, tol, fuse, info):
@@ -853,7 +896,7 @@ def _build(mesh, features, mesh_tol, tol, fuse, info):
     _bare_ahead(mesh, tol)
     features = settle_blends(mesh, features, mesh_tol, split_blend, info["skipped"])
     if "swap" in TRYING:
-        got = _swap_build(mesh, features, mesh_tol, tol, info)
+        got = _swap_build(mesh, features, mesh_tol, tol, info, faceted_volume)
         if got is not None:
             return got
     # Each attempt builds and sews the whole body: on a mesh of a quarter million facets

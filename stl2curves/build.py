@@ -22,7 +22,7 @@ from OCP.BRepPrimAPI import BRepPrimAPI_MakeRevol, BRepPrimAPI_MakeSphere, BRepP
 from OCP.BRepAlgoAPI import BRepAlgoAPI_Common, BRepAlgoAPI_Splitter
 from OCP.BRepExtrema import BRepExtrema_DistShapeShape
 from OCP.BRepCheck import BRepCheck_Analyzer
-from OCP.BRepAdaptor import BRepAdaptor_Curve
+from OCP.BRepAdaptor import BRepAdaptor_Curve, BRepAdaptor_Surface
 from OCP.BRepGProp import BRepGProp
 from OCP.GProp import GProp_GProps
 from OCP.GeomAPI import GeomAPI_Interpolate
@@ -36,13 +36,14 @@ from OCP.TopLoc import TopLoc_Location
 from OCP.GeomAPI import GeomAPI_ProjectPointOnSurf
 from OCP.GeomLProp import GeomLProp_SLProps
 from OCP.BRepFill import BRepFill_Filling
-from OCP.GeomAbs import GeomAbs_C0
+from OCP.GeomAbs import GeomAbs_C0, GeomAbs_Circle, GeomAbs_Line, GeomAbs_Plane
 from OCP.ShapeFix import ShapeFix_Face, ShapeFix_Shape
-from OCP.TopAbs import TopAbs_COMPOUND, TopAbs_EDGE, TopAbs_FACE, TopAbs_SHELL, TopAbs_REVERSED, TopAbs_VERTEX
+from OCP.TopAbs import TopAbs_COMPOUND, TopAbs_EDGE, TopAbs_FACE, TopAbs_FORWARD, TopAbs_SHELL, TopAbs_REVERSED, TopAbs_VERTEX
 from OCP.TopExp import TopExp, TopExp_Explorer
 from OCP.TopoDS import TopoDS, TopoDS_Compound, TopoDS_Iterator, TopoDS_Shape
 from OCP.BRepTools import BRepTools, BRepTools_ReShape
-from OCP.collections import IndexedMap_TopoDS_Shape_TopTools_ShapeMapHasher
+from OCP.collections import (IndexedDataMap_TopoDS_Shape_List_TopoDS_Shape_TopTools_ShapeMapHasher,
+                             IndexedMap_TopoDS_Shape_TopTools_ShapeMapHasher)
 from OCP.gp import gp_Ax1, gp_Ax2, gp_Ax3, gp_Circ, gp_Dir, gp_Pln, gp_Pnt
 from OCP.Geom import (Geom_ToroidalSurface, Geom_SphericalSurface, Geom_CylindricalSurface, Geom_ConicalSurface,
                       Geom_Plane)
@@ -201,6 +202,17 @@ def _loops(tris):
 
 # ---------------------------------------------------------------- shared edges
 
+def _crowded(pts, reach):
+    """The mesh points with another point within reach. Sewing merges such points (and
+    closes the edges between them) wherever faces arrive unjoined; faces joined on shared
+    corners there kept the tiny edges while an unshared face beside them (a facet left
+    as its triangles, a blend) had them closed up, and the two no longer met. So these
+    corners aren't shared: sewing joins the faces round them as it always did."""
+    from scipy.spatial import cKDTree
+    pairs = cKDTree(pts).query_pairs(reach, output_type="ndarray")
+    return set(int(i) for i in np.unique(pairs)) if len(pairs) else set()
+
+
 class Edges:
     """Builds each boundary run once, so the two faces on either side share one edge.
 
@@ -209,7 +221,7 @@ class Edges:
     smooth spline through the mesh points (which lie on both surfaces).
     """
 
-    def __init__(self, pts, pool=None, mesh=None, share=None):
+    def __init__(self, pts, pool=None, mesh=None, share=None, crowd=True):
         self.pts, self.cache = pts, {}
         self.mesh = mesh            # (for exact edges: the flat facets' planes)
         self.exacts = {}            # run key -> exact intersection edge, or None
@@ -221,11 +233,17 @@ class Edges:
         pool = {} if pool is None else pool
         self.corners = pool.setdefault("corners", {})   # mesh vertex id -> its TopoDS_Vertex
         self.lines = pool.setdefault("lines", {})       # (id, id) -> straight edge between them
+        # (crowd=False: every corner shared, for a build that is never sewn)
+        if self.shared and crowd and "crowded" not in pool:
+            pool["crowded"] = _crowded(pts, SHARED_CROWD)
+        self.crowded = pool.get("crowded", set()) if crowd else set()
 
     def corner(self, i):
         """The vertex at mesh point i, one for every edge ending there: faces whose edges
         share their ends (and edges) are joined already, and sewing is left only the
         seams it has to close."""
+        if i in self.crowded:
+            return BRepBuilderAPI_MakeVertex(_pnt(self.pts[i])).Vertex()
         if i not in self.corners:
             self.corners[i] = BRepBuilderAPI_MakeVertex(_pnt(self.pts[i])).Vertex()
         return self.corners[i]
@@ -233,7 +251,7 @@ class Edges:
     def line(self, i, j):
         """The straight edge from mesh vertex i to j (one per pair, shared by the faces
         either side when SHARED_CORNERS)."""
-        if not self.shared:
+        if not self.shared or i in self.crowded or j in self.crowded:
             return _line(self.pts[i], self.pts[j])
         key = (min(i, j), max(i, j))
         if key not in self.lines:
@@ -245,7 +263,10 @@ class Edges:
 
     def _on_corners(self, edge, first, last):
         """The edge rebuilt on the shared vertices at mesh points first and last (it starts
-        and ends at those points already); the edge as it was if OCC won't."""
+        and ends at those points already); the edge as it was if OCC won't, or if either
+        point is crowded (left to sewing)."""
+        if first in self.crowded or last in self.crowded:
+            return edge
         if (TopExp.FirstVertex_s(edge, True).IsSame(self.corner(first))
                 and TopExp.LastVertex_s(edge, True).IsSame(self.corner(last))):
             return edge
@@ -337,7 +358,10 @@ OUTLINE_FIRST = 300     # facets: a freeform patch this big gets its face from i
 TRYING = {x.strip() for x in os.environ.get("STL2CURVES_TRY", "").split(",") if x.strip()}
 SHARED_CORNERS = "shared" in TRYING     # one vertex per mesh point; flat-to-flat edges shared
 SHARED_TOLERANCE = 0.005    # mm: a flat face mended within this keeps its shared edges and corners
+SHARED_CROWD = 0.02     # mm: a mesh point this near another keeps corners of its own, for sewing to merge
 EXACT_EDGES = "exact" in TRYING         # a run between two analytic surfaces is their exact intersection
+REJOIN = "rejoin" in TRYING             # faces joined where they are the same already, before sewing
+REJOIN_SNAP = 1e-7      # mm: corners this near one mesh point are that point (copies read back from files)
 EXACT_DEV = 0.02        # mm: most a run's mesh points may lie off that curve (else a spline)
 
 
@@ -618,6 +642,13 @@ def _wire(mesh, loop, tags, edges, bounds):
 
 # ---------------------------------------------------------------- faces
 
+def _count(shape, kind):
+    """How many sub-shapes of this kind the shape has (each counted once)."""
+    m = IndexedMap_TopoDS_Shape_TopTools_ShapeMapHasher()
+    TopExp.MapShapes_s(shape, kind, m)
+    return m.Extent()
+
+
 def _max_tolerance(shape):
     """The widest tolerance of the shape's edges and vertices."""
     worst = 0.0
@@ -745,16 +776,20 @@ def _plane_face(mesh, fid, tris, owner, bounds, edge_tri, edges):
     if not maker.IsDone():
         return None
     face = maker.Face()
+    own = False         # (shared: is the face on copies of its edges now?)
     if edges.shared:
         # ShapeFix widens the tolerances of the edges and corners it is given, in place,
-        # as far as a gap in the outline needs (a millimetre, once): shared, that would
-        # spread to every face round them. So it tries a copy first, and only a face it
-        # mends within SHARED_TOLERANCE is mended on its shared edges; the rest keep
-        # their own (widened) copies, as every face did before corners were shared.
+        # as far as a gap in the outline needs (a millimetre, once), and drops or merges
+        # edges it finds too small: shared, that would spread to every face round them
+        # (and later builds reusing them). So it tries a copy first, and only a face it
+        # mends within SHARED_TOLERANCE, keeping every edge, is mended on its shared
+        # edges; the rest keep their own copies, as every face did before corners were
+        # shared, for sewing to join.
         probe = ShapeFix_Face(TopoDS.Face(BRepBuilderAPI_Copy(face).Shape()))
         probe.Perform()
-        if _max_tolerance(probe.Face()) > SHARED_TOLERANCE:
-            face = probe.Face()
+        if (_max_tolerance(probe.Face()) > SHARED_TOLERANCE
+                or _count(probe.Face(), TopAbs_EDGE) != _count(face, TopAbs_EDGE)):
+            face, own = probe.Face(), True
         else:
             fix = ShapeFix_Face(face)
             fix.Perform()
@@ -764,6 +799,8 @@ def _plane_face(mesh, fid, tris, owner, bounds, edge_tri, edges):
         fix.Perform()
         face = fix.Face()
     if mesh.noise and not BRepCheck_Analyzer(face).IsValid():
+        if edges.shared and not own:
+            face = TopoDS.Face(BRepBuilderAPI_Copy(face).Shape())
         # (edges a rounding step off the plane: widen their tolerances to match)
         whole = ShapeFix_Shape(face)
         whole.SetPrecision(mesh.noise)
@@ -1890,10 +1927,13 @@ def build_faces(mesh, features, tol):
     return comp, shells, failed
 
 
-def sew(shape, tol, shells=()):
+def sew(shape, tol, shells=(), pts=None):
     """Sew the faces into shells; closed shells made elsewhere (whole spheres) are added as
-    they are. Returns (shape, midpoints of the edges left unmatched)."""
-    if SHARED_CORNERS:
+    they are. Returns (shape, midpoints of the edges left unmatched). pts: the mesh's
+    points, for REJOIN."""
+    if REJOIN and pts is not None:
+        shape = _rejoin(shape, pts)
+    elif SHARED_CORNERS:
         # (sewing hands faces whose edges were shared already on unchanged, and the checks
         # after it widen tolerances in place: on the faces and edges build_faces keeps
         # for the next attempt, which then sewed apart. A copy keeps them as built,
@@ -1917,6 +1957,107 @@ def sew(shape, tol, shells=()):
     for shell in shells:
         builder.Add(comp, shell)
     return comp, free
+
+
+def _rejoin(shape, pts):
+    """A copy of the faces joined where they are the same already, before sewing: corners
+    at one mesh point (within REJOIN_SNAP) become one vertex, and edges between the same
+    two corners on the same curve one edge. Faces cut in the worker processes come back
+    as copies (read from files), on corners and edges of their own, so sewing had to
+    match nearly every edge of a part (19,650 of 21,740 on the GPS case); it costs about
+    as much per edge left to match as per face. Only exact matches are joined: an arc
+    beside a chord is a gap for sewing to close."""
+    from scipy.spatial import cKDTree
+    builder = BRep_Builder()
+    shape = BRepBuilderAPI_Copy(shape, True, False).Shape()
+    # corners
+    vmap = IndexedMap_TopoDS_Shape_TopTools_ShapeMapHasher()
+    TopExp.MapShapes_s(shape, TopAbs_VERTEX, vmap)
+    verts = [TopoDS.Vertex(vmap.FindKey(i)) for i in range(1, vmap.Extent() + 1)]
+    if not verts:
+        return shape
+    P = np.array([(lambda p: (p.X(), p.Y(), p.Z()))(BRep_Tool.Pnt_s(v)) for v in verts])
+    dist, near = cKDTree(pts).query(P)
+    groups = {}
+    for k in np.flatnonzero(dist <= REJOIN_SNAP):
+        groups.setdefault(int(near[k]), []).append(int(k))
+    reshape = BRepTools_ReShape()
+    for ks in groups.values():
+        if len(ks) < 2:
+            continue
+        keep = verts[ks[0]]
+        reach = max(BRep_Tool.Tolerance_s(verts[k]) + float(np.linalg.norm(P[k] - P[ks[0]])) for k in ks)
+        if reach > BRep_Tool.Tolerance_s(keep):
+            builder.UpdateVertex(keep, reach)       # (sew's own copy)
+        for k in ks[1:]:
+            reshape.Replace(verts[k], keep.Oriented(verts[k].Orientation()))
+    shape = reshape.Apply(shape)
+    # edges: the free ones, by their two corners
+    emap = IndexedDataMap_TopoDS_Shape_List_TopoDS_Shape_TopTools_ShapeMapHasher()
+    TopExp.MapShapesAndAncestors_s(shape, TopAbs_EDGE, TopAbs_FACE, emap)
+    vmap = IndexedMap_TopoDS_Shape_TopTools_ShapeMapHasher()
+    TopExp.MapShapes_s(shape, TopAbs_VERTEX, vmap)
+    by_ends = {}
+    for i in range(1, emap.Extent() + 1):
+        if emap.FindFromIndex(i).Size() != 1:
+            continue
+        e = TopoDS.Edge(emap.FindKey(i))
+        if BRep_Tool.Degenerated_s(e):
+            continue
+        a, b = TopExp.FirstVertex_s(e), TopExp.LastVertex_s(e)
+        if a.IsNull() or b.IsNull():
+            continue
+        ia, ib = vmap.FindIndex(a), vmap.FindIndex(b)
+        by_ends.setdefault((min(ia, ib), max(ia, ib)), []).append(i)
+
+    def face_of(i):
+        return TopoDS.Face(emap.FindFromIndex(i).First())
+
+    def flat(i):
+        return BRepAdaptor_Surface(face_of(i), False).GetType() == GeomAbs_Plane
+
+    def middle(c):
+        return c.Value(0.5 * (c.FirstParameter() + c.LastParameter()))
+
+    reshape = BRepTools_ReShape()
+    for ii in by_ends.values():
+        if len(ii) < 2:
+            continue
+        used = set()
+        for x in ii:
+            for y in ii:
+                if x in used:
+                    break
+                if y == x or y in used:
+                    continue
+                # keep the edge of a curved face (k), and give it to the other face (r)
+                k, r = (y, x) if flat(x) and not flat(y) else (x, y)
+                ek, er = TopoDS.Edge(emap.FindKey(k)), TopoDS.Edge(emap.FindKey(r))
+                ck, cr = BRepAdaptor_Curve(ek), BRepAdaptor_Curve(er)
+                if middle(ck).Distance(middle(cr)) > 10 * REJOIN_SNAP:
+                    continue
+                same_way = TopExp.FirstVertex_s(ek).IsSame(TopExp.FirstVertex_s(er))
+                same_params = (abs(ck.FirstParameter() - cr.FirstParameter()) <= 1e-9
+                               and abs(ck.LastParameter() - cr.LastParameter()) <= 1e-9)
+                r_flat = flat(r)
+                if not (same_way and same_params):
+                    # (r's curve on its surface is then in other parameters: only a flat
+                    # face does without one, and only lines and arcs are surely one curve)
+                    if not r_flat or ck.GetType() != cr.GetType() or ck.GetType() not in (GeomAbs_Line, GeomAbs_Circle):
+                        continue
+                tol = max(BRep_Tool.Tolerance_s(ek), BRep_Tool.Tolerance_s(er))
+                if not r_flat:
+                    face = face_of(r)
+                    c2d = BRep_Tool.CurveOnSurface_s(er, face, cr.FirstParameter(), cr.LastParameter())
+                    if c2d is None:
+                        continue
+                    loc = TopLoc_Location()
+                    builder.UpdateEdge(ek, c2d, BRep_Tool.Surface_s(face, loc), loc, tol)
+                elif tol > BRep_Tool.Tolerance_s(ek):
+                    builder.UpdateEdge(ek, tol)
+                reshape.Replace(er.Oriented(TopAbs_FORWARD), ek.Oriented(TopAbs_FORWARD if same_way else TopAbs_REVERSED))
+                used |= {x, y}
+    return reshape.Apply(shape)
 
 
 def _without_collapsed(shape, tol):
