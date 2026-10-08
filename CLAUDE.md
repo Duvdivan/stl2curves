@@ -207,6 +207,32 @@ in local coordinates and the solid gets the mesh's global placement. Keep
 `FreeCAD.exe --user-cfg <copy of user.cfg> -M <repo> script.py` (loads it without
 installing; a script's prints don't reach the console, so write to a file).
 
+Experiments (2026-10-07, after a survey of other tools: see memory prior-art), each off
+unless named in the environment variable `STL2CURVES_TRY` (comma-separated), so each can
+be judged alone by full regressions (`compare/regress_try.sh` runs them all):
+
+- `shared` (build.SHARED_CORNERS): `Edges` gives every edge the one vertex per mesh
+  point and shares flat-to-flat edges, kept for all of a part's attempts, so faces arrive
+  at sewing joined (GPS bare sew 11 -> 4 s, rounds 9 -> 7 s). Hazards met: anything that
+  mends shapes in place now spreads through shared corners (the splitter widened them to
+  8 mm: `SetNonDestructive`, on for everyone now; ShapeFix on flat faces: tried on a copy
+  first, `SHARED_TOLERANCE`; the checks after sewing: sew works on a copy); one blend fill
+  on such edges ground on for 20 min (fills keep unshared edges). Open: corners closer
+  than the sewing tolerance are no longer merged by sewing (Rak N-USB +217 faces).
+- `exact` (build.EXACT_EDGES): a run between two analytic surfaces (a flat facet's plane,
+  cylinder, cone, sphere, torus) is their exact intersection (`GeomAPI_IntSS`), trimmed
+  at the run's corners (widened to cover their distance off it), if every point of the
+  run lies within `EXACT_DEV`. A periodic curve on a single mesh edge must go the short way
+  (a 0.2 mm chord became a 1,055 mm ellipse), and the length must match the run's.
+- `swap` (assemble.py): no sewing and no rounds. The bare facets' faces on shared edges
+  make the start; each patch's face is made on its surface from the edges round its
+  facets (ShapeFix adds pcurves; tolerances restored if refused), checked alone (valid,
+  area, outward, volume roughly, edges reused, `MAX_EDGE_TOL`) and swapped in, else its
+  fallbacks (as `_build` picks them) are tried. Version 0 keeps the mesh's chords as the
+  curved faces' outlines. GPS: 7,158 faces, valid, read back OK, build stage ~315 s.
+- `local.py` (helpers, always available): swap faces/edges in a big shape at the cost of
+  the faces touched (`apply_local`: two-step ReShape), local edge maps; `tests/test_local.py`.
+
 Key contracts:
 
 - **`Feature`** (dataclass in `features.py`): `model`, `kind` (`revolve`, `wedge`,

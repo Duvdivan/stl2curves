@@ -30,6 +30,7 @@ from OCP.collections import HArray1_gp_Pnt
 from OCP.collections import List_TopoDS_Shape
 from OCP.GC import GC_MakeArcOfCircle
 from OCP.GCPnts import GCPnts_AbscissaPoint
+from OCP.GeomAdaptor import GeomAdaptor_Curve
 from OCP.BRepMesh import BRepMesh_IncrementalMesh
 from OCP.TopLoc import TopLoc_Location
 from OCP.GeomAPI import GeomAPI_ProjectPointOnSurf
@@ -37,13 +38,15 @@ from OCP.GeomLProp import GeomLProp_SLProps
 from OCP.BRepFill import BRepFill_Filling
 from OCP.GeomAbs import GeomAbs_C0
 from OCP.ShapeFix import ShapeFix_Face, ShapeFix_Shape
-from OCP.TopAbs import TopAbs_COMPOUND, TopAbs_EDGE, TopAbs_FACE, TopAbs_SHELL, TopAbs_REVERSED
+from OCP.TopAbs import TopAbs_COMPOUND, TopAbs_EDGE, TopAbs_FACE, TopAbs_SHELL, TopAbs_REVERSED, TopAbs_VERTEX
 from OCP.TopExp import TopExp, TopExp_Explorer
 from OCP.TopoDS import TopoDS, TopoDS_Compound, TopoDS_Iterator, TopoDS_Shape
 from OCP.BRepTools import BRepTools, BRepTools_ReShape
 from OCP.collections import IndexedMap_TopoDS_Shape_TopTools_ShapeMapHasher
 from OCP.gp import gp_Ax1, gp_Ax2, gp_Ax3, gp_Circ, gp_Dir, gp_Pln, gp_Pnt
-from OCP.Geom import Geom_ToroidalSurface
+from OCP.Geom import (Geom_ToroidalSurface, Geom_SphericalSurface, Geom_CylindricalSurface, Geom_ConicalSurface,
+                      Geom_Plane)
+from OCP.GeomAPI import GeomAPI_IntSS, GeomAPI_ProjectPointOnCurve
 
 from . import features as features_mod
 from . import workers
@@ -206,8 +209,75 @@ class Edges:
     smooth spline through the mesh points (which lie on both surfaces).
     """
 
-    def __init__(self, pts):
+    def __init__(self, pts, pool=None, mesh=None, share=None):
         self.pts, self.cache = pts, {}
+        self.mesh = mesh            # (for exact edges: the flat facets' planes)
+        self.exacts = {}            # run key -> exact intersection edge, or None
+        # Corners are shared only with a pool (build_faces': kept across a part's attempts,
+        # so a flat face reused from an earlier attempt shares its corners and edges with
+        # one built now). Blend fills (settle_blends) keep edges of their own: one fill on
+        # edges rebuilt on shared corners ground on for 20 minutes.
+        self.shared = (SHARED_CORNERS if share is None else share) and pool is not None
+        pool = {} if pool is None else pool
+        self.corners = pool.setdefault("corners", {})   # mesh vertex id -> its TopoDS_Vertex
+        self.lines = pool.setdefault("lines", {})       # (id, id) -> straight edge between them
+
+    def corner(self, i):
+        """The vertex at mesh point i, one for every edge ending there: faces whose edges
+        share their ends (and edges) are joined already, and sewing is left only the
+        seams it has to close."""
+        if i not in self.corners:
+            self.corners[i] = BRepBuilderAPI_MakeVertex(_pnt(self.pts[i])).Vertex()
+        return self.corners[i]
+
+    def line(self, i, j):
+        """The straight edge from mesh vertex i to j (one per pair, shared by the faces
+        either side when SHARED_CORNERS)."""
+        if not self.shared:
+            return _line(self.pts[i], self.pts[j])
+        key = (min(i, j), max(i, j))
+        if key not in self.lines:
+            maker = BRepBuilderAPI_MakeEdge(self.corner(key[0]), self.corner(key[1]))
+            # (an edge shorter than its corners' tolerances won't make: on its own corners)
+            self.lines[key] = maker.Edge() if maker.IsDone() else _line(self.pts[key[0]], self.pts[key[1]])
+        edge = self.lines[key]
+        return edge if i == key[0] else TopoDS.Edge(edge.Reversed())
+
+    def _on_corners(self, edge, first, last):
+        """The edge rebuilt on the shared vertices at mesh points first and last (it starts
+        and ends at those points already); the edge as it was if OCC won't."""
+        if (TopExp.FirstVertex_s(edge, True).IsSame(self.corner(first))
+                and TopExp.LastVertex_s(edge, True).IsSame(self.corner(last))):
+            return edge
+        if edge.Orientation() == TopAbs_REVERSED:
+            return TopoDS.Edge(self._on_corners(TopoDS.Edge(edge.Reversed()), last, first).Reversed())
+        try:
+            c = BRepAdaptor_Curve(edge)
+            curve = BRep_Tool.Curve_s(edge, 0.0, 0.0)
+            maker = BRepBuilderAPI_MakeEdge(curve, self.corner(first), self.corner(last),
+                                            c.FirstParameter(), c.LastParameter())
+            return maker.Edge() if maker.IsDone() else edge
+        except Exception:
+            return edge
+
+    def exact(self, ids, make):
+        """The run's exact edge (make: canonical ids -> edge or None), cached like get but
+        None kept as an answer: the caller then builds the run as before."""
+        ids = [int(i) for i in ids]
+        if len(ids) > 2 and ids[0] == ids[-1]:
+            return None
+        flip = ids[0] > ids[-1]
+        canon = ids[::-1] if flip else ids
+        key = tuple(canon)
+        if key not in self.exacts:
+            try:
+                self.exacts[key] = make(canon)
+            except Exception:
+                self.exacts[key] = None
+        edge = self.exacts[key]
+        if edge is None:
+            return None
+        return TopoDS.Edge(edge.Reversed()) if flip else edge
 
     def get(self, ids, make):
         ids = [int(i) for i in ids]
@@ -232,6 +302,8 @@ class Edges:
                 self.cache[key] = None
             if self.cache[key] is None and make != self.spline:
                 self.cache[key] = self.spline(canon)
+            if self.shared and self.cache[key] is not None:
+                self.cache[key] = self._on_corners(self.cache[key], canon[0], canon[-1])
         edge = self.cache[key]
         if edge is None:
             return None
@@ -245,7 +317,7 @@ class Edges:
         keep = np.r_[True, np.linalg.norm(np.diff(pts, axis=0), axis=1) > 1e-6]
         pts = pts[keep]
         if len(pts) == 2 and not closed:
-            return _line(pts[0], pts[1])
+            return self.line(ids[0], ids[-1])
         pts = _even(pts, closed)
         arr = HArray1_gp_Pnt(1, len(pts))
         for i, p in enumerate(pts):
@@ -260,6 +332,13 @@ class Edges:
 LONG_STEP = 3.0     # a step this many times the run's typical one gets points along it
 PARALLEL_CUTS = 8   # patches: this many faces to cut at once go to the worker processes
 OUTLINE_FIRST = 300     # facets: a freeform patch this big gets its face from its outline first
+# Experiments, off unless named in the environment variable STL2CURVES_TRY (comma-separated),
+# so each can be tried on its own in full regressions: shared, exact (and swap, see convert)
+TRYING = {x.strip() for x in os.environ.get("STL2CURVES_TRY", "").split(",") if x.strip()}
+SHARED_CORNERS = "shared" in TRYING     # one vertex per mesh point; flat-to-flat edges shared
+SHARED_TOLERANCE = 0.005    # mm: a flat face mended within this keeps its shared edges and corners
+EXACT_EDGES = "exact" in TRYING         # a run between two analytic surfaces is their exact intersection
+EXACT_DEV = 0.02        # mm: most a run's mesh points may lie off that curve (else a spline)
 
 
 def _even(pts, closed):
@@ -283,6 +362,105 @@ def _even(pts, closed):
     return np.array(out)
 
 
+def _analytic_surface(model):
+    """The model's surface as an OCC surface (cylinder, cone, torus, sphere), or None."""
+    if isinstance(model, Sphere):
+        return Geom_SphericalSurface(gp_Ax3(_pnt(model.c), gp_Dir(0, 0, 1)), float(model.r))
+    if not isinstance(model, Revolved):
+        return None
+    a, d = np.asarray(model.a, float), np.asarray(model.d, float)
+    if model.line:
+        c0, k = model.line
+        if abs(k) < 1e-9:
+            return Geom_CylindricalSurface(gp_Ax3(_pnt(a), gp_Dir(*d)), float(c0)) if c0 > 0 else None
+        if abs(c0) < 1e-9 or abs(math.atan(k)) >= math.pi / 2 - 1e-6:
+            return None
+        return Geom_ConicalSurface(gp_Ax3(_pnt(a), gp_Dir(*d)), float(math.atan(k)), float(c0)) if c0 > 0 else None
+    rc, zc, r = model.circle
+    if rc <= 0 or r <= 0:
+        return None
+    return Geom_ToroidalSurface(gp_Ax3(_pnt(a + zc * d), gp_Dir(*d)), float(rc), float(r))
+
+
+def _side_surface(mesh, bounds, side):
+    """The surface on one side of a run: ("patch", k) or a flat facet's id."""
+    if isinstance(side, tuple):
+        return _analytic_surface(bounds[side[1]].m)
+    centre = mesh.pts[mesh.fverts[side]].mean(axis=0)
+    return Geom_Plane(gp_Pln(_pnt(centre), gp_Dir(*mesh.fn[side])))
+
+
+def _exact_edge(mesh, edges, bounds, k, other, ids):
+    """The exact intersection of patch k's surface and the other side's (a flat facet or
+    patch), between the run's end corners, if every mesh point of the run lies within
+    EXACT_DEV of it; else None (the run becomes a spline)."""
+    s1 = _analytic_surface(bounds[k].m)
+    s2 = _side_surface(mesh, bounds, other)
+    if s1 is None or s2 is None:
+        return None
+    pts = mesh.pts[ids]
+    closed = len(ids) > 3 and ids[0] == ids[-1]
+    if closed:
+        return None                         # (whole loops: left as they are, for now)
+    inter = GeomAPI_IntSS(s1, s2, 1e-7)
+    if not inter.IsDone() or inter.NbLines() == 0:
+        return None
+    best = None
+    for i in range(1, inter.NbLines() + 1):
+        curve = inter.Line(i)
+        params, worst = [], 0.0
+        for p in pts:
+            proj = GeomAPI_ProjectPointOnCurve(_pnt(p), curve)
+            if proj.NbPoints() == 0:
+                worst = math.inf
+                break
+            params.append(proj.LowerDistanceParameter())
+            worst = max(worst, proj.LowerDistance())
+        if worst <= EXACT_DEV and (best is None or worst < best[0]):
+            best = (worst, curve, params)
+    if best is None:
+        return None
+    worst, curve, params = best
+    t0, t1 = params[0], params[-1]
+    if curve.IsPeriodic():
+        # the way round that passes the middle points (a single mesh edge has none: the
+        # shorter way; taking the other gave a 0.2 mm chord a 1,055 mm ellipse)
+        period = curve.Period()
+        t1 = t0 + (t1 - t0) % period
+        if len(params) > 2:
+            mid = params[len(params) // 2]
+            if not t0 <= t0 + (mid - t0) % period <= t1:
+                t1 -= period
+        elif t1 - t0 > period / 2:
+            t1 -= period
+    reverse = t1 < t0
+    lo, hi = (t1, t0) if reverse else (t0, t1)
+    if hi - lo < 1e-9:
+        return None
+    # (and no longer than the run itself, give or take a chord's sag: else a wrong branch)
+    chord = float(np.linalg.norm(np.diff(pts, axis=0), axis=1).sum())
+    length = GCPnts_AbscissaPoint.Length_s(GeomAdaptor_Curve(curve, lo, hi))
+    if abs(length - chord) > 0.02 * chord + EXACT_DEV / 4:
+        return None
+    # the corners sit off the exact curve by up to the mesh's error: their tolerance covers it
+    builder = BRep_Builder()
+    for end, t in ((ids[0], t0), (ids[-1], t1)):
+        v = edges.corner(end)
+        gap = curve.Value(t).Distance(_pnt(mesh.pts[end]))
+        if gap * 1.2 + 1e-7 > BRep_Tool.Tolerance_s(v):
+            builder.UpdateVertex(v, gap * 1.2 + 1e-7)
+    first, last = (edges.corner(ids[-1]), edges.corner(ids[0])) if reverse else (edges.corner(ids[0]), edges.corner(ids[-1]))
+    maker = BRepBuilderAPI_MakeEdge(curve, first, last, lo, hi)
+    if not maker.IsDone():
+        return None
+    edge = maker.Edge()
+    _exact_edge.count += 1
+    return TopoDS.Edge(edge.Reversed()) if reverse else edge
+
+
+_exact_edge.count = 0
+
+
 def _run_edge(edges, bounds, tag, ids, patch_side=False):
     """Edge for a run of mesh vertices; tag = (patch, boundary line or None, ...).
 
@@ -291,12 +469,16 @@ def _run_edge(edges, bounds, tag, ids, patch_side=False):
     (sewing closes the tiny gap, which is no bigger than the facet's own error).
     """
     k, label = tag[0], tag[1]
+    if EXACT_EDGES and label is None and len(tag) > 2 and tag[2] is not None and edges.mesh is not None:
+        edge = edges.exact(ids, lambda canon: _exact_edge(edges.mesh, edges, bounds, k, tag[2], canon))
+        if edge is not None:
+            return edge
     if label is None and len(ids) == 2:
         # (a smooth blend's or freeform surface's face is fitted to its outline, so the
         # chord serves it; a bow would leave the flat face beside it an edge off its plane,
         # which then won't merge with the flat faces round it)
         if not patch_side or bounds[k].f.kind == "blend" or bounds[k].m.kind in ("freeform", "pipe", "extrusion"):
-            return _line(edges.pts[ids[0]], edges.pts[ids[1]])
+            return edges.line(int(ids[0]), int(ids[1]))
         m = bounds[k].m
         a, b = edges.pts[ids[0]], edges.pts[ids[1]]
         mid = ((a + b) / 2)[None]
@@ -394,14 +576,16 @@ def _split_sharp(runs, pts):
     return out
 
 
-def _loop_tags(mesh, loop, owner, bounds, edge_tri, patch=None):
+def _loop_tags(mesh, loop, owner, bounds, edge_tri, patch=None, own=None):
     """Tag each edge of a boundary loop.
 
     None: a plain mesh edge between two flat facets. Otherwise (patch, boundary line):
     a curved patch is involved (the loop's own patch if `patch` is given, else the
     neighbouring one); the boundary line is the patch's line the edge runs along, or
     None if it runs along a trimmed outline. On a patch's own outline a third item
-    records the neighbour, so runs split exactly where the neighbouring face's do.
+    records the neighbour, so runs split exactly where the neighbouring face's do; on a
+    flat facet's outline it is the facet itself (own), so both sides of a run know both
+    surfaces (EXACT_EDGES).
     """
     pts, n, tags = mesh.pts, len(loop), []
     for i in range(n):
@@ -414,7 +598,7 @@ def _loop_tags(mesh, loop, owner, bounds, edge_tri, patch=None):
             tags.append(None)
             continue
         both = bounds[ref].labels(pts[a]) & bounds[ref].labels(pts[b])
-        tags.append((ref, min(both) if both else None, neighbour if patch is not None else None))
+        tags.append((ref, min(both) if both else None, neighbour if patch is not None else own))
     return tags
 
 
@@ -423,7 +607,7 @@ def _wire(mesh, loop, tags, edges, bounds):
     pts = mesh.pts
     for tag, run in _split_sharp(_runs(loop, tags), pts):
         if tag is None:
-            wire.Add(_line(pts[run[0]], pts[run[1]]))
+            wire.Add(edges.line(int(run[0]), int(run[1])))
             continue
         edge = _run_edge(edges, bounds, tag, run)
         if edge is None:
@@ -433,6 +617,19 @@ def _wire(mesh, loop, tags, edges, bounds):
 
 
 # ---------------------------------------------------------------- faces
+
+def _max_tolerance(shape):
+    """The widest tolerance of the shape's edges and vertices."""
+    worst = 0.0
+    for kind in (TopAbs_EDGE, TopAbs_VERTEX):
+        ex = TopExp_Explorer(shape, kind)
+        while ex.More():
+            x = ex.Current()
+            worst = max(worst, BRep_Tool.Tolerance_s(TopoDS.Edge(x)) if kind == TopAbs_EDGE
+                        else BRep_Tool.Tolerance_s(TopoDS.Vertex(x)))
+            ex.Next()
+    return worst
+
 
 def _planar_face(mesh, fid, owner, bounds, edge_tri, edges):
     """The flat facet's face; a facet whose outline touches itself (two holes meeting
@@ -513,7 +710,7 @@ def _plane_face(mesh, fid, tris, owner, bounds, edge_tri, edges):
     wires = []
     for loop in loops:
         n = len(loop)
-        tags = _loop_tags(mesh, loop, owner, bounds, edge_tri)
+        tags = _loop_tags(mesh, loop, owner, bounds, edge_tri, own=int(fid))
         whole = all(t is not None and t == tags[0] for t in tags)
         if whole and tags[0][1] in ("lo", "hi") and bounds[tags[0][0]].f.kind == "revolve":
             bound = bounds[tags[0][0]]
@@ -547,9 +744,25 @@ def _plane_face(mesh, fid, tris, owner, bounds, edge_tri, edges):
         maker.Add(w)
     if not maker.IsDone():
         return None
-    fix = ShapeFix_Face(maker.Face())
-    fix.Perform()
-    face = fix.Face()
+    face = maker.Face()
+    if edges.shared:
+        # ShapeFix widens the tolerances of the edges and corners it is given, in place,
+        # as far as a gap in the outline needs (a millimetre, once): shared, that would
+        # spread to every face round them. So it tries a copy first, and only a face it
+        # mends within SHARED_TOLERANCE is mended on its shared edges; the rest keep
+        # their own (widened) copies, as every face did before corners were shared.
+        probe = ShapeFix_Face(TopoDS.Face(BRepBuilderAPI_Copy(face).Shape()))
+        probe.Perform()
+        if _max_tolerance(probe.Face()) > SHARED_TOLERANCE:
+            face = probe.Face()
+        else:
+            fix = ShapeFix_Face(face)
+            fix.Perform()
+            face = fix.Face()
+    else:
+        fix = ShapeFix_Face(face)
+        fix.Perform()
+        face = fix.Face()
     if mesh.noise and not BRepCheck_Analyzer(face).IsValid():
         # (edges a rounding step off the plane: widen their tolerances to match)
         whole = ShapeFix_Shape(face)
@@ -1026,6 +1239,10 @@ def _split_face(feature, mesh, base, tools, loops, tol):
     # (a fitted freeform surface passes a little off the outline's corners, which the
     # outline edges run through)
     splitter.SetFuzzyValue(max(10 * tol, 1e-4, 2 * getattr(m, "rim_dev", 0.0)))
+    # (otherwise it widens the tolerances of the outline edges it is given, in place:
+    # those are shared with the faces beside the patch, whose corners came out 8 mm
+    # "wide" and then joined to anything)
+    splitter.SetNonDestructive(True)
     splitter.Build()
     if not splitter.IsDone():
         return None
@@ -1113,6 +1330,7 @@ BLEND_SECONDS = 300     # time allowed for fitting blends; the rest keep their e
 FINE_BLENDS = 150       # a part with more blends than this is mostly freeform: skip the finer (slower) refits
 PARALLEL_FILLS = 40     # without worker processes, more fills than this start them
 FILL_SECONDS = 5        # a fill in a worker process still running after this long counts as failed
+ASSESS_SECONDS = 60     # longest wait for the fit checks of a batch of fills (behind overrunning fills)
 BUILD_SHARE = 0.35      # of the conversion's time limit, what is kept back for building and checking
                         # the part (blends not fitted by then keep their exact pieces or facets)
 
@@ -1210,9 +1428,12 @@ def _fill_all(jobs):
                         judged[key] = pool.submit(_assess_job, (a[3], pieces[key]))
                 out[key] = (face, None)
             # (an overrunning fill can't be stopped inside OpenCascade; its worker is left
-            # to finish it, and the workers are restarted once the part is done)
+            # to finish it, and the workers are restarted once the part is done. Checks
+            # queued behind such fills are waited for only so long: unjudged, a face is
+            # judged later, here)
+            wait(list(judged.values()), timeout=ASSESS_SECONDS)
             for key, f in judged.items():
-                if f.exception() is None:
+                if f.done() and not f.cancelled() and f.exception() is None:
                     out[key] = (out[key][0], f.result())
         except Exception:
             out = {}                    # (the worker processes broke down: do them here)
@@ -1595,7 +1816,7 @@ def build_faces(mesh, features, tol):
     builder = BRep_Builder()
     builder.MakeCompound(comp)
     failed, shells = [], []
-    edges = Edges(mesh.pts)
+    edges = Edges(mesh.pts, mesh.__dict__.setdefault("corner_pool", {}), mesh)
     keys = []
     for f in features:
         if "_across" not in f.__dict__:
@@ -1672,6 +1893,12 @@ def build_faces(mesh, features, tol):
 def sew(shape, tol, shells=()):
     """Sew the faces into shells; closed shells made elsewhere (whole spheres) are added as
     they are. Returns (shape, midpoints of the edges left unmatched)."""
+    if SHARED_CORNERS:
+        # (sewing hands faces whose edges were shared already on unchanged, and the checks
+        # after it widen tolerances in place: on the faces and edges build_faces keeps
+        # for the next attempt, which then sewed apart. A copy keeps them as built,
+        # the sharing within it kept; 0.7 s on 38,000 faces)
+        shape = BRepBuilderAPI_Copy(shape, True, False).Shape()
     s = BRepBuilderAPI_Sewing(tol)
     s.Add(shape)
     s.Perform()

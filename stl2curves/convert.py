@@ -72,7 +72,7 @@ from . import __version__
 from . import features as features_mod
 from .features import load_stl, analyze, summarize, snap, half_rings, Mesh, TOL, time_left
 from .sizing import guess_size
-from .build import build_faces, sew, features_near, point_facet_distance, settle_blends
+from .build import build_faces, sew, features_near, point_facet_distance, settle_blends, TRYING
 from . import workers
 from .bodies import split_bodies
 from .blends import add_blends, split as split_blend, _blend as as_blend, fallback as blend_fallback, carve, pipe_fallback
@@ -827,12 +827,35 @@ def misjoined_edge_points(shape):
     return out
 
 
+def _swap_build(mesh, features, mesh_tol, tol, info):
+    """STL2CURVES_TRY=swap (an experiment): the body assembled patch by patch on the bare
+    facets' shared edges (assemble.py) rather than built, sewn and checked whole in rounds.
+    (shape, bodies, cavities), or None if that solid doesn't check out (then the sewing
+    build runs as usual)."""
+    from .assemble import assemble
+    try:
+        solid, kept, report = assemble(mesh, features, mesh_tol, tol)
+        shape, nb, nv, _ = solids_from_shells(solid, inward_shells(mesh))
+    except Exception:
+        return None
+    if not BRepCheck_Analyzer(shape, True, True).IsValid():
+        return None
+    used = {id(f) for f in kept}
+    info["skipped"] += [f for f in features if id(f) not in used]
+    info["assembly"] = report
+    return shape, nb, nv
+
+
 def _build(mesh, features, mesh_tol, tol, fuse, info):
     """Build and check one group of bodies, leaving faceted any feature that spoils it.
     Returns (shape, bodies, cavities)."""
     faceted_volume = mesh_volume(mesh)
     _bare_ahead(mesh, tol)
     features = settle_blends(mesh, features, mesh_tol, split_blend, info["skipped"])
+    if "swap" in TRYING:
+        got = _swap_build(mesh, features, mesh_tol, tol, info)
+        if got is not None:
+            return got
     # Each attempt builds and sews the whole body: on a mesh of a quarter million facets
     # that is minutes, and dropping troublemakers a few at a time took over an hour. So
     # after TROUBLE_SECONDS every patch near trouble goes at once (culprits), reaching
