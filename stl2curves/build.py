@@ -229,7 +229,7 @@ class Edges:
         # so a flat face reused from an earlier attempt shares its corners and edges with
         # one built now). Blend fills (settle_blends) keep edges of their own: one fill on
         # edges rebuilt on shared corners ground on for 20 minutes.
-        self.shared = (SHARED_CORNERS if share is None else share) and pool is not None
+        self.shared = (True if share is None else share) and pool is not None
         pool = {} if pool is None else pool
         self.corners = pool.setdefault("corners", {})   # mesh vertex id -> its TopoDS_Vertex
         self.lines = pool.setdefault("lines", {})       # (id, id) -> straight edge between them
@@ -250,7 +250,7 @@ class Edges:
 
     def line(self, i, j):
         """The straight edge from mesh vertex i to j (one per pair, shared by the faces
-        either side when SHARED_CORNERS)."""
+        either side when the build shares its corners)."""
         if not self.shared or i in self.crowded or j in self.crowded:
             return _line(self.pts[i], self.pts[j])
         key = (min(i, j), max(i, j))
@@ -353,15 +353,13 @@ class Edges:
 LONG_STEP = 3.0     # a step this many times the run's typical one gets points along it
 PARALLEL_CUTS = 8   # patches: this many faces to cut at once go to the worker processes
 OUTLINE_FIRST = 300     # facets: a freeform patch this big gets its face from its outline first
-# Experiments, off unless named in the environment variable STL2CURVES_TRY (comma-separated),
-# so each can be tried on its own in full regressions: shared, exact (and swap, see convert)
-TRYING = {x.strip() for x in os.environ.get("STL2CURVES_TRY", "").split(",") if x.strip()}
-SHARED_CORNERS = "shared" in TRYING     # one vertex per mesh point; flat-to-flat edges shared
 SHARED_TOLERANCE = 0.005    # mm: a flat face mended within this keeps its shared edges and corners
 SHARED_CROWD = 0.02     # mm: a mesh point this near another keeps corners of its own, for sewing to merge
-EXACT_EDGES = "exact" in TRYING         # a run between two analytic surfaces is their exact intersection
-REJOIN = "rejoin" in TRYING             # faces joined where they are the same already, before sewing
 REJOIN_SNAP = 1e-7      # mm: corners this near one mesh point are that point (copies read back from files)
+# Experiments, off unless named in the environment variable STL2CURVES_TRY (comma-separated),
+# so each can be tried on its own in full regressions: exact (and swap, see convert)
+TRYING = {x.strip() for x in os.environ.get("STL2CURVES_TRY", "").split(",") if x.strip()}
+EXACT_EDGES = "exact" in TRYING         # a run between two analytic surfaces is their exact intersection
 EXACT_DEV = 0.02        # mm: most a run's mesh points may lie off that curve (else a spline)
 
 
@@ -1930,10 +1928,10 @@ def build_faces(mesh, features, tol):
 def sew(shape, tol, shells=(), pts=None):
     """Sew the faces into shells; closed shells made elsewhere (whole spheres) are added as
     they are. Returns (shape, midpoints of the edges left unmatched). pts: the mesh's
-    points, for REJOIN."""
-    if REJOIN and pts is not None:
+    points, for joining corners and edges before sewing (_rejoin)."""
+    if pts is not None:
         shape = _rejoin(shape, pts, tol)
-    elif SHARED_CORNERS:
+    else:
         # (sewing hands faces whose edges were shared already on unchanged, and the checks
         # after it widen tolerances in place: on the faces and edges build_faces keeps
         # for the next attempt, which then sewed apart. A copy keeps them as built,
@@ -1969,7 +1967,9 @@ def _rejoin(shape, pts, tol):
     beside a chord is a gap for sewing to close, and an edge shorter than twice the sewing
     tolerance is sewing's to close up, with every edge meeting it (it merges the short
     edge's ends; with edges round it joined already, the edge came out closed up in one
-    face and gone from the other: no closed solid)."""
+    face and gone from the other: no closed solid). Their corners stay apart too: merged,
+    they changed how sewing matched the edges round them (a free edge left at the end of
+    a rounded edge, which the blame then dropped)."""
     from scipy.spatial import cKDTree
     builder = BRep_Builder()
     shape = BRepBuilderAPI_Copy(shape, True, False).Shape()
@@ -1981,12 +1981,22 @@ def _rejoin(shape, pts, tol):
         return shape
     P = np.array([(lambda p: (p.X(), p.Y(), p.Z()))(BRep_Tool.Pnt_s(v)) for v in verts])
     dist, near = cKDTree(pts).query(P)
+    short = set()
+    ex = TopExp_Explorer(shape, TopAbs_EDGE)
+    while ex.More():
+        e = TopoDS.Edge(ex.Current())
+        ex.Next()
+        if BRep_Tool.Degenerated_s(e):
+            continue
+        a, b = TopExp.FirstVertex_s(e), TopExp.LastVertex_s(e)
+        if not a.IsNull() and not b.IsNull() and BRep_Tool.Pnt_s(a).Distance(BRep_Tool.Pnt_s(b)) <= 2 * tol:
+            short |= {vmap.FindIndex(a) - 1, vmap.FindIndex(b) - 1}
     groups = {}
     for k in np.flatnonzero(dist <= REJOIN_SNAP):
         groups.setdefault(int(near[k]), []).append(int(k))
     reshape = BRepTools_ReShape()
     for ks in groups.values():
-        if len(ks) < 2:
+        if len(ks) < 2 or short.intersection(ks):
             continue
         keep = verts[ks[0]]
         reach = max(BRep_Tool.Tolerance_s(verts[k]) + float(np.linalg.norm(P[k] - P[ks[0]])) for k in ks)

@@ -207,37 +207,42 @@ in local coordinates and the solid gets the mesh's global placement. Keep
 `FreeCAD.exe --user-cfg <copy of user.cfg> -M <repo> script.py` (loads it without
 installing; a script's prints don't reach the console, so write to a file).
 
-Experiments (2026-10-07, after a survey of other tools: see memory prior-art), each off
-unless named in the environment variable `STL2CURVES_TRY` (comma-separated), so each can
-be judged alone by full regressions (`compare/regress_try.sh` runs them all):
+Shared corners and rejoin are on by default (since 2026-10-08). The other experiments
+(2026-10-07, after a survey of other tools: see memory prior-art) are each off unless named
+in the environment variable `STL2CURVES_TRY` (comma-separated), so each can be judged alone
+by full regressions (`compare/regress_try.sh` runs them all):
 
-- `shared` (build.SHARED_CORNERS): `Edges` gives every edge the one vertex per mesh
-  point and shares flat-to-flat edges, kept for all of a part's attempts, so faces arrive
-  at sewing joined (GPS bare sew 11 -> 4 s, rounds 9 -> 7 s). Hazards met: anything that
-  mends shapes in place now spreads through shared corners (the splitter widened them to
-  8 mm: `SetNonDestructive`, on for everyone now; ShapeFix on flat faces: tried on a copy
-  first, `SHARED_TOLERANCE`; the checks after sewing: sew works on a copy); one blend fill
-  on such edges ground on for 20 min (fills keep unshared edges). Mesh points within
-  `SHARED_CROWD` of another (duplicates, slivers 0.0001 mm across) keep corners of their
-  own (`_crowded`): sewing merges such points for unjoined faces, and faces joined there
-  kept the tiny edges and no longer met their unshared neighbours (ratchet: no solid).
-  ShapeFix mends a flat face on its shared edges only if a copy keeps every edge. Don't
-  close up edges shorter than the sewing tolerance yourself: fine meshes have real edges
-  of 0.005-0.05 mm (the tensioner came out invalid). Regression = baseline faces (14,741
-  vs 14,753); GPS 8,242 faces / 728 s vs 8,598 / 772 s. But curved faces cut in the
-  workers come back as copies, so with patches nearly every edge still needs sewing.
-- `rejoin` (build.REJOIN, `_rejoin` in `sew`): on sew's copy, corners at one mesh point
-  (within `REJOIN_SNAP`: copies read back from files) become one vertex, and free edges
-  with the same two corners and the same curve one edge (the curved face's kept, with
-  the other face's curve on its surface moved over; a flat face takes a line or arc
-  either way round). Arc-beside-chord pairs are gaps, left to sewing. GPS first round:
-  free edges 19,650 -> 9,340, sew 8.4 -> 4.5 s (+1.2 s rejoining). Edges meeting an
-  edge shorter than twice the sewing tolerance are left to sewing (it closes the short
-  edge up; joined round it, the edge came out closed in one face and gone from the
-  other: no closed solid, and the halving search took Rak SMA-USB to 1,754 faces). Same
-  day with `shared,rejoin` vs all off (2026-10-08): regression 14,780 vs 14,753 faces
-  (Uni-USB +50, ratchet -13, bracket -7 and now valid), 2,286 vs 2,349 s; GPS 8,195 vs
-  8,598 faces, 675 vs 785 s.
+- `shared`, on by default (`build.Edges`, `SHARED_TOLERANCE`, `SHARED_CROWD`): `build_faces` gives every
+  edge the one vertex per mesh point and shares flat-to-flat edges, kept for all of a
+  part's attempts, so faces arrive at sewing joined (GPS bare sew 11 -> 4 s, rounds 9 ->
+  7 s). Blend fills keep their own edges: one fill on shared edges ground on for 20 min.
+  Hazards met: anything that mends shapes in place spreads through shared corners (the
+  splitter widened them to 8 mm: `SetNonDestructive`; ShapeFix on flat faces is tried on a
+  copy first, `SHARED_TOLERANCE`; the checks after sewing run on a copy). Mesh points within
+  `SHARED_CROWD` of another (duplicates, slivers 0.0001 mm across) keep corners of their own
+  (`_crowded`): sewing merges such points for unjoined faces, and faces joined there kept
+  the tiny edges and no longer met their unshared neighbours (ratchet: no solid). Don't
+  close up edges shorter than the sewing tolerance yourself: fine meshes have real edges of
+  0.005-0.05 mm (the tensioner came out invalid).
+- `rejoin`, on by default (`build._rejoin` in `sew`, `REJOIN_SNAP`): on sew's copy, corners at one mesh
+  point (within `REJOIN_SNAP`: copies read back from files) become one vertex, and free
+  edges with the same two corners and the same curve become one edge (the curved face's
+  kept, the other face's curve moved onto its surface; a flat face takes a line or arc
+  either way round). Arc-beside-chord pairs are gaps, left to sewing. Two rules keep it
+  from breaking sewing. An edge shorter than twice the sewing tolerance is left to sewing,
+  with every edge meeting it: sewing closes the short edge up, and joined round it the edge
+  came out closed in one face and gone from the other (no closed solid; the halving search
+  took Rak SMA-USB to 1,754 faces). And the corners of a short edge stay apart: merged, they
+  changed how sewing matched the edges round them (Uni-USB got a free edge at the end of a
+  rounded edge, which the blame then dropped: +50 faces). GPS first round: free edges
+  19,650 -> 9,340, sew 8.4 -> 4.5 s.
+  Default (d1) vs all off (n7), same day: whole set of 28 parts 14,775 vs 14,753 faces,
+  2,359 vs 2,349 s; Rak Uni-USB 1,531 (as all off); Solar Panel Bracket Large 2,256 faces,
+  valid (all off: 2,222, invalid); the ratchet is invalid in both (d1: 1,753 faces, with a
+  STEP read-back warning that all off doesn't have). GPS 8,242 faces / 771 s vs 8,598 /
+  785 s. Before the corner rule (n6): whole set 14,780 faces, 2,286 s; Uni-USB +50 faces;
+  bracket 2,215 valid; GPS 8,195 / 675 s. So the corner rule buys back the Uni-USB fix at
+  about 73 s over the set (96 s on GPS) and +41 faces on the bracket, netting -5 faces over the set.
 - `exact` (build.EXACT_EDGES): a run between two analytic surfaces (a flat facet's plane,
   cylinder, cone, sphere, torus) is their exact intersection (`GeomAPI_IntSS`), trimmed
   at the run's corners (widened to cover their distance off it), if every point of the
