@@ -595,14 +595,20 @@ def file_trouble(shape, allowed):
         # the face in the other shape most like this one: same kind of surface, middle
         # nearby (a big face's middle moves further when it changes), area closest
         _, kind, area, centre = item
-        kinds, areas, centres = table
+        kinds, areas, centres, tree = table
         reach = FILE_MATCH + 0.02 * math.sqrt(abs(area))
-        near = np.nonzero((kinds == kind) & (np.linalg.norm(centres - centre, axis=1) <= reach))[0]
+        if tree is None:
+            return None
+        # a hair wider than reach: the tree may round differently from the exact test below
+        cand = np.array(sorted(tree.query_ball_point(centre, reach * (1 + 1e-9))), dtype=int)
+        near = cand[(kinds[cand] == kind) & (np.linalg.norm(centres[cand] - centre, axis=1) <= reach)]
         return pool[near[np.argmin(np.abs(areas[near] - area))]] if len(near) else None
 
     def table(pool):
-        return (np.array([x[1] for x in pool]), np.array([x[2] for x in pool]),
-                np.array([x[3] for x in pool]).reshape(-1, 3))
+        from scipy.spatial import cKDTree
+        centres = np.array([x[3] for x in pool]).reshape(-1, 3)
+        return (np.array([x[1] for x in pool]), np.array([x[2] for x in pool]), centres,
+                cKDTree(centres) if len(pool) else None)
 
     mine, theirs = faces(shape), faces(back)
     mine_t, theirs_t = table(mine), table(theirs)

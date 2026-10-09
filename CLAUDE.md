@@ -308,6 +308,10 @@ Key contracts:
   ends merged, which a reader takes for a whole circle. Hence `file_trouble` in
   `attempt` (write, read back, compare) and `build._without_collapsed` after sewing.
   Check outputs with a read-back, not only `BRepCheck_Analyzer` on the shape in memory.
+- `file_trouble` matches faces with a KD-tree (`table`/`partner` in `convert.py`): the
+  all-pairs search took 12.7 s on 30,000 faces, the tree 0.45 s, with the same partners.
+  The read-back at the end of `_stl_to_solid` can't be skipped: `attempt` checked the shape
+  before `_tidy`, and a tidied shape is a new one with a new STEP file.
 - OCP 8 quirks: `TopoDS.Shell/Face` (no `_s`), `OCP.collections` for arrays and
   sequences, `Bnd_Box.Get()` is broken, `Quantity_Color` returns linear RGB,
   `BRepCheck_Result.Status()` can't be read (use `BRepCheck_Analyzer.IsValid(sub)`).
