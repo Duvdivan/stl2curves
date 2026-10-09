@@ -1932,7 +1932,7 @@ def sew(shape, tol, shells=(), pts=None):
     they are. Returns (shape, midpoints of the edges left unmatched). pts: the mesh's
     points, for REJOIN."""
     if REJOIN and pts is not None:
-        shape = _rejoin(shape, pts)
+        shape = _rejoin(shape, pts, tol)
     elif SHARED_CORNERS:
         # (sewing hands faces whose edges were shared already on unchanged, and the checks
         # after it widen tolerances in place: on the faces and edges build_faces keeps
@@ -1959,14 +1959,17 @@ def sew(shape, tol, shells=(), pts=None):
     return comp, free
 
 
-def _rejoin(shape, pts):
+def _rejoin(shape, pts, tol):
     """A copy of the faces joined where they are the same already, before sewing: corners
     at one mesh point (within REJOIN_SNAP) become one vertex, and edges between the same
     two corners on the same curve one edge. Faces cut in the worker processes come back
     as copies (read from files), on corners and edges of their own, so sewing had to
     match nearly every edge of a part (19,650 of 21,740 on the GPS case); it costs about
     as much per edge left to match as per face. Only exact matches are joined: an arc
-    beside a chord is a gap for sewing to close."""
+    beside a chord is a gap for sewing to close, and an edge shorter than twice the sewing
+    tolerance is sewing's to close up, with every edge meeting it (it merges the short
+    edge's ends; with edges round it joined already, the edge came out closed up in one
+    face and gone from the other: no closed solid)."""
     from scipy.spatial import cKDTree
     builder = BRep_Builder()
     shape = BRepBuilderAPI_Copy(shape, True, False).Shape()
@@ -1997,10 +2000,8 @@ def _rejoin(shape, pts):
     TopExp.MapShapesAndAncestors_s(shape, TopAbs_EDGE, TopAbs_FACE, emap)
     vmap = IndexedMap_TopoDS_Shape_TopTools_ShapeMapHasher()
     TopExp.MapShapes_s(shape, TopAbs_VERTEX, vmap)
-    by_ends = {}
+    ends, short = {}, set()
     for i in range(1, emap.Extent() + 1):
-        if emap.FindFromIndex(i).Size() != 1:
-            continue
         e = TopoDS.Edge(emap.FindKey(i))
         if BRep_Tool.Degenerated_s(e):
             continue
@@ -2008,6 +2009,13 @@ def _rejoin(shape, pts):
         if a.IsNull() or b.IsNull():
             continue
         ia, ib = vmap.FindIndex(a), vmap.FindIndex(b)
+        ends[i] = (ia, ib)
+        if BRep_Tool.Pnt_s(a).Distance(BRep_Tool.Pnt_s(b)) <= 2 * tol:
+            short |= {ia, ib}
+    by_ends = {}
+    for i, (ia, ib) in ends.items():
+        if emap.FindFromIndex(i).Size() != 1 or ia in short or ib in short:
+            continue
         by_ends.setdefault((min(ia, ib), max(ia, ib)), []).append(i)
 
     def face_of(i):
@@ -2030,6 +2038,8 @@ def _rejoin(shape, pts):
                     break
                 if y == x or y in used:
                     continue
+                if face_of(x).IsSame(face_of(y)):
+                    continue    # (one face's two sides of a slit: joined, it uses the edge twice)
                 # keep the edge of a curved face (k), and give it to the other face (r)
                 k, r = (y, x) if flat(x) and not flat(y) else (x, y)
                 ek, er = TopoDS.Edge(emap.FindKey(k)), TopoDS.Edge(emap.FindKey(r))

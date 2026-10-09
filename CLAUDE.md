@@ -231,9 +231,13 @@ be judged alone by full regressions (`compare/regress_try.sh` runs them all):
   with the same two corners and the same curve one edge (the curved face's kept, with
   the other face's curve on its surface moved over; a flat face takes a line or arc
   either way round). Arc-beside-chord pairs are gaps, left to sewing. GPS first round:
-  free edges 19,650 -> 9,340, sew 8.4 -> 4.5 s (+1.2 s rejoining). But with `shared`
-  the regression lost curves (15,186 faces; Rak SMA-USB 1,242 -> 1,754, Uni 1,395 ->
-  1,545, more STEP read-back trouble) and GPS was no faster (8,107 faces, 663 s).
+  free edges 19,650 -> 9,340, sew 8.4 -> 4.5 s (+1.2 s rejoining). Edges meeting an
+  edge shorter than twice the sewing tolerance are left to sewing (it closes the short
+  edge up; joined round it, the edge came out closed in one face and gone from the
+  other: no closed solid, and the halving search took Rak SMA-USB to 1,754 faces). Same
+  day with `shared,rejoin` vs all off (2026-10-08): regression 14,780 vs 14,753 faces
+  (Uni-USB +50, ratchet -13, bracket -7 and now valid), 2,286 vs 2,349 s; GPS 8,195 vs
+  8,598 faces, 675 vs 785 s.
 - `exact` (build.EXACT_EDGES): a run between two analytic surfaces (a flat facet's plane,
   cylinder, cone, sphere, torus) is their exact intersection (`GeomAPI_IntSS`), trimmed
   at the run's corners (widened to cover their distance off it), if every point of the
