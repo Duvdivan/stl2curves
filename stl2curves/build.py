@@ -984,9 +984,11 @@ def _thread_face(feature, k, mesh, owner, bounds, edge_tri):
         runs = [(tags[0], loop + [loop[0]])] if all(t == tags[0] for t in tags) else _runs(loop, tags)
         wire = BRepBuilderAPI_MakeWire()
         uv = []
+        loose = _notches(m, mesh.pts[loop], snap)
+        loose = {p for p, n in zip(loop, loose) if n}
         for _, run in _split_sharp(runs, mesh.pts):
             s, _, U = m.place(mesh.pts[run])
-            s = np.where(np.abs(s) <= snap, 0.0, np.where(np.abs(s - m.length) <= snap, m.length, s))
+            s = np.where([p in loose for p in run], s, _snapped(s, m.length, snap))
             pieces = [slice(0, len(run) // 2 + 1), slice(len(run) // 2, len(run))] \
                 if run[0] == run[-1] else [slice(0, len(run))]
             for part in pieces:
@@ -1041,6 +1043,31 @@ def _thread_face(feature, k, mesh, owner, bounds, edge_tri):
     # a narrow crest or root band that is a good share of its area)
     rim = sum(float(np.linalg.norm(np.diff(mesh.pts[loop + loop[:1]], axis=0), axis=1).sum()) for loop in loops)
     return face if abs(props.Mass() - target) <= 0.05 * target + snap * rim / 2 else None
+
+
+def _snapped(s, length, snap):
+    """Positions s across a thread piece, those within snap of its ends put on them."""
+    return np.where(np.abs(s) <= snap, 0.0, np.where(np.abs(s - length) <= snap, length, s))
+
+
+def _notches(m, pts, snap):
+    """Which corners of a closed outline on a thread piece to leave off its end lines: a
+    corner that snapping would put behind its neighbours on the line, so that the outline
+    ran back over itself there (a mesh's crest edge zigzags by a hundredth of a mm, and
+    flattened onto the helix the zigzag is a face crossing itself)."""
+    s, _, U = m.place(pts)
+    on = _snapped(s, m.length, snap)
+    loose = np.zeros(len(pts), bool)
+    for _ in range(len(pts)):
+        S = np.where(loose, np.nan, on)
+        a, b = np.roll(S, 1), np.roll(S, -1)
+        line = (S == a) & (S == b) & ((S == 0.0) | (S == m.length))
+        back = (U - np.roll(U, 1)) * (np.roll(U, -1) - U) < 0
+        new = line & back & ~loose
+        if not new.any():
+            break
+        loose |= new
+    return loose
 
 
 def _facing_against(face, mesh):

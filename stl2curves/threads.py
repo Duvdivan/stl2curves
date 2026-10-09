@@ -45,6 +45,8 @@ ON_TOL = 0.01          # mm (plus the file's rounding): corners this near lie on
 MIN_TURNS = 1.0        # the facets must wind round at least this far
 PROFILE_TOL = 0.004    # mm: profile simplified to straight pieces within this
 MIN_AROUND = 270       # deg: the facets must reach at least this far round the axis
+MAX_FACET_TURN = 90    # deg: a facet of a piece spans less than this along its helix (a plain
+                       # bore a whole number of leads long has every corner on the thread)
 
 
 class Helical:
@@ -255,12 +257,14 @@ def patches(mesh, thread, facets):
     pieces = [Flank(thread, P[i], P[i + 1]) for i in range(len(P) - 1)]
     corners = np.unique(np.concatenate([mesh.fverts[f] for f in facets]))
     on = np.zeros((len(pieces), len(mesh.pts)), bool)
+    U = np.zeros((len(pieces), len(mesh.pts)))
     for k, piece in enumerate(pieces):
-        s, off, _ = piece.place(mesh.pts[corners])
+        s, off, U[k, corners] = piece.place(mesh.pts[corners])
         on[k, corners] = (np.abs(off) <= tol) & (s >= -tol) & (s <= piece.length + tol)
     groups = [[] for _ in pieces]
     for f in facets:
-        homes = [k for k in range(len(pieces)) if on[k, mesh.fverts[f]].all()]
+        homes = [k for k in range(len(pieces)) if on[k, mesh.fverts[f]].all()
+                 and np.ptp(U[k, mesh.fverts[f]]) < math.radians(MAX_FACET_TURN)]
         if len(homes) == 1:
             groups[homes[0]].append(int(f))
     out = []

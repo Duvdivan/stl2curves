@@ -93,7 +93,12 @@ Local regression data on this machine (not in the repo):
      the loose pass (which would take thread pieces for cylinders and cones). A thread
      must reach at least 270 deg round its axis and be no deeper than its lead: a finely
      meshed smooth bend agrees with some screw motion over a narrow arc (a 58k-triangle
-     bracket gave three false threads and spent minutes on 130 candidates).
+     bracket gave three false threads and spent minutes on 130 candidates). A facet of a
+     thread piece spans less than `MAX_FACET_TURN` of its helix: a plain bore a whole
+     number of leads long has every corner on the thread and radial normals (a coaxial
+     cylinder is screw-invariant), and its wall triangles bridged the thread sections
+     either side (GPS case back, M3 with a 5 mm bore: 2,100 triangles left faceted).
+     Their own axis pass (countersinks, chamfers, bores) runs right after them.
    - Pass 0b: surfaces on the axes found so far (a lug round its screw hole).
    - Fillets between flat faces (`fillets.py`, rolling ball): before pass 1, which
      would cut a coarsely meshed fillet into strips of its own. Forgiving (most band
@@ -108,7 +113,7 @@ Local regression data on this machine (not in the repo):
      axis a cylinder. A coarse chamfer round a hole fits a torus exactly (all its
      corners on the rims), hence the profile-bend and interior-corner guards.
    - Pass 1: surfaces hypothesised from pairs of neighbouring facets.
-   - Pass 2: tori around axes already found; thread ends (countersinks, chamfers).
+   - Pass 2: tori around axes already found.
    - Loose pass, band tori, merge of same-surface neighbours.
 
    Thread features are appended after the merge: their models aren't surfaces of

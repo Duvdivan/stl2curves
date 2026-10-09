@@ -874,6 +874,12 @@ def analyze(pts, tris):
     claimed = [int(f) for x in screws for f in x.facets]
     for region in regions:
         region.free &= ~np.isin(region.facets, claimed)
+    # a thread usually ends in a countersink or chamfer round its own axis, and runs on
+    # into a plain bore: tried on that axis before pass 1 can cut them into strips that
+    # each fit a cylinder of their own. Held to the thread's own tolerance: the CAD
+    # program drew them together, both a hundredth or so off true.
+    axes = [(t.a, t.d, 2 * float(t.profile[:, 1].max()) + 3) for t in {id(p.model.thread): p.model.thread for p in screws}.values()]
+    ends = _axis_pass(mesh, regions, axes, threads.ON_TOL + mesh.noise) if axes else []
 
     # Pass 0b: surfaces on the axes found so far (a lug round its screw hole), before
     # pairs of facets can propose surfaces of their own: on a coarse, rounded-off mesh a
@@ -886,7 +892,7 @@ def analyze(pts, tris):
     # that each fit some cylinder of their own.
     from . import fillets
     taken = np.zeros(len(mesh.farea), bool)
-    for f in features + screws:
+    for f in features + screws + ends:
         taken[f.facets] = True
     known = [r for r in (_radius(f.model) for f in features) if r]
     rolled = fillets.find(mesh, regions, taken, known, walls=features)
@@ -913,11 +919,6 @@ def analyze(pts, tris):
         # (on a known axis only the radius is free, so a file that rounded its corners
         # can be allowed that much more: the CAD program's own export is often as loose)
         features += _axis_pass(mesh, regions, axes, AXIS_NOISE * mesh.noise)
-    # a thread usually ends in a countersink or chamfer round its own axis, which the
-    # passes above couldn't try (the thread wasn't known yet). Held to the thread's own
-    # tolerance: the CAD program drew them together, both a hundredth or so off true.
-    axes = [(t.a, t.d, 2 * float(t.profile[:, 1].max()) + 3) for t in {id(p.model.thread): p.model.thread for p in screws}.values()]
-    ends = _axis_pass(mesh, regions, axes, threads.ON_TOL + mesh.noise) if axes else []
     features += _loose_pass(mesh, regions, features)
     features = _band_tori(mesh, regions, features)
     # (the thread's pieces ahead of what was found round its ends: if the solid won't
