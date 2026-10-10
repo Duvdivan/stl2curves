@@ -959,13 +959,18 @@ def _thread_surface(feature, m):
     return Geom_BSplineSurface(poles, uk, vk, um, vm, a.Degree(), 1)
 
 
-def _thread_face(feature, k, mesh, owner, bounds, edge_tri):
+def _thread_face(feature, k, mesh, owner, bounds, edge_tri, straight=False):
     """A thread piece's face, built in its surface's own parameters: each outline corner
     is placed on the piece as (U, s) and the outline drawn there, so its edges lie on
     the surface exactly. (Splines through the corners themselves, a few microns off the
     true thread, won't cut a long helical surface, and neither will their projections.)
     Where the outline follows the piece's own ends (a crest or root edge) it runs along
-    s = its end exactly: a helix, the same one the next piece has."""
+    s = its end exactly: a helix, the same one the next piece has. straight: the outline
+    runs straight between its corners in (U, s) instead of in splines through them
+    (tried when the splines fail: the two sides of a thin spike, a corner reaching
+    0.1 mm further across the flank than its neighbours, leave its tip nearly
+    parallel and their bend crosses them; the gutter mount's threaded hole lost a
+    1,116-facet flank piece so)."""
     from OCP.BRepLib import BRepLib
     from OCP.Geom2dAPI import Geom2dAPI_Interpolate
     from OCP.collections import HArray1_gp_Pnt2d
@@ -996,11 +1001,17 @@ def _thread_face(feature, k, mesh, owner, bounds, edge_tri):
                 pts = HArray1_gp_Pnt2d(1, len(run[part]))
                 for i, (u, v) in enumerate(zip(U[part], s[part])):
                     pts.SetValue(i + 1, gp_Pnt2d(float(u), float(v)))
-                interp = Geom2dAPI_Interpolate(pts, False, 1e-9)
-                interp.Perform()
-                if not interp.IsDone():
-                    return None
-                edge = BRepBuilderAPI_MakeEdge(interp.Curve(), surface).Edge()
+                if straight:
+                    curve = _polyline2d(np.c_[U[part], s[part]])
+                    if curve is None:
+                        return None
+                else:
+                    interp = Geom2dAPI_Interpolate(pts, False, 1e-9)
+                    interp.Perform()
+                    if not interp.IsDone():
+                        return None
+                    curve = interp.Curve()
+                edge = BRepBuilderAPI_MakeEdge(curve, surface).Edge()
                 BRepLib.BuildCurve3d_s(edge)
                 wire.Add(edge)
             uv += list(zip(U, s))
@@ -1044,6 +1055,22 @@ def _thread_face(feature, k, mesh, owner, bounds, edge_tri):
     # a narrow crest or root band that is a good share of its area)
     rim = sum(float(np.linalg.norm(np.diff(mesh.pts[loop + loop[:1]], axis=0), axis=1).sum()) for loop in loops)
     return face if abs(props.Mass() - target) <= 0.05 * target + snap * rim / 2 else None
+
+
+def _polyline2d(P):
+    """A degree-1 B-spline through the 2D points P (repeats dropped), or None."""
+    from OCP.Geom2d import Geom2d_BSplineCurve
+    from OCP.collections import Array1_double, Array1_gp_Pnt2d, Array1_int
+    from OCP.gp import gp_Pnt2d
+    P = P[np.r_[True, np.linalg.norm(np.diff(P, axis=0), axis=1) > 1e-12]]
+    if len(P) < 2:
+        return None
+    poles, knots, mults = Array1_gp_Pnt2d(1, len(P)), Array1_double(1, len(P)), Array1_int(1, len(P))
+    for i, (u, v) in enumerate(P):
+        poles.SetValue(i + 1, gp_Pnt2d(float(u), float(v)))
+        knots.SetValue(i + 1, float(i))
+        mults.SetValue(i + 1, 2 if i in (0, len(P) - 1) else 1)
+    return Geom2d_BSplineCurve(poles, knots, mults, 1)
 
 
 def _snapped(s, length, snap):
@@ -1911,7 +1938,8 @@ def build_faces(mesh, features, tol):
         else:
             try:
                 if f.model.kind == "thread":
-                    faces = [_thread_face(f, k, mesh, owner, bounds, edge_tri)]
+                    faces = [_thread_face(f, k, mesh, owner, bounds, edge_tri)
+                             or _thread_face(f, k, mesh, owner, bounds, edge_tri, straight=True)]
                 elif f.kind == "trimmed":
                     if outlines.get(k) is None:
                         faces = [None]
