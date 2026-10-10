@@ -127,7 +127,7 @@ Local regression data on this machine (not in the repo):
      Profile corners are held near their start (`HOLD`): one with no corners near it
      drifted up to 189 mm. Within a patch, seeds on a found thread's motion are skipped
      (`_found_already`). A found thread's facets join its pieces within `piece_tol`
-     (1% of the lead, between `ON_TOL` and 0.02 mm scaled by the accuracy; detection
+     (1% of the lead, between `ON_TOL` and 0.03 mm scaled by the accuracy; detection
      stays at `ON_TOL`, 0.01; a flat 0.02 took the GPS case back's M3 x 0.5 from 1,502
      to 2,548 faces, its narrow crest and root bands taking in others' facets): CAD programs
      store threads as splines a hundredth or two off a true helical sweep (the gutter
@@ -139,7 +139,8 @@ Local regression data on this machine (not in the repo):
      the flank there or stepped it. `_plain` tries a crest flat, a root flat and two
      straight flanks, refitted, and takes it if it puts 98% as many corners on the
      thread (gutter mount 1,032 -> 524 faces; its screw 13,696 facets in 17 pieces, was
-     9,506 in 84). Tried and dropped (2026-10-10): bent flanks as one swept-spline face
+     9,506 in 84; with the 0.03 ceiling, flanks wandering up to 0.029 at the mid-flank
+     lines joined too: 413 faces, both threads 7 pieces). Tried and dropped (2026-10-10): bent flanks as one swept-spline face
      (3,218 faces), or merged into one straight piece (1,528: specks left between
      pieces stayed triangles, and the hole's big merged pieces wouldn't sew), and
      dropping profile corners whose gathering spans one turn (the mid-flank lines span

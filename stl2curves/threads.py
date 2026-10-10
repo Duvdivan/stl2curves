@@ -45,7 +45,7 @@ SAME_PITCH = 0.1       # share: a seed's motion within this of a found thread's 
 BAND = 0.02            # mm: radii binned this finely to find the crest's and root's corners
 MIN_GATHER = 0.8       # share of a crest's or root's corners on a few helix lines
 ON_TOL = 0.01          # mm (plus the file's rounding): corners this near lie on the thread
-PIECE_TOL = 0.02 * ACCURACY    # mm: at most this (plus the rounding) ...
+PIECE_TOL = 0.03 * ACCURACY    # mm: at most this (plus the rounding) ...
 PIECE_SHARE = 0.01     # ... and this share of its lead (but at least ON_TOL): a found
                        # thread's facet whose corners all lie this near one piece of its
                        # profile is built on it (see piece_tol)
