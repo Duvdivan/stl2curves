@@ -50,6 +50,8 @@ PIECE_SHARE = 0.01     # ... and this share of its lead (but at least ON_TOL): a
                        # thread's facet whose corners all lie this near one piece of its
                        # profile is built on it (see piece_tol)
 MIN_TURNS = 1.0        # the facets must wind round at least this far
+PLAIN_FLAT = 0.05      # share of the depth: profile corners this near the crest or root are on its flat
+PLAIN_SHARE = 0.98     # a plain trapezoid profile is taken if it puts this share as many corners on it
 PROFILE_TOL = 0.004    # mm: profile simplified to straight pieces within this
 MIN_AROUND = 270       # deg: the facets must reach at least this far round the axis
 EPS_STEP = np.finfo(float).eps ** 0.5   # relative step of the axis fit's differences (scipy's)
@@ -557,6 +559,7 @@ def _thread(mesh, pool, seed, c, a, pitch):
         if len(grown) < MIN_FACETS:
             return None, agree
         model, prof = _refine(model, prof, _corners(mesh, grown))
+    model, prof = _plain(model, prof, _corners(mesh, grown), piece_tol(model) + mesh.noise)
     if (np.diff(prof[:, 0]) <= 0).any():
         return None, agree              # the profile folded over itself: not a thread
     if np.ptp(prof[:, 1]) > model.lead:
@@ -572,7 +575,9 @@ def _thread(mesh, pool, seed, c, a, pitch):
             ring[i, 1] = ring[j, 1] = (ring[i, 1] + ring[j, 1]) / 2
     prof = np.r_[ring, ring[:1] + [model.lead, 0]]
     model = Helical(model.a, model.d, model.pitch, prof, True)
-    facets = _lying_on(mesh, pool, agree, model, ON_TOL + mesh.noise)
+    # (as near as its pieces take them: held to ON_TOL, the facets of a flank wandering a
+    # hundredth or two off true were left out, and found again as a second thread)
+    facets = _lying_on(mesh, pool, agree, model, piece_tol(model) + mesh.noise)
     if len(facets) < MIN_FACETS:
         return None, agree
     Q = mesh.pts[np.unique(np.concatenate([mesh.fverts[f] for f in facets]))]
@@ -809,6 +814,49 @@ def _refine(model, prof, P):
     fit = least_squares(residual, np.zeros(5 + 2 * k), jac=jac, x_scale="jac", max_nfev=200)
     m = build(fit.x)
     return m, m.profile
+
+
+def _plain(model, prof, P, tol):
+    """The profile as a thread is drawn, if it fits about as well: a crest flat, a root
+    flat (either may be a point: a V thread) and two straight flanks, refitted. Corners
+    are fitted where the mesh's corners gather, and a mesh can run a helix line of
+    corners partway up a flank, wandering a few hundredths in radius (a thread stored
+    as a spline): the fit bent each flank there, a degree or two, or stepped it
+    (the gutter mount's M30 x 3.5 screw and threaded hole), and a facet reaching
+    across a bent flank lay on neither half."""
+    if len(prof) <= 5:
+        return model, prof              # (four corners or fewer already)
+    ring = prof[:-1]
+    hi, lo = ring[:, 1].max(), ring[:, 1].min()
+    band = PLAIN_FLAT * (hi - lo)
+    top = ring[ring[:, 1] >= hi - band]
+    bottom = ring[ring[:, 1] <= lo + band]
+    lead = model.lead
+
+    def ends(pts):
+        # the flat's two ends along z (it may wrap round the lead)
+        z = np.sort(np.mod(pts[:, 0], lead))
+        gaps = np.diff(np.r_[z, z[0] + lead])
+        k = int(np.argmax(gaps))
+        start, stop = z[(k + 1) % len(z)], z[k]
+        return start, (stop if stop >= start else stop + lead)
+
+    corners = []
+    for pts, r in ((top, hi), (bottom, lo)):
+        a, b = ends(pts)
+        corners += [(a, r)] + ([(b, r)] if b - a > 1e-6 else [])
+    corners = np.array(sorted((np.mod(z, lead), r) for z, r in corners))
+    if len(corners) < 2:
+        return model, prof
+    plain = np.r_[corners, corners[:1] + [lead, 0]]
+    if (np.diff(plain[:, 0]) <= 0).any():
+        return model, prof
+    m, p = _refine(model, plain, P)
+
+    def on(h):
+        rho, z0, _ = h.local(P)
+        return int((np.abs(h._profile_distance(z0, rho)) <= tol).sum())
+    return (m, p) if on(m) >= PLAIN_SHARE * on(model) else (model, prof)
 
 
 def _simplify(P, tol):
