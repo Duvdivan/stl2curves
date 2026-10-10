@@ -595,8 +595,16 @@ def file_trouble(shape, allowed):
         shutil.rmtree(tmp, ignore_errors=True)
     check = BRepCheck_Analyzer(back, True, True)
     # (a reader may split a face in two: harmless, so faces aren't counted)
-    if check.IsValid() and abs(volume(back) - volume(shape)) <= allowed:
-        return None
+    if check.IsValid():
+        if abs(volume(back) - volume(shape)) <= allowed:
+            return None
+        # OCC's integration goes astray on long helical spline faces, and differently in
+        # the shape and in its copy read back (a thread flank of 25.3 mm^2 by tessellation
+        # integrated to 20.5, its copy elsewhere): the gutter mount's threaded hole lost
+        # 550 facets of thread to the blame. Measured by tessellation, as attempt does.
+        mine, theirs = tessellated_volume(shape), tessellated_volume(back)
+        if mine is not None and theirs is not None and abs(mine - theirs) <= allowed:
+            return None
 
     def faces(s):
         out, ex = [], TopExp_Explorer(s, TopAbs_FACE)
