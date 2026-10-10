@@ -970,7 +970,7 @@ def _thread_face(feature, k, mesh, owner, bounds, edge_tri):
     from OCP.Geom2dAPI import Geom2dAPI_Interpolate
     from OCP.collections import HArray1_gp_Pnt2d
     from OCP.gp import gp_Pnt2d
-    from .threads import ON_TOL
+    from .threads import piece_tol
     m = feature.model
     surface = _thread_surface(feature, m)
     if surface is None:
@@ -978,7 +978,7 @@ def _thread_face(feature, k, mesh, owner, bounds, edge_tri):
     loops = _loops(np.concatenate([mesh.tris[mesh.ftris[f]] for f in feature.facets]))
     if not loops:
         return None
-    snap = ON_TOL + mesh.noise
+    snap = piece_tol(m.thread) + mesh.noise
     wires, spans = [], []
     for loop in loops:
         tags = _loop_tags(mesh, loop, owner, bounds, edge_tri, patch=k)

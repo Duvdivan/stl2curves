@@ -118,7 +118,24 @@ Local regression data on this machine (not in the repo):
      number of leads long has every corner on the thread and radial normals (a coaxial
      cylinder is screw-invariant), and its wall triangles bridged the thread sections
      either side (GPS case back, M3 with a 5 mm bore: 2,100 triangles left faceted).
-     Their own axis pass (countersinks, chamfers, bores) runs right after them.
+     The profile refit (`_refine`: least squares over axis, pitch and profile corners)
+     has its Jacobian worked out (`Helical._nearest` gives each point's foot piece,
+     place along it, profile copy and direction; only the points' places are taken by
+     differences): left to scipy's differences it recomputed the residual once per
+     unknown, 30 s a refit on a 7,000-corner thread, and the N-type gutter mount (an
+     M30 x 3.5 connector) spent ~30 min in the thread search (now 142 s, same thread).
+     Profile corners are held near their start (`HOLD`): one with no corners near it
+     drifted up to 189 mm. Within a patch, seeds on a found thread's motion are skipped
+     (`_found_already`). A found thread's facets join its pieces within `piece_tol`
+     (1% of the lead, between `ON_TOL` and 0.02 mm scaled by the accuracy; detection
+     stays at `ON_TOL`, 0.01; a flat 0.02 took the GPS case back's M3 x 0.5 from 1,502
+     to 2,548 faces, its narrow crest and root bands taking in others' facets): CAD programs
+     store threads as splines a hundredth or two off a true helical sweep (the gutter
+     mount's flanks scatter +-0.015 mm with crests exact, while freeform fits them
+     within 0.002), and at 0.01 half of each flank went to freeform patches (4,449 ->
+     1,956 faces). Tried and dropped (2026-10-10): flanks bent in the axial plane as one
+     swept-spline face (the fit gives such a flank two pieces a degree apart): 3,218
+     faces alone, 3,956 with the looser limit. Their own axis pass (countersinks, chamfers, bores) runs right after them.
    - Pass 0b: surfaces on the axes found so far (a lug round its screw hole).
    - Fillets between flat faces (`fillets.py`, rolling ball): before pass 1, which
      would cut a coarsely meshed fillet into strips of its own. Forgiving (most band

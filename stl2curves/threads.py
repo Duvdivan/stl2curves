@@ -33,18 +33,28 @@ import math
 
 import numpy as np
 
+from .accuracy import SCALE as ACCURACY
+
 MIN_FACETS = 30        # a thread has at least this many facets
 FIT_DEG = 2.0          # a seed's facet normals this close to a screw motion ...
 SEED_SHARE = 0.25      # ... this many of them: the motion is worth a closer look
 AGREE_DEG = 3.0        # facet normals this close to the motion may belong to the thread
 SMALLEST_SEED = 1.0    # mm: radius of the smallest balls of facets tried as seeds
 MAX_FITS = 300         # seeds tried at most, per part
+SAME_PITCH = 0.1       # share: a seed's motion within this of a found thread's pitch is its own
 BAND = 0.02            # mm: radii binned this finely to find the crest's and root's corners
 MIN_GATHER = 0.8       # share of a crest's or root's corners on a few helix lines
 ON_TOL = 0.01          # mm (plus the file's rounding): corners this near lie on the thread
+PIECE_TOL = 0.02 * ACCURACY    # mm: at most this (plus the rounding) ...
+PIECE_SHARE = 0.01     # ... and this share of its lead (but at least ON_TOL): a found
+                       # thread's facet whose corners all lie this near one piece of its
+                       # profile is built on it (see piece_tol)
 MIN_TURNS = 1.0        # the facets must wind round at least this far
 PROFILE_TOL = 0.004    # mm: profile simplified to straight pieces within this
 MIN_AROUND = 270       # deg: the facets must reach at least this far round the axis
+EPS_STEP = np.finfo(float).eps ** 0.5   # relative step of the axis fit's differences (scipy's)
+HOLD = 0.01            # weight (mm per mm moved) keeping profile corners where they started:
+                       # one with no corners near it was otherwise free to drift (100+ mm)
 MAX_FACET_TURN = 90    # deg: a facet of a piece spans less than this along its helix (a plain
                        # bore a whole number of leads long has every corner on the thread)
 
@@ -78,24 +88,50 @@ class Helical:
         return self._profile_distance(z0, rho)
 
     def _profile_distance(self, z0, rho):
+        best, sign = self._nearest(z0, rho)[:2]
+        return best * (sign if self.inside else -sign)
+
+    def _nearest(self, z0, rho):
+        """Distance from (z0, rho) to the profile, the side (+1 above it), and where its
+        foot is: the profile piece, how far along it, which copy of the profile (-1, 0,
+        1 leads on), and the unit direction from the foot to the point (what moving the
+        point or the piece's ends does to the distance)."""
         P = self.profile
-        best = np.full(len(z0), np.inf)
-        sign = np.ones(len(z0))
-        for shift in (-self.lead, 0.0, self.lead):
+        n = len(z0)
+        rows = np.arange(n)
+        best = np.full(n, np.inf)
+        sign = np.ones(n)
+        piece = np.zeros(n, int)
+        along = np.zeros(n)
+        wrap = np.zeros(n)
+        away = np.zeros((n, 2))
+        q = np.c_[z0, rho]
+        for copy in (-1, 0, 1):
+            shift = copy * self.lead
             A, B = P[:-1] + [shift, 0], P[1:] + [shift, 0]
-            q = np.c_[z0, rho][:, None]
             ab = B - A
-            t = np.clip(((q - A) * ab).sum(-1) / np.maximum((ab * ab).sum(-1), 1e-300), 0, 1)
+            t = np.clip(((q[:, None] - A) * ab).sum(-1) / np.maximum((ab * ab).sum(-1), 1e-300), 0, 1)
             foot = A + ab * t[..., None]
-            d = np.linalg.norm(q - foot, axis=-1)
+            d = np.linalg.norm(q[:, None] - foot, axis=-1)
             k = d.argmin(axis=1)
-            dk = d[np.arange(len(z0)), k]
+            dk = d[rows, k]
             # side: rho above the profile at that z is away from a bolt's material
-            above = rho - foot[np.arange(len(z0)), k, 1]
+            above = rho - foot[rows, k, 1]
             better = dk < best
             best[better] = dk[better]
             sign[better] = np.where(above[better] >= 0, 1.0, -1.0)
-        return best * (sign if self.inside else -sign)
+            piece[better] = k[better]
+            along[better] = t[rows, k][better]
+            wrap[better] = copy
+            away[better] = (q - foot[rows, k])[better]
+        d = np.linalg.norm(away, axis=1)
+        on = d < 1e-15
+        away[~on] /= d[~on, None]
+        if on.any():        # on the profile: square to its piece, on the side counted +
+            ab = P[piece[on] + 1] - P[piece[on]]
+            nrm = np.c_[-ab[:, 1], ab[:, 0]] / np.maximum(np.linalg.norm(ab, axis=1), 1e-300)[:, None]
+            away[on] = nrm * np.where(nrm[:, 1] >= 0, 1.0, -1.0)[:, None]
+        return best, sign, piece, along, wrap, away
 
     def point(self, z0, rho, u):
         """The point of the surface over profile point (z0, rho) at angle u."""
@@ -207,6 +243,7 @@ def find(mesh, candidates):
     found, tested, fits = [], [], 0
     for patch in _patches(mesh, np.asarray(candidates)):
         pool = patch
+        here = []                       # threads found in this patch
         for seed in _seeds(mesh, patch):
             seed = np.intersect1d(seed, pool)
             if len(seed) < MIN_FACETS:
@@ -217,11 +254,17 @@ def find(mesh, candidates):
             motion = _motion(mesh, seed)
             if motion is None or any(_same(motion, seed, t) for t in tested):
                 continue
+            if any(_found_already(motion, h) for h in here):
+                # (the thread took every facet of the patch lying on it: what is left on
+                # its motion is run-out and rounding, which only failed again, at up to
+                # a minute a try: the N-type gutter mount spent half an hour on them)
+                continue
             thread, agree = _thread(mesh, pool, seed, *motion)
             if thread is None:
                 tested.append((motion, agree))
                 continue
             found.append(thread)
+            here.append(thread[0])
             pool = np.setdiff1d(pool, thread[1])
             if len(pool) < MIN_FACETS:
                 break
@@ -252,7 +295,7 @@ def patches(mesh, thread, facets):
     """The thread's facets as features, one per connected stretch of each straight piece
     of its profile (a facet must lie wholly on one piece; any that don't are left as
     they are)."""
-    tol = ON_TOL + mesh.noise
+    tol = piece_tol(thread) + mesh.noise
     P = thread.profile
     pieces = [Flank(thread, P[i], P[i + 1]) for i in range(len(P) - 1)]
     corners = np.unique(np.concatenate([mesh.fverts[f] for f in facets]))
@@ -278,6 +321,16 @@ def patches(mesh, thread, facets):
             if len(part) >= 3:
                 out.append(_piece_feature(mesh, thread, piece, part))
     return out
+
+
+def piece_tol(thread):
+    """How near one piece of a found thread's profile a facet's corners must lie to be
+    built on it. CAD programs store threads as splines a hundredth or two off a true
+    helical sweep (an M30 x 3.5's flanks scatter +-0.015 mm, its crests exact), and held
+    to ON_TOL half of each flank went to freeform patches. But on a small thread that
+    is a good share of its depth: an M3 x 0.5's narrow crest and root bands took in
+    facets that weren't theirs, and failed (the GPS case back: 1,502 -> 2,548 faces)."""
+    return min(PIECE_TOL, max(ON_TOL, PIECE_SHARE * thread.lead))
 
 
 def _piece_feature(mesh, thread, piece, fids):
@@ -338,6 +391,18 @@ def _same(motion, seed, tested):
     if np.linalg.norm(off - (off @ c2) * c2) > 0.1:
         return False
     return len(np.intersect1d(seed, facets)) >= 0.5 * len(seed)
+
+
+def _found_already(motion, thread):
+    """Whether a screw motion is a thread's own: the same axis and about its pitch (the
+    normals give the pitch only roughly; another thread on the same axis differs more)."""
+    c, a, pitch = motion
+    if abs(c @ thread.d) < math.cos(math.radians(1)):
+        return False
+    off = a - thread.a
+    if np.linalg.norm(off - (off @ thread.d) * thread.d) > 0.1:
+        return False
+    return abs(abs(pitch) - abs(thread.pitch)) <= SAME_PITCH * abs(thread.pitch)
 
 
 def _motion(mesh, facets):
@@ -709,9 +774,39 @@ def _refine(model, prof, P):
     def residual(x):
         m = build(x)
         rho, z0, _ = m.local(P)
-        return m._profile_distance(z0, rho)
+        return np.r_[m._profile_distance(z0, rho), HOLD * x[5:]]
 
-    fit = least_squares(residual, np.zeros(5 + 2 * k), x_scale="jac", max_nfev=200)
+    def jac(x):
+        # Left to scipy, the whole residual was recomputed once per unknown: 30 s a
+        # refit on a 7,000-corner thread, and a part tries up to 300. A point's
+        # distance moves with the point itself (its place in the profile's plane), and
+        # with the two ends of the piece its foot is on, by how far along it the foot
+        # is. Only the points' places are taken by differences, for the axis and pitch.
+        m = build(x)
+        rho, z0, _ = m.local(P)
+        best, sign, piece, along, wrap, away = m._nearest(z0, rho)
+        g = -sign[:, None] * away                   # d(distance)/d(foot) = -d/d(point)
+        J = np.zeros((len(P) + 2 * k, len(x)))
+        for i in range(5):
+            h = EPS_STEP * max(1.0, abs(x[i]))
+            xi = x.copy()
+            xi[i] += h
+            mi = build(xi)
+            rho_i, z0_i, _ = mi.local(P)
+            dz = z0_i - z0
+            dz -= mi.lead * np.round(dz / mi.lead)  # (a point wrapping round the lead)
+            col = -(g[:, 0] * dz + g[:, 1] * (rho_i - rho))
+            if i == 4:      # the pitch also moves the profile's copies, and its closing corner
+                col += g[:, 0] * (wrap + np.where(piece == k - 1, along, 0.0)) * (mi.lead - m.lead)
+            J[:len(P), i] = col / h
+        rows = np.arange(len(P))
+        for end, share in ((piece, 1 - along), ((piece + 1) % k, along)):
+            for c in range(2):
+                np.add.at(J, (rows, 5 + 2 * end + c), share * g[:, c])
+        J[len(P):, 5:] = HOLD * np.eye(2 * k)
+        return J
+
+    fit = least_squares(residual, np.zeros(5 + 2 * k), jac=jac, x_scale="jac", max_nfev=200)
     m = build(fit.x)
     return m, m.profile
 
