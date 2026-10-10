@@ -71,7 +71,7 @@ def _scrap(mesh, f, any_count=False):
     (or any number, any_count: on a finely meshed part a narrow strip has dozens),
     turning through a small angle, small for its radius."""
     r = _radius(f.model, mesh.fcent[f.facets])
-    if r is None or f.kind in ("ball", "wedge") or (len(f.facets) >= 40 and not any_count):
+    if r is None or f.kind in ("ball", "wedge") or (len(f.facets) >= 40 and not any_count) or f.__dict__.get("vouched"):
         return False
     N = mesh.fn[f.facets]
     turn = math.degrees(math.acos(float(np.clip((N @ N.T).min(), -1, 1))))

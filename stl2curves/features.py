@@ -43,6 +43,10 @@ COPLANAR_DEG = 0.05  # triangles closer to flat than this are merged into one fa
 MAX_SAG = 0.25       # mm: the middle of a facet may sit this far inside the curve (coarse meshes)
 BEND_SLACK_DEG = 8   # neighbouring facets must bend by what the surface predicts, within this
 MIN_SPAN_DEG = 15    # a partial patch must curve through at least this much
+LAND_TOL = 0.002     # mm: narrow strips round a known axis with corners this near one radius ...
+LAND_MIN = 3         # ... at least this many of them (and MIN_SPAN_DEG between them) ...
+LAND_MAX_FACETS = 12 # ... of at most this many facets each (bigger ones stand alone) ...
+LAND_TILT_DEG = 3    # ... each facet facing this near straight out from the axis: cylinders
 CREASE_DEG = 20      # a one-ring cone must meet a neighbour at a crease at least this sharp
 MIN_CORNERS = {"cylinder": 8, "cone": 10, "sphere": 8, "torus": 12}
 # A patch whose outline doesn't follow its own boundary lines (e.g. a hole running
@@ -894,6 +898,7 @@ def analyze(pts, tris):
     # program drew them together, both a hundredth or so off true.
     axes = [(t.a, t.d, 2 * float(t.profile[:, 1].max()) + 3) for t in {id(p.model.thread): p.model.thread for p in screws}.values()]
     ends = _axis_pass(mesh, regions, axes, threads.ON_TOL + mesh.noise) if axes else []
+    thread_axes = axes
 
     # Pass 0b: surfaces on the axes found so far (a lug round its screw hole), before
     # pairs of facets can propose surfaces of their own: on a coarse, rounded-off mesh a
@@ -936,6 +941,7 @@ def analyze(pts, tris):
         # (on a known axis only the radius is free, so a file that rounded its corners
         # can be allowed that much more: the CAD program's own export is often as loose)
         features += _axis_pass(mesh, regions, axes, AXIS_NOISE * mesh.noise)
+    features += _lands(mesh, regions, _distinct_axes(features, mesh) + thread_axes)
     progress.step("finding what is left")
     features += _loose_pass(mesh, regions, features)
     features = _band_tori(mesh, regions, features)
@@ -1668,6 +1674,55 @@ def _absorb_straddlers(mesh, features):
                 owner[g] = k
                 break
     return features
+
+
+def _lands(mesh, regions, axes):
+    """Narrow strips all on one cylinder round a known axis: the lands of a knurled
+    or splined round between its grooves, exported a few flat facets each. Alone each
+    is too narrow to trust (MIN_SPAN_DEG: a flat strip fits almost any big cylinder);
+    together, every corner on one radius round an axis found already, they are what
+    the round was drawn as (the gutter mount's knurled screw head: 30 lands of 3
+    facets, 5 deg each, corners within 0.0004 mm of r 20, left to smooth blends)."""
+    global _loose, _anchored
+    tol = LAND_TOL + mesh.noise
+    out = []
+    for a, d, reach in axes:
+        base = Revolved(a, d, line=(1.0, 0))
+        strips = []
+        for region in regions:
+            idx = np.nonzero(region.free)[0]
+            if not 2 <= len(idx) <= LAND_MAX_FACETS:
+                continue
+            rho, _, u = base.local(region.points(idx))
+            if np.ptp(rho) > tol or rho.mean() > reach:
+                continue
+            # (each facet facing straight out from the axis, or straight in)
+            c = mesh.fcent[region.facets[idx]] - a
+            radial = c - np.outer(c @ d, d)
+            radial /= np.linalg.norm(radial, axis=1)[:, None]
+            facing = np.einsum("ij,ij->i", radial, region.n[idx])
+            if np.abs(facing).min() < math.cos(math.radians(LAND_TILT_DEG)) or np.ptp(np.sign(facing)) > 0:
+                continue
+            u = np.unwrap(np.sort(np.mod(u, TWO_PI)))
+            strips.append((region, idx, float(rho.mean()), bool(facing[0] > 0), float(np.ptp(u))))
+        strips.sort(key=lambda x: x[2])
+        while strips:
+            group = [x for x in strips if abs(x[2] - strips[0][2]) <= tol and x[3] == strips[0][3]]
+            strips = [x for x in strips if all(x is not g for g in group)]
+            if len(group) < LAND_MIN or sum(x[4] for x in group) < math.radians(MIN_SPAN_DEG):
+                continue
+            model = Revolved(a, d, line=(float(np.mean([x[2] for x in group])), 0))
+            for region, idx, _, convex, _ in group:
+                _loose, _anchored = True, True
+                try:
+                    feature = _feature(mesh, model, region.facets[idx], convex)
+                finally:
+                    _loose, _anchored = False, False
+                if feature is not None:
+                    feature.vouched = True      # (by the others: not a stand-in, blends._scrap)
+                    region.free[idx] = False
+                    out.append(feature)
+    return out
 
 
 def _distinct_axes(features, mesh=None):
