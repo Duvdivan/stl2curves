@@ -37,6 +37,8 @@ from .blends import merge
 PAGE = Path(__file__).with_name("studio.html")
 BIGGEST_UPLOAD = 500 * 2 ** 20      # bytes
 TESS_DEFLECTION = 0.02              # mm: how finely the result is tessellated for the view
+EDGE_ANGLE = 0.1                    # rad: edges drawn in straight segments turning at most this ...
+EDGE_SAG = 0.01                     # ... and bowing at most this far (mm)
 SURFACES = {1: "cylinder", 2: "cone", 3: "sphere", 4: "torus"}    # OCC surface types (0: plane)
 # the result view's colours, as the page's KIND table names them
 VIEW_KINDS = ["none", "left", "cylinder", "cone", "sphere", "torus", "pipe", "freeform", "blend", "thread", "extrusion"]
@@ -255,14 +257,25 @@ def _tessellated(shape):
         ex.Next()
         if BRep_Tool.Degenerated_s(edge):
             continue
-        c = BRepAdaptor_Curve(edge)
-        a, b = c.FirstParameter(), c.LastParameter()
-        n = 2 if int(c.GetType()) == 0 else 24
-        P = np.array([c.Value(a + (b - a) * i / (n - 1)).Coord() for i in range(n)])
+        P = np.array([p.Coord() for p in edge_points(BRepAdaptor_Curve(edge))])
         lines.append(np.repeat(P, 2, axis=0)[1:-1])
     pos = np.vstack(pos) if pos else np.zeros((0, 3))
     lines = np.vstack(lines) if lines else np.zeros((0, 3))
     return {"positions": _b64(pos.astype(np.float32).ravel()), "edges": _b64(lines.astype(np.float32).ravel())}, faces
+
+
+def edge_points(curve):
+    """Points along an edge (a BRepAdaptor_Curve) close enough to draw it with straight
+    segments: spaced by how much it bends. A fixed 24 drew a thread's crest edge, two
+    or three turns round a bore, as chords cutting across it."""
+    from OCP.GCPnts import GCPnts_TangentialDeflection
+    a, b = curve.FirstParameter(), curve.LastParameter()
+    if int(curve.GetType()) == 0:
+        return [curve.Value(a), curve.Value(b)]
+    sample = GCPnts_TangentialDeflection(curve, EDGE_ANGLE, EDGE_SAG, 2)
+    if sample.NbPoints() < 2:
+        return [curve.Value(a + (b - a) * i / 23) for i in range(24)]
+    return [sample.Value(i) for i in range(1, sample.NbPoints() + 1)]
 
 
 def _handler(session):

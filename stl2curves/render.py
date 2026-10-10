@@ -28,6 +28,24 @@ COLOURS = {GeomAbs_Plane: (0.78, 0.78, 0.80), GeomAbs_Cylinder: (0.30, 0.55, 0.9
            GeomAbs_Sphere: (0.65, 0.40, 0.85)}
 
 
+EDGE_ANGLE = 0.1    # rad: edges drawn in straight segments turning at most this ...
+EDGE_SAG = 0.01     # ... and bowing at most this far (mm)
+
+
+def edge_points(curve):
+    """Points along an edge (a BRepAdaptor_Curve) close enough to draw it with straight
+    segments: spaced by how much it bends. A fixed 24 drew a thread's crest edge, two
+    or three turns round a bore, as chords cutting across it."""
+    from OCP.GCPnts import GCPnts_TangentialDeflection
+    a, b = curve.FirstParameter(), curve.LastParameter()
+    if int(curve.GetType()) == 0:
+        return [curve.Value(a), curve.Value(b)]
+    sample = GCPnts_TangentialDeflection(curve, EDGE_ANGLE, EDGE_SAG, 2)
+    if sample.NbPoints() < 2:
+        return [curve.Value(a + (b - a) * i / 23) for i in range(24)]
+    return [sample.Value(i) for i in range(1, sample.NbPoints() + 1)]
+
+
 def read_step(path):
     saved, devnull = os.dup(1), os.open(os.devnull, os.O_WRONLY)
     os.dup2(devnull, 1)
@@ -78,13 +96,7 @@ def to_vtk(shape):
         ex.Next()
         if BRep_Tool.Degenerated_s(edge):
             continue
-        c = BRepAdaptor_Curve(edge)
-        a, b = c.FirstParameter(), c.LastParameter()
-        n = 2 if c.GetType() == 0 else 24
-        ids = []
-        for i in range(n):
-            p = c.Value(a + (b - a) * i / (n - 1))
-            ids.append(lp.InsertNextPoint(p.X(), p.Y(), p.Z()))
+        ids = [lp.InsertNextPoint(p.X(), p.Y(), p.Z()) for p in edge_points(BRepAdaptor_Curve(edge))]
         lines.InsertNextCell(len(ids), ids)
     edges = vtk.vtkPolyData()
     edges.SetPoints(lp)
