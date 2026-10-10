@@ -24,6 +24,7 @@ classifiers = [
 [project.scripts]
 stl2curves = "stl2curves.convert:main"
 stl2curves-render = "stl2curves.render:main"
+stl2curves-studio = "stl2curves.studio:main"
 
 [project.urls]
 Homepage = "https://github.com/Duvdivan/stl2curves"
@@ -31,6 +32,9 @@ Issues = "https://github.com/Duvdivan/stl2curves/issues"
 
 [tool.setuptools]
 packages = ["stl2curves"]
+
+[tool.setuptools.package-data]
+stl2curves = ["studio.html"]
 
 [tool.setuptools.dynamic]
 version = { attr = "stl2curves.__version__" }

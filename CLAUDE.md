@@ -215,6 +215,16 @@ as BRep files, the mesh once per pass via `workers.share`/`load`. What runs ther
 - `TIME_LIMIT` (`--time-limit`) only stops optional refinement (blends, culprit search,
   second chances); analysis always runs to the end (cutting it gave garbage).
 
+Studio (`studio.py` + `studio.html`, `stl2curves-studio`): a local web page (stdlib
+`ThreadingHTTPServer` on 127.0.0.1, three.js from a CDN) over `convert.prepare` (first
+stages, saved in a stage cache of its own) and `convert.finish` (build). After a Convert
+it marks the mesh triangles that came out as faces of their own (`_left_as_triangles`);
+painted groups go through `blends.merge` (features half covered or more join whole, flat
+facets the brush caught are dropped; one exact surface via `features._whole_region` if
+the whole area lies on one, else freeform, else a blend). `#demo` on the page's URL runs
+a self-test (convert, paint the densest leftovers, convert again): headless Chrome with
+`--use-angle=swiftshader --virtual-time-budget=...` can screenshot it.
+
 FreeCAD add-on (`package.xml` at the root, code in `freecad_addon/`): the repository
 itself is the add-on (FreeCAD clones it into `Mod/stl2curves`; `package.xml`'s workbench
 `subdirectory` makes FreeCAD run `freecad_addon/InitGui.py`, which registers the
@@ -340,9 +350,12 @@ Key contracts:
 - OCP 8 quirks: `TopoDS.Shell/Face` (no `_s`), `OCP.collections` for arrays and
   sequences, `Bnd_Box.Get()` is broken, `Quantity_Color` returns linear RGB,
   `BRepCheck_Result.Status()` can't be read (use `BRepCheck_Analyzer.IsValid(sub)`).
-- Pickling a `Mesh` reorders its neighbour *sets*, and pass 1 tries `nbrs[i][:3]`: send
-  regions' neighbour lists along to workers, or results silently change. (Sorting them
-  instead, 2026-10-09, was just another draw: the tray went 268 -> 354 faces.)
+- Pickling a set can rebuild it in another order (310 of the latch's 2,581 neighbour
+  sets), and pass 1 tries `nbrs[i][:3]`, `add_blends` walks them: `Mesh.__getstate__`
+  pickles them as lists in their order (2026-10-09; before that a stage recomputed from
+  a saved one, or a worker, could go its own way: the case back 1,502 -> 1,501 faces).
+  Regions' neighbour lists are still sent along to workers. Don't replace the order
+  with a "better" one: sorting them was just another draw (the tray 268 -> 354 faces).
 - Windows process pools spawn a worker only when a job finds none idle, one by one in
   the submitting thread: `workers._start` calls `_launch_processes()` up front. Scripts
   that convert must have an `if __name__ == "__main__"` guard (workers re-import them).

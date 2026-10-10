@@ -169,6 +169,46 @@ def add_blends(mesh, features):
     return [f for k, f in enumerate(features) if k not in dropped] + out
 
 
+def merge(mesh, features, facets):
+    """(features, merged): an area someone painted (stl2curves.studio: one the conversion
+    left as triangles, a fillet it missed) made one face. A feature they cover half or
+    more of goes into it whole, one they barely touch stays as it was, and flat facets
+    the brush caught (none of whose neighbours meet it at a gentle bend) stay flat. The
+    area is one cylinder, cone or sphere if it all lies on one, else one freeform surface
+    if one fits, else one smooth blend (cut in two by the build if no fill fits); either
+    way it gives back the features it took if its face can't be built. merged is None if
+    there is nothing to merge."""
+    from .features import Region, _whole_region
+    chosen = {int(a) for a in facets if len(mesh.nbrs[int(a)])}
+    keep, taken = [], []
+    for f in features:
+        inside = sum(int(a) in chosen for a in f.facets)
+        if inside and 2 * inside >= len(f.facets):
+            taken.append(f)
+        else:
+            keep.append(f)
+            chosen.difference_update(int(a) for a in f.facets)
+    for f in taken:
+        chosen.update(int(a) for a in f.facets)
+    if len(chosen) < 2:
+        return features, None
+    area = np.array(sorted(chosen))
+    merged = None
+    try:
+        best = _whole_region(mesh, Region(mesh, area))
+    except Exception:
+        best = None
+    if best is not None and len(best[1]) == len(area):
+        merged = best[0]
+        merged.parts = tuple(taken)
+    if merged is None:
+        model, dev = freeform.fit(mesh, area)
+        merged = (freeform.feature(mesh, model, area, tuple(taken), dev) if model is not None
+                  else _blend(mesh, area, tuple(taken)))
+    merged.detail = "painted: " + merged.detail
+    return keep + [merged], merged
+
+
 def fallback(mesh, feature):
     """Smooth blends of up to MAX_FACETS facets over a freeform patch's area (for when its
     face can't be built), the pieces it replaced kept whole."""

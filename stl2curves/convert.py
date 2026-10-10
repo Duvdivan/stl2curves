@@ -1088,6 +1088,18 @@ def _stl_to_solid(path, tol, fuse=True, curves=True, true_size=False, blends=Tru
     # (a mesh file, or (points, triangles) or (points, triangles, part of each triangle):
     # a 3MF object's parts can overlap, and are each mended and built on their own, then
     # joined by a boolean union)
+    return finish(*prepare(path, tol, fuse, curves, true_size, blends, mend, simplify_to), tol, fuse)
+
+
+def prepare(path, tol, fuse=True, curves=True, true_size=False, blends=True, mend=True,
+                  simplify_to=None):
+    """The first stages of a conversion: (parts, info, part), parts being (mesh,
+    features, mesh tolerance) for each body, ready for finish(). simplify_to: how far
+    (mm) thinning out an over-dense mesh may move its surface; None: only above
+    AUTO_SIMPLIFY triangles, at SIMPLIFY_ERROR; 0: never."""
+    # (a mesh file, or (points, triangles) or (points, triangles, part of each triangle):
+    # a 3MF object's parts can overlap, and are each mended and built on their own, then
+    # joined by a boolean union)
     part = None
     # (with STL2CURVES_CACHE set, the first stages are saved, and taken up again on the
     # next run of the same file if their code hasn't changed: see stages.py)
@@ -1141,6 +1153,9 @@ def _stl_to_solid(path, tol, fuse=True, curves=True, true_size=False, blends=Tru
         if saved is not None:
             parts, info["size"], info["snapped"] = saved
             info.setdefault("cached", []).append(done)
+            # (the tolerance analyze() leaves set for the stages after it: the last body's)
+            if parts:
+                features_mod._mesh_tol = parts[-1][2]
         else:
             parts = [analyze(pts, g) for g in groups]
             info["size"] = guess = guess_size([p[:2] for p in parts])
@@ -1158,9 +1173,18 @@ def _stl_to_solid(path, tol, fuse=True, curves=True, true_size=False, blends=Tru
             cache.save("blends", (parts, info["size"], info["snapped"]), [p[0] for p in parts])
     else:
         parts = [(Mesh(pts, g), [], TOL) for g in groups]
+    return parts, info, part
+
+
+def finish(parts, info, part, tol, fuse=True):
+    """The rest of a conversion, from prepare()'s parts (whose features may have been
+    edited in between): each body built and checked, joined, tidied: (shape, info)."""
     shapes, nb, nv = [], 0, 0
+    info["used"] = []           # (each body's features as built, for stl2curves.studio)
     for mesh, features, mesh_tol in parts:
+        before = len(info["restored"])
         shape, b, v = _build(mesh, features, mesh_tol, tol, fuse, info)
+        info["used"].append(info["restored"][before:])
         shapes.append(shape)
         nb, nv = nb + b, nv + v
         info["mesh_defects"] = info.get("mesh_defects", False) or mesh.__dict__.get("defective", False)

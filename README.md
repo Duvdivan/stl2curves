@@ -84,6 +84,22 @@ object made of several parts (a multi-colour print, say) has each part mended an
 rebuilt on its own, and the parts joined into one solid at the end (they may touch or
 overlap: merged into one mesh first, they would make a mesh that crosses itself).
 
+### Studio: check and rescue areas by hand
+
+```
+stl2curves-studio part.stl             # or: python -m stl2curves.studio part.stl
+```
+
+opens a page in your browser (served from your own computer only) showing the mesh
+coloured by what was found on it: holes, rounded edges, chamfers, rounded corners,
+smooth blends. **Convert** builds the solid and shows its faces; areas that came out as
+triangles (a fillet it missed, say) are then shown red on the mesh. Paint such an area
+with the brush (or pick whole features), one group per face it should become, and
+Convert again: each group is rebuilt as one cylinder, cone or sphere if it lies on one,
+else as one smooth surface. **Save STEP** downloads the result. The first stages of the
+conversion are kept between runs, so converting again after painting skips the
+analysis. The page draws with three.js, fetched from a CDN the first time.
+
 ### In FreeCAD
 
 stl2curves is also a FreeCAD add-on (FreeCAD 1.0 or later). Until it is listed in the

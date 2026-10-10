@@ -243,6 +243,14 @@ class Mesh:
             self.nbrs[y].add(x)
             self.shared.setdefault((x, y), []).append(e)
 
+    def __getstate__(self):
+        # (the neighbour sets as lists in the order they have: a set pickle rebuilds can
+        # come out in another order, and the order decides what is tried, so a worker or
+        # a saved stage taken up again went its own way)
+        state = dict(self.__dict__)
+        state["nbrs"] = [list(s) for s in self.nbrs]
+        return state
+
     def smooth_regions(self):
         nf = len(self.fn)
         a = [x for x in range(nf) for y in self.nbrs[x] if x < y]
