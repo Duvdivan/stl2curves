@@ -36,6 +36,7 @@
   #groups .g { display:flex; align-items:center; gap:6px; padding:2px 4px; border-radius:3px; cursor:pointer; }
   #groups .g.cur { outline:1px solid var(--accent); }
   #groups .g .n { color:var(--dim); margin-left:auto; }
+  #groups .g .o { color:var(--dim); font-size:11px; }
   #groups .g button { padding:0 6px; }
   #toolbar { position:absolute; top:10px; left:10px; right:10px; display:flex; gap:6px; flex-wrap:wrap; pointer-events:none; }
   #toolbar > * { pointer-events:auto; }
@@ -119,13 +120,12 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 const KIND = {
   cylinder: ['#4d8ce6', 'cylinder (hole, pin, rounded edge)'], cone: ['#f29933', 'cone (chamfer, countersink)'],
   torus: ['#59bf66', 'torus (rounded edge round a curve)'], sphere: ['#a666d9', 'sphere (rounded corner, dome)'],
-  pipe: ['#3fb3b3', 'swept rounded edge'], freeform: ['#e05a5a', 'freeform surface'],
-  blend: ['#d24f86', 'smooth blend'], thread: ['#c29a4a', 'screw thread'], extrusion: ['#8a8af0', 'extruded profile'],
+  pipe: ['#3fb3b3', 'swept rounded edge'], freeform: ['#a8774f', 'freeform surface'],
+  blend: ['#d24f86', 'smooth blend'], thread: ['#e3cf3c', 'screw thread'], extrusion: ['#8a8af0', 'extruded profile'],
   none: ['#c8c8cc', 'flat face, or left as triangles'],
   left: ['#ff3b30', 'left as triangles by the last Convert: paint it to rescue it'],
 };
-const SURF = ['#c8c8cc', '#4d8ce6', '#f29933', '#a666d9', '#59bf66'];   // plane, cylinder, cone, sphere, torus; else freeform
-const GROUP = ['#ffd21e', '#20e0ff', '#ff5ae0', '#7dff4a', '#ff8a30', '#b0a0ff', '#ffffff', '#30ffa0'];
+const GROUP = ['#20e0ff', '#ff5ae0', '#7dff4a', '#ffffff', '#ff8a30', '#b0a0ff', '#30ffa0', '#ff9d9d'];
 const $ = id => document.getElementById(id);
 // (faces pushed back a little, so the lines drawn on them show)
 const OFFSET = { polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1 };
@@ -177,7 +177,26 @@ for (const [k, [c, text]] of Object.entries(KIND))
   legend.insertAdjacentHTML('beforeend', `<span class="sw" style="background:${c}"></span><span>${text}</span>`);
 
 function status(text, err) { $('status').innerHTML = err ? `<span class="err">${text}</span>` : text; }
-function busy(on, text) { $('busy').style.display = on ? 'flex' : 'none'; $('busy').textContent = text || 'working…'; }
+// While busy, the step the conversion is on and how long it has been at it (a long
+// analysis otherwise looks hung).
+let busyTimer = null;
+function busy(on, text) {
+  $('busy').style.display = on ? 'flex' : 'none';
+  $('busy').textContent = text || 'working…';
+  clearInterval(busyTimer); busyTimer = null;
+  if (!on || location.protocol === 'file:') return;
+  const start = Date.now(), head = text || 'working…';
+  const clock = s => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
+  busyTimer = setInterval(async () => {
+    try {
+      const j = await (await fetch('/api/progress')).json();
+      if (!busyTimer) return;
+      const total = (Date.now() - start) / 1000;
+      $('busy').innerHTML = `<div style="text-align:center;line-height:1.6">${head} ${clock(total)}` +
+        (j.step ? `<br><span style="opacity:.75">${j.step} (${clock(j.seconds)})</span>` : '') + '</div>';
+    } catch (e) { /* the next tick will tell */ }
+  }, 1000);
+}
 function decode(b64, Type) {
   const s = atob(b64), u = new Uint8Array(s.length);
   for (let i = 0; i < s.length; i++) u[i] = s.charCodeAt(i);
@@ -185,7 +204,8 @@ function decode(b64, Type) {
 }
 async function api(path, body) {
   const r = await fetch(path, { method: 'POST', body: body instanceof Blob ? body : JSON.stringify(body || {}) });
-  const j = await r.json();
+  let j;
+  try { j = await r.json(); } catch (e) { throw new Error(`${path}: ${r.status} ${r.statusText}`); }
   if (!r.ok) throw new Error(j.error || r.statusText);
   return j;
 }
@@ -255,6 +275,10 @@ $('convert').onclick = async () => {
                (j.file_ok === false ? ', STEP does not read back exactly' : '') +
                `\n${j.left_faceted} feature(s) left faceted · STEP ${j.step_kb} KB · ${j.seconds} s`;
     for (const g of j.groups) text += `\n${g.group}: ${g.label} (${g.detail}): ${g.outcome}`;
+    for (const g of groups) g.outcome = (j.groups.find(r => r.group === g.name) || {}).outcome || '';
+    renderGroups();
+    if (nleft) text += `\n${nleft.toLocaleString()} triangles came out as faces of their own: red here, and ` +
+                       'in Analysis, where you paint (Brush or Pick feature takes you there)';
     status(text, !j.valid);
     $('download').disabled = false;
     if (location.hash === '#demo' && demoRound === 1) setTimeout(demo, 50);
@@ -337,10 +361,10 @@ $('radius').oninput = () => { $('radiusv').textContent = $('radius').value; };
 
 function showResult(j) {
   clearScene(resultGroup);
-  const pos = decode(j.positions, Float32Array), surf = decode(j.surface, Uint8Array);
+  const pos = decode(j.positions, Float32Array), kind = decode(j.kind, Uint8Array);
   const col = new Float32Array(pos.length), g = new THREE.Color();
-  for (let t = 0; t < surf.length; t++) {
-    g.set(SURF[surf[t]] || KIND.freeform[0]);
+  for (let t = 0; t < kind.length; t++) {
+    g.set((KIND[j.kinds[kind[t]]] || KIND.freeform)[0]);
     for (let v = 0; v < 3; v++) col.set([g.r, g.g, g.b], t * 9 + v * 3);
   }
   const geom = new THREE.BufferGeometry();
@@ -367,7 +391,8 @@ function renderGroups() {
     let n = 0; for (const b of bodies) for (const p of b.paint) if (p === i) n++;
     const row = document.createElement('div');
     row.className = 'g' + (i === current ? ' cur' : '');
-    row.innerHTML = `<span class="sw" style="background:${g.color}"></span><span>${g.name}</span><span class="n">${n} triangles</span>`;
+    row.innerHTML = `<span class="sw" style="background:${g.color}"></span><span>${g.name}</span><span class="n">${n} triangles</span>` +
+                    (g.outcome ? `<span class="o" title="what the last Convert made of it">${g.outcome}</span>` : '');
     const del = document.createElement('button'); del.textContent = '×'; del.title = 'delete this group';
     del.onclick = ev => { ev.stopPropagation(); deleteGroup(i); };
     row.appendChild(del);
@@ -383,6 +408,7 @@ function deleteGroup(i) {
       else if (b.paint[t] > i) b.paint[t]--;
     }
   groups.splice(i, 1);
+  if (current > i) current--;
   current = Math.min(current, groups.length - 1);
   for (const b of bodies) recolour(b, allTris(b));
   renderGroups();
@@ -412,8 +438,8 @@ function setTool(t) {
     : { LEFT: null, MIDDLE: THREE.MOUSE.DOLLY, RIGHT: THREE.MOUSE.ROTATE };
 }
 $('tOrbit').onclick = () => setTool('orbit');
-$('tBrush').onclick = () => setTool('brush');
-$('tFeature').onclick = () => setTool('feature');
+$('tBrush').onclick = () => { setTool('brush'); if (bodies.length) show('analysis'); };
+$('tFeature').onclick = () => { setTool('feature'); if (bodies.length) show('analysis'); };
 
 function paintAt(h, erase) {
   if (current < 0) newGroup();
@@ -433,7 +459,8 @@ function paintAt(h, erase) {
 }
 let painting = false;
 renderer.domElement.addEventListener('pointerdown', ev => {
-  if (ev.button !== 0 || tool === 'orbit' || !analysisGroup.visible) return;
+  if (ev.button !== 0 || tool === 'orbit' || !bodies.length) return;
+  if (!analysisGroup.visible) { show('analysis'); return; }    // (painting is on the mesh)
   const h = hit(ev); if (!h) return;
   painting = tool === 'brush'; paintAt(h, ev.shiftKey);
   if (!painting) renderGroups();
@@ -472,8 +499,22 @@ async function demo() {
   if (changed.length) setTimeout(() => $('convert').click(), 50);
 }
 
-// a mesh given on the command line
-fetch('/api/state').then(r => r.json()).then(j => { if (j.name) { opened(j.name); if (j.auto) $('analyze').click(); } });
+// Opened as a file (double-clicked), the page has no server to convert with: go to a
+// studio that is running, or say how to start one.
+if (location.protocol === 'file:') {
+  const home = 'http://127.0.0.1:8765/';
+  fetch(home + 'api/state', { mode: 'no-cors' }).then(() => { location.href = home; }, () => {
+    $('busy').style.display = 'flex';
+    $('busy').innerHTML = `<div style="max-width:440px;line-height:1.5;background:#222;padding:18px 22px;border-radius:6px">
+      <b>The studio isn't running.</b><br>This page does its work through a small program on
+      this computer. Double-click <b>studio.bat</b> in the stl2curves folder (or drop an STL
+      file on it), or run <code>python -m stl2curves.studio</code>; it opens the page itself.
+      Keep its window open while you work.</div>`;
+  });
+} else {
+  // a mesh given on the command line
+  fetch('/api/state').then(r => r.json()).then(j => { if (j.name) { opened(j.name); if (j.auto) $('analyze').click(); } });
+}
 </script>
 </body>
 </html>

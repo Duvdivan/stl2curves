@@ -77,7 +77,7 @@ from . import workers
 from .bodies import split_bodies
 from .blends import add_blends, split as split_blend, _blend as as_blend, fallback as blend_fallback, carve, pipe_fallback
 from .repair import repair
-from . import accuracy, stages
+from . import accuracy, progress, stages
 from .simplify import simplify
 from .read3mf import read_3mf
 
@@ -464,6 +464,8 @@ def attempt(mesh, features, mesh_tol, tol, fuse, faceted_volume):
     "volume2", "invalid"; "ok"), for diagnosing a slow or poor conversion."""
     attempt.blamed = False
     attempt.why = "ok"
+    mesh.tries = mesh.__dict__.get("tries", 0) + 1
+    progress.step(f"building the solid and checking it (try {mesh.tries}, {len(features)} curved areas)")
     comp, shells, failed = build_faces(mesh, features, mesh_tol)
     if failed:
         attempt.why = "build"
@@ -914,6 +916,8 @@ def _swap_build(mesh, features, mesh_tol, tol, info, faceted_volume):
 def _build(mesh, features, mesh_tol, tol, fuse, info):
     """Build and check one group of bodies, leaving faceted any feature that spoils it.
     Returns (shape, bodies, cavities)."""
+    mesh.tries = 0
+    progress.step("building the flat faces")
     faceted_volume = mesh_volume(mesh)
     _bare_ahead(mesh, tol)
     features = settle_blends(mesh, features, mesh_tol, split_blend, info["skipped"])
@@ -1111,6 +1115,7 @@ def prepare(path, tol, fuse=True, curves=True, true_size=False, blends=True, men
             workers.start(kept["triangles"])
         info = {"restored": [], "skipped": [], "size": None, "snapped": 0, "cached": ["mesh"], **kept}
     else:
+        progress.step("reading the mesh")
         if isinstance(path, (str, os.PathLike)):
             pts, tris = load_stl(path)
         else:
@@ -1122,6 +1127,7 @@ def prepare(path, tol, fuse=True, curves=True, true_size=False, blends=True, men
         info = {"triangles": len(tris), "restored": [], "skipped": [], "size": None, "snapped": 0,
                 "repairs": [], "simplified": None}
         if mend:
+            progress.step("mending the mesh")
             if part is None:
                 pts, tris, info["repairs"] = repair(pts, tris)
             else:
@@ -1129,6 +1135,7 @@ def prepare(path, tol, fuse=True, curves=True, true_size=False, blends=True, men
         if simplify_to is None:
             simplify_to = SIMPLIFY_ERROR if len(tris) > AUTO_SIMPLIFY else 0
         if simplify_to:
+            progress.step("thinning out the mesh")
             before = len(tris)
             if part is None:
                 tris = simplify(pts, tris, simplify_to)
@@ -1139,6 +1146,7 @@ def prepare(path, tol, fuse=True, curves=True, true_size=False, blends=True, men
                 tris = np.vstack(pieces)
             info["simplified"] = (before, len(tris), simplify_to)
         # bodies touching at an edge are built apart (and so are a 3MF object's parts)
+        progress.step("separating the bodies")
         groups = (split_bodies(pts, tris) if part is None
                   else [g for p in np.unique(part) for g in split_bodies(pts, tris[part == p])])
         cache.save("mesh", (pts, tris, part, groups,
@@ -1157,18 +1165,20 @@ def prepare(path, tol, fuse=True, curves=True, true_size=False, blends=True, men
             if parts:
                 features_mod._mesh_tol = parts[-1][2]
         else:
-            parts = [analyze(pts, g) for g in groups]
+            parts = [_analyze_body(pts, g, i, len(groups)) for i, g in enumerate(groups)]
+            progress.step("guessing the design size")
             info["size"] = guess = guess_size([p[:2] for p in parts])
             round_unit = None
             if true_size and guess is not None:
                 round_unit = guess.unit
                 if guess.factor != 1.0:
-                    parts = [analyze(pts * guess.factor, g) for g in groups]
+                    parts = [_analyze_body(pts * guess.factor, g, i, len(groups)) for i, g in enumerate(groups)]
             for mesh, features, _ in parts:
                 info["snapped"] += snap(mesh, features, round_unit)
             cache.save("analysis", (parts, info["size"], info["snapped"]), [p[0] for p in parts])
             done = "analysis"
         if blends and done == "analysis":
+            progress.step("fitting smooth blends and freeform surfaces")
             parts = [(mesh, add_blends(mesh, features), t) for mesh, features, t in parts]
             cache.save("blends", (parts, info["size"], info["snapped"]), [p[0] for p in parts])
     else:
@@ -1176,20 +1186,31 @@ def prepare(path, tol, fuse=True, curves=True, true_size=False, blends=True, men
     return parts, info, part
 
 
+def _analyze_body(pts, tris, i, n):
+    progress.within(f"body {i + 1} of {n}" if n > 1 else "")
+    try:
+        return analyze(pts, tris)
+    finally:
+        progress.within("")
+
+
 def finish(parts, info, part, tol, fuse=True):
     """The rest of a conversion, from prepare()'s parts (whose features may have been
     edited in between): each body built and checked, joined, tidied: (shape, info)."""
     shapes, nb, nv = [], 0, 0
     info["used"] = []           # (each body's features as built, for stl2curves.studio)
-    for mesh, features, mesh_tol in parts:
+    for i, (mesh, features, mesh_tol) in enumerate(parts):
+        progress.within(f"body {i + 1} of {len(parts)}" if len(parts) > 1 else "")
         before = len(info["restored"])
         shape, b, v = _build(mesh, features, mesh_tol, tol, fuse, info)
         info["used"].append(info["restored"][before:])
         shapes.append(shape)
         nb, nv = nb + b, nv + v
         info["mesh_defects"] = info.get("mesh_defects", False) or mesh.__dict__.get("defective", False)
+    progress.within("")
     shape = shapes[0]
     if len(shapes) > 1:
+        progress.step("joining the bodies")
         # bodies that met at an edge were built apart; join them now, unless the join
         # comes out invalid or loses material (the boolean can return nothing at all
         # where bodies only touch): then they are handed over side by side
@@ -1211,6 +1232,7 @@ def finish(parts, info, part, tol, fuse=True):
     # ridge a thousandth of a millimetre high in an export, was built triangle by
     # triangle), failing that just edges split along one line (see tidied: given up on
     # a part so big that it would take more than TIDY_SECONDS).
+    progress.step("tidying up the faces")
     checked = shape
     target = volume(checked)
     shape, untidy = tidied(checked, target)
@@ -1230,6 +1252,7 @@ def finish(parts, info, part, tol, fuse=True):
     # shape as checked)
     slack = FILE_VOLUME * abs(target) + 1e-3
     if count(shape, TopAbs_FACE) <= FILE_CHECK_FACES:
+        progress.step("checking the STEP file reads back")
         trouble = file_trouble(shape, slack)
         if trouble is not None and shape is not checked and file_trouble(checked, slack) is None:
             shape, trouble = checked, None

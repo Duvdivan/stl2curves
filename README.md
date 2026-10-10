@@ -105,6 +105,11 @@ else as one smooth surface. **Save STEP** downloads the result. The first stages
 conversion are kept between runs, so converting again after painting skips the
 analysis. The page draws with three.js, fetched from a CDN the first time.
 
+On Windows, from a downloaded copy: double-click `studio.bat` (or drop an STL file on
+it), and keep its window open while you work; closing it stops the studio. Opening
+`studio.html` by itself does nothing useful: the page sends its work to the studio
+program, and tells you so when that isn't running.
+
 ### In FreeCAD
 
 stl2curves is also a FreeCAD add-on (FreeCAD 1.0 or later). Until it is listed in the

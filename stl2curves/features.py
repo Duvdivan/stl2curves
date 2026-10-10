@@ -30,6 +30,7 @@ from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import progress
 from .accuracy import SCALE as ACCURACY
 
 import numpy as np
@@ -858,12 +859,14 @@ def find_features(pts, tris):
 def analyze(pts, tris):
     """Return (mesh, features, tolerance): the facet structure and every rebuildable patch."""
     global _mesh_tol
+    progress.step("grouping triangles into flat facets")
     mesh = Mesh(pts, tris)
     _mesh_tol = TOL + FLOAT_TOL * float(np.abs(pts).max())
     regions = [Region(mesh, g) for g in mesh.smooth_regions()]
     features = []
 
     # Pass 0: smooth regions that are all one surface, fitted whole.
+    progress.step("fitting whole smooth areas")
     for region in regions:
         if len(region.facets) >= 6:
             best = _whole_region(mesh, region)
@@ -877,6 +880,7 @@ def analyze(pts, tris):
     # cylinder or cone on its own axis, which is often a hole's too) or the loose pass
     # (which would take pieces of them for cylinders and cones)
     from . import threads
+    progress.step("looking for screw threads")
     free = [region.facets[region.free] for region in regions]
     screws = []
     for thread, fids in threads.find(mesh, np.concatenate(free) if free else np.zeros(0, int)):
@@ -901,6 +905,7 @@ def analyze(pts, tris):
     # likeliest. Before pass 1, which would cut a coarsely meshed fillet into strips
     # that each fit some cylinder of their own.
     from . import fillets
+    progress.step("finding rounded edges between flat faces")
     taken = np.zeros(len(mesh.farea), bool)
     for f in features + screws + ends:
         taken[f.facets] = True
@@ -912,11 +917,13 @@ def analyze(pts, tris):
     features += rolled
 
     # Pass 1: from each pair of neighbouring facets, work out what surface they're on.
+    progress.step("finding curved surfaces")
     features += _pairs_pass(mesh, regions)
 
     # Pass 2: tori (and anything missed) around the axes of the patches found so far.
     # A curved rounded edge always shares its axis with a neighbouring hole, pin or
     # rounded corner, so each new patch can unlock its neighbours.
+    progress.step("finding rounded edges round holes and pins")
     done = []
     while True:
         # each round only tries the axes found since the last one
@@ -929,6 +936,7 @@ def analyze(pts, tris):
         # (on a known axis only the radius is free, so a file that rounded its corners
         # can be allowed that much more: the CAD program's own export is often as loose)
         features += _axis_pass(mesh, regions, axes, AXIS_NOISE * mesh.noise)
+    progress.step("finding what is left")
     features += _loose_pass(mesh, regions, features)
     features = _band_tori(mesh, regions, features)
     # (the thread's pieces ahead of what was found round its ends: if the solid won't

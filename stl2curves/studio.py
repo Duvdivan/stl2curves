@@ -17,6 +17,7 @@ import argparse
 import base64
 import json
 import os
+import shutil
 import sys
 import tempfile
 import threading
@@ -29,14 +30,19 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 import numpy as np
 
-from . import accuracy, convert, stages, workers
+from . import accuracy, convert, progress, stages, workers
 from . import features as features_mod
 from .blends import merge
 
 PAGE = Path(__file__).with_name("studio.html")
 BIGGEST_UPLOAD = 500 * 2 ** 20      # bytes
 TESS_DEFLECTION = 0.02              # mm: how finely the result is tessellated for the view
-SURFACES = {0: "plane", 1: "cylinder", 2: "cone", 3: "sphere", 4: "torus"}
+SURFACES = {1: "cylinder", 2: "cone", 3: "sphere", 4: "torus"}    # OCC surface types (0: plane)
+# the result view's colours, as the page's KIND table names them
+VIEW_KINDS = ["none", "left", "cylinder", "cone", "sphere", "torus", "pipe", "freeform", "blend", "thread", "extrusion"]
+SPLINE_KINDS = {"pipe", "freeform", "blend", "thread", "extrusion"}     # features built as splines
+FOLDER_PREFIX = "stl2curves_studio_"    # each studio's working folder, in the temp folder
+OLD_FOLDER_HOURS = 48               # hours untouched after which another studio deletes one
 
 
 def _b64(a):
@@ -123,45 +129,63 @@ class Session:
             path = self.folder / (self.path.stem + ".step")
             convert.write_step(shape, str(path))
             self.step = path.read_bytes()
-            view = _tessellated(shape)
+            view, faces = _tessellated(shape)
             # what was left as triangles: the solid's flat three-sided faces, matched back to
             # the mesh triangles they are (what a person may want to paint and convert again)
-            left = [_b64(x.astype(np.uint8)) for x in _left_as_triangles(shape, [p[0] for p in parts])]
-            return {**view, "left": left, "faces": info["faces"], "volume": round(info["volume"], 2), "valid": info["valid"],
+            flags, left_faces = _left_as_triangles(faces, [p[0] for p in parts])
+            kinds = _face_kinds(faces, left_faces, parts, info.get("used", []))
+            view["kind"] = _b64(np.repeat(kinds, [f["triangles"] for f in faces]).astype(np.uint8))
+            left = [_b64(x.astype(np.uint8)) for x in flags]
+            return {**view, "kinds": VIEW_KINDS, "left": left, "faces": info["faces"], "volume": round(info["volume"], 2), "valid": info["valid"],
                     "file_ok": info.get("file_ok"), "seconds": round(time.time() - t, 1), "groups": groups,
                     "left_faceted": len(skipped), "step_kb": round(len(self.step) / 1024, 1)}
 
 
-def _left_as_triangles(shape, meshes):
-    """For each mesh, which of its triangles came out as a face of their own."""
+def _left_as_triangles(faces, meshes):
+    """For each mesh, which of its triangles came out as a face of their own; and which
+    of the result's faces those are."""
     from scipy.spatial import cKDTree
-    from OCP.BRepAdaptor import BRepAdaptor_Surface
-    from OCP.BRepGProp import BRepGProp
-    from OCP.GProp import GProp_GProps
-    from OCP.TopAbs import TopAbs_EDGE, TopAbs_FACE
-    from OCP.TopExp import TopExp, TopExp_Explorer
-    from OCP.TopoDS import TopoDS
-    from OCP.collections import IndexedMap_TopoDS_Shape_TopTools_ShapeMapHasher as Map
-    centres = []
-    ex = TopExp_Explorer(shape, TopAbs_FACE)
-    while ex.More():
-        face = TopoDS.Face(ex.Current())
-        ex.Next()
-        if int(BRepAdaptor_Surface(face).GetType()) != 0:
-            continue
-        edges = Map()
-        TopExp.MapShapes_s(face, TopAbs_EDGE, edges)
-        if edges.Extent() == 3:
-            g = GProp_GProps()
-            BRepGProp.SurfaceProperties_s(face, g)
-            centres.append(g.CentreOfMass().Coord())
-    out = []
+    picked = [i for i, f in enumerate(faces) if f["centre"] is not None]
+    out, left = [], np.zeros(len(faces), bool)
     for mesh in meshes:
         flags = np.zeros(len(mesh.tris), bool)
-        if centres:
-            d, k = cKDTree(mesh.pts[mesh.tris].mean(axis=1)).query(np.array(centres))
-            flags[k[d < 0.01]] = True
+        if picked:
+            d, k = cKDTree(mesh.pts[mesh.tris].mean(axis=1)).query(np.array([faces[i]["centre"] for i in picked]))
+            near = d < 0.01
+            flags[k[near]] = True
+            left[np.array(picked)[near]] = True
         out.append(flags)
+    return out, left
+
+
+def _face_kinds(faces, left, parts, used):
+    """Each result face's colour (an index into VIEW_KINDS), as the analysis view colours
+    the feature it came from: a flat face grey, or red if it is a mesh triangle left as
+    it was; an exact surface by its type; a spline face by the feature it was built from
+    (a thread's flanks, a swept fillet, a freeform patch and a blend are all splines)."""
+    from scipy.spatial import cKDTree
+    index = {k: i for i, k in enumerate(VIEW_KINDS)}
+    pts, labels = [], []
+    for (mesh, _, _), features in zip(parts, used):
+        cent = mesh.pts[mesh.tris].mean(axis=1)
+        for f in features:
+            kind = getattr(f.model, "kind", None)
+            if kind in SPLINE_KINDS:
+                tris = np.nonzero(np.isin(mesh.facet_of, f.facets))[0]
+                pts.append(cent[tris])
+                labels.append(np.full(len(tris), index[kind]))
+    tree = cKDTree(np.vstack(pts)) if pts else None
+    labels = np.concatenate(labels) if labels else np.zeros(0, int)
+    out = np.zeros(len(faces), np.uint8)
+    for i, f in enumerate(faces):
+        if f["type"] == 0:
+            out[i] = index["left" if left[i] else "none"]
+        elif f["type"] in SURFACES:
+            out[i] = index[SURFACES[f["type"]]]
+        elif tree is not None:
+            out[i] = labels[tree.query(f["sample"])[1]]
+        else:
+            out[i] = index["freeform"]
     return out
 
 
@@ -181,16 +205,21 @@ def _outline(mesh, owner):
 
 
 def _tessellated(shape):
-    """The shape's faces as triangles coloured by surface type, and its edges as lines."""
+    """The shape's faces as triangles and its edges as lines (for the view), and for each
+    face: its surface type, how many of the triangles are its, a point on it, and (a
+    flat three-sided face) its centre."""
     from OCP.BRep import BRep_Tool
     from OCP.BRepAdaptor import BRepAdaptor_Curve, BRepAdaptor_Surface
+    from OCP.BRepGProp import BRepGProp
     from OCP.BRepMesh import BRepMesh_IncrementalMesh
+    from OCP.GProp import GProp_GProps
     from OCP.TopAbs import TopAbs_EDGE, TopAbs_FACE, TopAbs_REVERSED
-    from OCP.TopExp import TopExp_Explorer
+    from OCP.TopExp import TopExp, TopExp_Explorer
     from OCP.TopLoc import TopLoc_Location
     from OCP.TopoDS import TopoDS
+    from OCP.collections import IndexedMap_TopoDS_Shape_TopTools_ShapeMapHasher as Map
     BRepMesh_IncrementalMesh(shape, TESS_DEFLECTION, False, 0.3, True)
-    pos, kind = [], []
+    pos, faces = [], []
     ex = TopExp_Explorer(shape, TopAbs_FACE)
     while ex.More():
         face = TopoDS.Face(ex.Current())
@@ -204,8 +233,21 @@ def _tessellated(shape):
         ids = np.array([tri.Triangle(i).Get() for i in range(1, tri.NbTriangles() + 1)]) - 1
         if face.Orientation() == TopAbs_REVERSED:
             ids = ids[:, [0, 2, 1]]
-        pos.append(nodes[ids].reshape(-1, 3))
-        kind.append(np.full(len(ids), int(BRepAdaptor_Surface(face).GetType())))
+        T = nodes[ids]
+        pos.append(T.reshape(-1, 3))
+        kind = int(BRepAdaptor_Surface(face).GetType())
+        # (a point on the face, to find the feature it came from: the middle of its biggest
+        # triangle; a curved face's centre of mass can lie off it, a cylinder's on its axis)
+        big = int(np.linalg.norm(np.cross(T[:, 1] - T[:, 0], T[:, 2] - T[:, 0]), axis=1).argmax())
+        centre = None
+        if kind == 0:               # flat three-sided faces may be mesh triangles left as they were
+            edges = Map()
+            TopExp.MapShapes_s(face, TopAbs_EDGE, edges)
+            if edges.Extent() == 3:
+                g = GProp_GProps()
+                BRepGProp.SurfaceProperties_s(face, g)
+                centre = g.CentreOfMass().Coord()
+        faces.append({"type": kind, "triangles": len(ids), "sample": T[big].mean(axis=0), "centre": centre})
     lines = []
     ex = TopExp_Explorer(shape, TopAbs_EDGE)
     while ex.More():
@@ -219,10 +261,8 @@ def _tessellated(shape):
         P = np.array([c.Value(a + (b - a) * i / (n - 1)).Coord() for i in range(n)])
         lines.append(np.repeat(P, 2, axis=0)[1:-1])
     pos = np.vstack(pos) if pos else np.zeros((0, 3))
-    kind = np.concatenate(kind) if kind else np.zeros(0, int)
     lines = np.vstack(lines) if lines else np.zeros((0, 3))
-    return {"positions": _b64(pos.astype(np.float32).ravel()), "surface": _b64(np.minimum(kind, 9).astype(np.uint8)),
-            "edges": _b64(lines.astype(np.float32).ravel())}
+    return {"positions": _b64(pos.astype(np.float32).ravel()), "edges": _b64(lines.astype(np.float32).ravel())}, faces
 
 
 def _handler(session):
@@ -246,6 +286,9 @@ def _handler(session):
                 self._send(200, PAGE.read_bytes(), "text/html; charset=utf-8")
             elif url.path == "/api/state":
                 self._send(200, {"name": session.path.name if session.path else None, "auto": session.auto})
+            elif url.path == "/api/progress":
+                text, seconds = progress.current()
+                self._send(200, {"step": text, "seconds": round(seconds, 1)})
             elif url.path == "/api/step" and session.step:
                 name = session.path.stem + ".step"
                 self._send(200, session.step, "application/step",
@@ -283,13 +326,34 @@ def _handler(session):
     return Handler
 
 
+def _clear_old_folders():
+    """Delete the folders of studios long gone: closing the studio's window kills it
+    before it can delete its own (copies of the meshes, STEP files, saved stages)."""
+    cutoff = time.time() - OLD_FOLDER_HOURS * 3600
+    for old in Path(tempfile.gettempdir()).glob(FOLDER_PREFIX + "*"):
+        try:
+            newest = max([old.stat().st_mtime] + [p.stat().st_mtime for p in old.rglob("*")])
+            if newest < cutoff:
+                shutil.rmtree(old, ignore_errors=True)
+        except OSError:
+            pass
+
+
+class _Server(ThreadingHTTPServer):
+    # on Windows SO_REUSEADDR lets a second server bind a port in use, and requests then
+    # go to either; refused, a second studio takes a port of its own
+    allow_reuse_address = False
+    allow_reuse_port = False
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="stl2curves.studio", description=__doc__.split("\n\n")[0])
     ap.add_argument("mesh", nargs="?", help="an STL file to open straight away")
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--no-browser", action="store_true", help="don't open the page in a browser")
     a = ap.parse_args(argv)
-    folder = Path(tempfile.mkdtemp(prefix="stl2curves_studio_"))
+    _clear_old_folders()
+    folder = Path(tempfile.mkdtemp(prefix=FOLDER_PREFIX))
     if not stages.FOLDER:
         stages.FOLDER = str(folder / "stages")
     session = Session(folder)
@@ -297,7 +361,10 @@ def main(argv=None):
         session.path = folder / Path(a.mesh).name
         session.path.write_bytes(Path(a.mesh).read_bytes())
         session.auto = True
-    server = ThreadingHTTPServer(("127.0.0.1", a.port), _handler(session))
+    try:
+        server = _Server(("127.0.0.1", a.port), _handler(session))
+    except OSError:     # a studio is already running there: take any free port
+        server = _Server(("127.0.0.1", 0), _handler(session))
     url = f"http://127.0.0.1:{server.server_address[1]}/"
     print(f"stl2curves studio at {url}  (Ctrl+C to stop)", flush=True)
     if not a.no_browser:
@@ -309,6 +376,7 @@ def main(argv=None):
     finally:
         server.server_close()
         workers.finish()
+        shutil.rmtree(folder, ignore_errors=True)
 
 
 if __name__ == "__main__":
