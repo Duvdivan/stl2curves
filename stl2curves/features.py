@@ -30,6 +30,8 @@ from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
+from .accuracy import SCALE as ACCURACY
+
 import numpy as np
 
 TOL = 0.001          # mm: CAD exports put mesh corners on the true surface to within this
@@ -50,8 +52,8 @@ WHOLE_STRAY = 0.02          # mm: how far the rest (outline corners on a seam) m
 # A region taken whole although its corners stray from the surface (a mesh exported
 # coarsely, or rounded off, keeps its cylinders only to a hundredth of a millimetre or
 # so; cut into strips instead, every strip fits a cylinder of its own, wrong radius):
-NOISY_MAX = 0.02            # mm: every corner this close to the surface ...
-NOISY_TYPICAL = 0.01        # ... nearly all of them (95%) this close ...
+NOISY_MAX = 0.02 * ACCURACY  # mm: every corner this close to the surface ...
+NOISY_TYPICAL = 0.01 * ACCURACY  # ... nearly all of them (95%) this close ...
 NOISY_TURN_DEG = 60         # ... the region turning at least this far (a gently curved patch fits anything)
 NOISY_MIN_FACETS = 12       # ... with at least this many facets
 TRIMMED_MIN_CORNERS = 12

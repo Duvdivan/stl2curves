@@ -75,7 +75,12 @@ Options: `--tol` sewing tolerance (mm), `--no-fuse` keep overlapping bodies sepa
 `--no-curves` flat faces only, `--no-blends` no smooth freeform faces (exact surfaces
 and flat facets only), `--no-repair` take the mesh as it is, `--simplify MM` thin out
 the mesh first (moving its surface by at most MM; meshes over 150,000 triangles are
-thinned by 0.005 mm automatically), `--time-limit SECONDS` (default 600, 0 for none).
+thinned by 0.005 mm automatically), `--time-limit SECONDS` (default 600, 0 for none),
+`--accuracy MM` how far smooth surfaces, fillets on rough meshes and other fitted surfaces
+may stray from the mesh (default 0.02): a looser setting rebuilds more of the part as
+curves instead of leaving it as triangles. On the GPS case back used in testing, 0.1
+gave 857 faces instead of 1,502, with the mesh still within 0.016 mm of the solid at
+99% of its corners (0.044 mm at most).
 
 From a 3MF file (Bambu Studio, OrcaSlicer, PrusaSlicer...) every object on the build
 plates is converted to its own STEP, named after the file and the object, placed as on

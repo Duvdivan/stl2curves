@@ -50,6 +50,7 @@ from OCP.Geom import (Geom_ToroidalSurface, Geom_SphericalSurface, Geom_Cylindri
 from OCP.GeomAPI import GeomAPI_IntSS, GeomAPI_ProjectPointOnCurve
 
 from . import features as features_mod
+from .accuracy import SCALE as ACCURACY
 from . import workers
 from .features import TWO_PI, _angle_gap, _frame, Revolved, Sphere
 from .blends import TANGENT_DEG, MAX_DEVIATION, MAX_BULGE, MAX_EDGE_GAP
@@ -1386,6 +1387,7 @@ def _repaired(face):
 # tolerances, max degree, max segments
 USE_GUIDES = False   # guide points past the outline pull against the real points where the neighbour is curved
 BULGE_FACTOR = 1.0   # how far past a circular arc's sag a blend may bow over a facet
+HUG_SLACK = 0.005 * ACCURACY   # mm: ... plus this
 FILL_SETTINGS = (3, 15, 2, False, 1e-5, 1e-4, 1e-2, 0.1, 8, 9)
 FINE_FILL_SETTINGS = (3, 30, 3, False, 1e-5, 1e-5, 1e-2, 0.1, 8, 20)
 BLEND_SECONDS = 300     # time allowed for fitting blends; the rest keep their exact pieces or facets
@@ -1730,7 +1732,7 @@ def _hugs_mesh(face, piece):
     vn /= np.maximum(np.linalg.norm(vn, axis=1), 1e-12)[:, None]
     theta = np.arccos(np.clip(np.einsum("tkj,tj->tk", vn[corners], tn), -1, 1)).max(axis=1)
     size = np.linalg.norm(T - T[:, [1, 2, 0]], axis=2).max(axis=1)
-    allowed = BULGE_FACTOR * size * theta / 4 + 0.005
+    allowed = BULGE_FACTOR * size * theta / 4 + HUG_SLACK
     if (d > allowed[k]).any():
         return False
     # and every mesh corner lies on the face itself (not just on its untrimmed surface)

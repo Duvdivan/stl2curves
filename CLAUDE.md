@@ -215,6 +215,15 @@ as BRep files, the mesh once per pass via `workers.share`/`load`. What runs ther
 - `TIME_LIMIT` (`--time-limit`) only stops optional refinement (blends, culprit search,
   second chances); analysis always runs to the end (cutting it gave garbage).
 
+Accuracy (`accuracy.py`, `--accuracy MM`, env `STL2CURVES_ACCURACY` so workers inherit
+it): scales the fitted-surface limits listed in `accuracy.LIMITS` (blend and freeform
+fit and bow limits, the hug slack, fillets' FILLET_TOL/GROW_TOL, the noisy whole-region
+limits) by mm / 0.02; at the default every limit is exactly as tuned. Modules define
+those constants as `value * ACCURACY`; `set_accuracy` rescales them in place, copies
+included (build imports blends' by name). Quick set 2026-10-10: 0.02 / 0.05 / 0.1 gave
+3,790 / 3,512 / 3,043 faces (GPS case back 1,502 / 1,123 / 857, corners p99 0.006 /
+0.011 / 0.016 mm). Part of the saved-stage key.
+
 Studio (`studio.py` + `studio.html`, `stl2curves-studio`): a local web page (stdlib
 `ThreadingHTTPServer` on 127.0.0.1, three.js from a CDN) over `convert.prepare` (first
 stages, saved in a stage cache of its own) and `convert.finish` (build). After a Convert

@@ -68,6 +68,7 @@
       <label class="row">Simplify (mm) <code>--simplify</code>
         <span><input id="simpauto" type="checkbox" checked> auto <input id="simp" type="number" step="0.001" value="0.005" disabled></span></label>
       <label class="row">Time limit (s) <code>--time-limit</code><input id="limit" type="number" step="30" value="300"></label>
+      <label class="row" title="How far smooth surfaces and fillets on rough meshes may stray from the mesh: more rebuilds more of the part as curves, less keeps it closer to the mesh">Accuracy (mm) <code>--accuracy</code><input id="accuracy" type="number" step="0.01" min="0.001" value="0.02"></label>
     </div>
     <div class="box">
       <div class="buttons">
@@ -190,7 +191,8 @@ async function api(path, body) {
 }
 function params() {
   return { tol: +$('tol').value, true_size: $('truesize').checked,
-           simplify: $('simpauto').checked ? 'auto' : +$('simp').value, time_limit: +$('limit').value };
+           simplify: $('simpauto').checked ? 'auto' : +$('simp').value, time_limit: +$('limit').value,
+           accuracy: +$('accuracy').value };
 }
 $('simpauto').onchange = () => { $('simp').disabled = $('simpauto').checked; };
 

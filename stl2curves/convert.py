@@ -77,7 +77,7 @@ from . import workers
 from .bodies import split_bodies
 from .blends import add_blends, split as split_blend, _blend as as_blend, fallback as blend_fallback, carve, pipe_fallback
 from .repair import repair
-from . import stages
+from . import accuracy, stages
 from .simplify import simplify
 from .read3mf import read_3mf
 
@@ -1103,7 +1103,7 @@ def prepare(path, tol, fuse=True, curves=True, true_size=False, blends=True, men
     part = None
     # (with STL2CURVES_CACHE set, the first stages are saved, and taken up again on the
     # next run of the same file if their code hasn't changed: see stages.py)
-    cache = stages.Cache(path, (tol, fuse, curves, true_size, blends, mend, simplify_to))
+    cache = stages.Cache(path, (tol, fuse, curves, true_size, blends, mend, simplify_to, accuracy.mm()))
     saved = cache.load("mesh")
     if saved is not None:
         pts, tris, part, groups, kept = saved
@@ -1441,7 +1441,12 @@ def main():
                          f"and keep what checks out (0: no limit; default {TIME_LIMIT})")
     ap.add_argument("--true-size", action="store_true",
                     help="rebuild at the apparent design size, with radii snapped to round values")
+    ap.add_argument("--accuracy", type=float, metavar="MM", default=accuracy.mm(),
+                    help=f"how far smooth surfaces, rough-mesh fillets and other fitted surfaces may stray "
+                         f"from the mesh (default {accuracy.DEFAULT}): more rebuilds more of the part as "
+                         f"curves, less keeps them closer to the mesh")
     args = ap.parse_args()
+    accuracy.set_accuracy(args.accuracy)
 
     files = []
     for p in map(Path, args.inputs):

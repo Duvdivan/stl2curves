@@ -29,7 +29,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 import numpy as np
 
-from . import convert, stages, workers
+from . import accuracy, convert, stages, workers
 from . import features as features_mod
 from .blends import merge
 
@@ -62,6 +62,10 @@ class Session:
     def prepared(self, req):
         """The conversion's first stages for these options (saved ones if any)."""
         opts = self.options(req)
+        wanted = float(req.get("accuracy") or accuracy.DEFAULT)
+        if wanted != accuracy.mm():
+            workers.finish()        # (worker processes take the accuracy from when they start)
+            accuracy.set_accuracy(wanted)
         limit = float(req.get("time_limit") or convert.TIME_LIMIT)
         features_mod._budget = limit
         features_mod._deadline = time.time() + limit

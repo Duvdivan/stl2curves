@@ -22,7 +22,9 @@ import scipy.sparse as sp
 from scipy.interpolate import BSpline
 from scipy.sparse.linalg import spsolve
 
-FIT_DEV = 0.002         # mm: the surface passes this close to every mesh corner of its area
+from .accuracy import SCALE as ACCURACY
+
+FIT_DEV = 0.002 * ACCURACY  # mm: the surface passes this close to every mesh corner of its area
 GRAPH_DEG = 75          # no facet turned further than this from the base's direction there
 CYLINDER_DEG = 30       # a cylinder base: every facet within this of square to the axis
 MAX_INTERVALS = 128     # knot intervals along each direction at most
@@ -32,7 +34,7 @@ SAMPLE_WEIGHT = 0.01    # weight of points on the facets between their corners (
 RIM_WEIGHT = 10.0       # weight of the corners on the area's outline
 MARGIN = 0.05           # share of the area's extent (plus MARGIN_MM) the surface reaches past it
 MARGIN_MM = 0.5
-BULGE_MM = 0.005        # between the corners the surface may bow off a facet by L*theta/4 + this
+BULGE_MM = 0.005 * ACCURACY  # between the corners the surface may bow off a facet by L*theta/4 + this
 
 
 class Freeform:

@@ -15,6 +15,7 @@ import numpy as np
 from . import extrude
 from . import freeform
 from . import pipes
+from .accuracy import SCALE as ACCURACY
 from .features import Feature, Revolved, Sphere
 
 SMOOTH_DEG = 50       # facets bending less than this meet smoothly
@@ -26,9 +27,9 @@ CORNER_SIZE = 1.5     # mm: a blend no bigger across than this is a corner...
 CORNER_SPREAD_DEG = 85  # ...and may turn this far
 MAX_SPLITS = 2        # a blend whose face won't fit is cut in two, at most this many times over
 SMALL_FACET = 0.02    # unrecognised facets smaller than this share of the biggest can be blends
-MAX_DEVIATION = 0.02  # a blend face must pass this close to every mesh corner (mm)
+MAX_DEVIATION = 0.02 * ACCURACY  # a blend face must pass this close to every mesh corner (mm)
 MAX_BULGE = 0.15      # ...and bow away from a facet by at most this share of its size
-MAX_EDGE_GAP = 0.01   # ...and follow its outline edges this closely (mm)
+MAX_EDGE_GAP = 0.01 * ACCURACY   # ...and follow its outline edges this closely (mm)
 CREASE_DEG = 20       # a freeform area (freeform.py) doesn't reach across a sharper bend than this
 FREEFORM_TURN_DEG = 3  # ...and turns at least this far from its mean direction somewhere
 FREEFORM_MIN_RADIUS = 2.0   # mm: a piece rounder than this (a small rounded edge) stays out of one

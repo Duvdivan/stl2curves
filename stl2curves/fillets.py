@@ -46,6 +46,7 @@ import math
 import numpy as np
 
 from . import features as F
+from .accuracy import SCALE as ACCURACY
 from .features import Revolved
 
 MIN_FACE_AREA = 2       # mm^2: flat facets at least this big can be the faces a fillet joins
@@ -53,8 +54,8 @@ MIN_ANGLE_DEG = 30      # the faces must meet at least this far from flat...
 MAX_ANGLE_DEG = 170     # ...and not be (nearly) parallel
 LINK_RINGS = 24         # a fillet's band is at most this many facets across
 FACE_TO_STRIP = 3       # each face a fillet joins is at least this many times its biggest band facet
-FILLET_TOL = 0.02       # mm: how far most band corners may lie off the fillet found from them ...
-GROW_TOL = 0.05         # mm: ... and its facets' corners at most (meshes lose accuracy at fillets)
+FILLET_TOL = 0.02 * ACCURACY  # mm: how far most band corners may lie off the fillet found from them ...
+GROW_TOL = 0.05 * ACCURACY  # mm: ... and its facets' corners at most (meshes lose accuracy at fillets)
 REL_TOL = 0.04          # ... but neither more than this share of its radius
 SPAN_SLACK_DEG = 8      # deg: a fillet may turn this much more than its faces do
 CONFIDENT_TOL = 0.005   # mm: fillets fitting this well (or cylinders and tori found strictly)
