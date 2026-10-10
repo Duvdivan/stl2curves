@@ -133,10 +133,24 @@ Local regression data on this machine (not in the repo):
      store threads as splines a hundredth or two off a true helical sweep (the gutter
      mount's flanks scatter +-0.015 mm with crests exact, while freeform fits them
      within 0.002), and at 0.01 half of each flank went to freeform patches (4,449 ->
-     1,956 faces). Tried and dropped (2026-10-10): flanks bent in the axial plane as one
-     swept-spline face (the fit gives such a flank two pieces a degree apart): 3,218
-     faces alone, 3,956 with the looser limit. Their own axis pass (countersinks, chamfers, bores) runs right after them.
+     1,956 faces); the thread's own facet set is gathered at the same limit. Profile
+     corners are fitted where mesh corners gather, and a mesh can run a helix line of
+     corners partway up a flank, wandering a few hundredths in radius: the fit bent
+     the flank there or stepped it. `_plain` tries a crest flat, a root flat and two
+     straight flanks, refitted, and takes it if it puts 98% as many corners on the
+     thread (gutter mount 1,032 -> 524 faces; its screw 13,696 facets in 17 pieces, was
+     9,506 in 84). Tried and dropped (2026-10-10): bent flanks as one swept-spline face
+     (3,218 faces), or merged into one straight piece (1,528: specks left between
+     pieces stayed triangles, and the hole's big merged pieces wouldn't sew), and
+     dropping profile corners whose gathering spans one turn (the mid-flank lines span
+     all of them). A piece whose spline outline crosses itself (a thin spike of facets)
+     is retried with straight segments in (U, s) (`_thread_face(straight=True)`).
+     Their own axis pass (countersinks, chamfers, bores) runs right after them.
    - Pass 0b: surfaces on the axes found so far (a lug round its screw hole).
+     Knurl and spline lands (`_lands`, after pass 2): strips of a few facets, each too
+     narrow to trust (MIN_SPAN_DEG), all on one radius round a known axis and together
+     covering MIN_SPAN_DEG, become cylinders, marked `vouched` so blends don't take them
+     for stand-ins (the gutter mount's knurled screw head: 30 lands of 3 facets).
    - Fillets between flat faces (`fillets.py`, rolling ball): before pass 1, which
      would cut a coarsely meshed fillet into strips of its own. Forgiving (most band
      corners within 0.02 mm, all within 0.05), so its guards matter: faces at least 3x
@@ -357,6 +371,10 @@ Key contracts:
   noise-tolerant sliver handling (broke the RAK enclosures).
 - Facet normals on real meshes are good only to about 1°. Anything needing precision
   (thread pitch, axis) should come from corners, which are exact to the file's rounding.
+- OCC's area and volume integration also goes astray on long helical spline faces (a
+  thread flank of 25.3 mm^2 by tessellation integrated to 20.5), differently in a solid
+  and its STEP copy: `file_trouble` re-measures a valid copy by tessellation before
+  blaming faces (the gutter mount's hole lost 550 facets of thread to that blame).
 - OCC's volume integration (GProp) goes astray on solids sewn across wide gaps (a
   curved patch's outline edge bowed onto its surface, the flat facet beside it keeping
   the chord, 0.05-0.09 mm apart on a rough mesh): several mm^3 off, the same wherever
