@@ -77,6 +77,7 @@ from . import workers
 from .bodies import split_bodies
 from .blends import add_blends, split as split_blend, _blend as as_blend, fallback as blend_fallback, carve, pipe_fallback
 from .repair import repair
+from . import stages
 from .simplify import simplify
 from .read3mf import read_3mf
 
@@ -96,6 +97,7 @@ BARE_AHEAD = 5000       # facets from which the bare-facet build is made ahead, 
 WORKERS_FROM = 5000     # triangles from which a part is worth starting worker processes for
 BARE_DRIFT = 1e-4       # share of a sound mesh's volume its bare facets may differ by and still be a reference
 TESS_DEFLECTION = 0.0005    # mm: how closely a solid's faces are tessellated to measure its volume
+UV_LIMIT = 1e5              # a face's parameters (mm, or radians) beyond this: broken, not tessellated
 VOLUME_EPS = 1e-5       # relative precision of the volume integration
 VOLUMES_KEPT = 4        # shapes whose volume is remembered (see volume)
 TESS_SPECK = 0.05       # mm^2: a face this small that won't tessellate is left out of that measure
@@ -156,6 +158,20 @@ def tessellated_volume(shape):
     or the other. The tessellation follows the shared edges, so it closes up.
     tessellated_volume.untessellated: a point on each face (bar specks) that wouldn't."""
     tessellated_volume.untessellated = []
+    # (a face sewn shut across a wide gap can come out with a parameter range of millions,
+    # a torus wound round a million times: OCC's mesher then never returns. Such a face
+    # is untessellated, for the blame, and nothing is meshed)
+    ex = TopExp_Explorer(shape, TopAbs_FACE)
+    while ex.More():
+        face = TopoDS.Face(ex.Current())
+        ex.Next()
+        if max(abs(x) for x in BRepTools.UVBounds_s(face)) > UV_LIMIT:
+            props = GProp_GProps()
+            BRepGProp.SurfaceProperties_s(face, props)
+            c = props.CentreOfMass()
+            tessellated_volume.untessellated.append((c.X(), c.Y(), c.Z()))
+    if tessellated_volume.untessellated:
+        return None
     BRepTools.Clean_s(shape)
     BRepMesh_IncrementalMesh(shape, TESS_DEFLECTION, False, 0.1, True)
     ex = TopExp_Explorer(shape, TopAbs_FACE)
@@ -1073,48 +1089,73 @@ def _stl_to_solid(path, tol, fuse=True, curves=True, true_size=False, blends=Tru
     # a 3MF object's parts can overlap, and are each mended and built on their own, then
     # joined by a boolean union)
     part = None
-    if isinstance(path, (str, os.PathLike)):
-        pts, tris = load_stl(path)
+    # (with STL2CURVES_CACHE set, the first stages are saved, and taken up again on the
+    # next run of the same file if their code hasn't changed: see stages.py)
+    cache = stages.Cache(path, (tol, fuse, curves, true_size, blends, mend, simplify_to))
+    saved = cache.load("mesh")
+    if saved is not None:
+        pts, tris, part, groups, kept = saved
+        if kept["triangles"] >= WORKERS_FROM:
+            workers.start(kept["triangles"])
+        info = {"restored": [], "skipped": [], "size": None, "snapped": 0, "cached": ["mesh"], **kept}
     else:
-        pts, tris = path[0], path[1]
-        if len(path) > 2 and len(np.unique(path[2])) > 1:
-            part = np.asarray(path[2])
-    if len(tris) >= WORKERS_FROM:
-        workers.start(len(tris))    # (worker processes, started while the mesh is repaired)
-    info = {"triangles": len(tris), "restored": [], "skipped": [], "size": None, "snapped": 0,
-            "repairs": [], "simplified": None}
-    if mend:
-        if part is None:
-            pts, tris, info["repairs"] = repair(pts, tris)
+        if isinstance(path, (str, os.PathLike)):
+            pts, tris = load_stl(path)
         else:
-            pts, tris, part, info["repairs"] = _repair_parts(pts, tris, part)
-    if simplify_to is None:
-        simplify_to = SIMPLIFY_ERROR if len(tris) > AUTO_SIMPLIFY else 0
-    if simplify_to:
-        before = len(tris)
-        if part is None:
-            tris = simplify(pts, tris, simplify_to)
-        else:
-            labels = np.unique(part)
-            pieces = [simplify(pts, tris[part == p], simplify_to) for p in labels]
-            part = np.concatenate([np.full(len(t), p) for p, t in zip(labels, pieces)])
-            tris = np.vstack(pieces)
-        info["simplified"] = (before, len(tris), simplify_to)
-    # bodies touching at an edge are built apart (and so are a 3MF object's parts)
-    groups = (split_bodies(pts, tris) if part is None
-              else [g for p in np.unique(part) for g in split_bodies(pts, tris[part == p])])
+            pts, tris = path[0], path[1]
+            if len(path) > 2 and len(np.unique(path[2])) > 1:
+                part = np.asarray(path[2])
+        if len(tris) >= WORKERS_FROM:
+            workers.start(len(tris))    # (worker processes, started while the mesh is repaired)
+        info = {"triangles": len(tris), "restored": [], "skipped": [], "size": None, "snapped": 0,
+                "repairs": [], "simplified": None}
+        if mend:
+            if part is None:
+                pts, tris, info["repairs"] = repair(pts, tris)
+            else:
+                pts, tris, part, info["repairs"] = _repair_parts(pts, tris, part)
+        if simplify_to is None:
+            simplify_to = SIMPLIFY_ERROR if len(tris) > AUTO_SIMPLIFY else 0
+        if simplify_to:
+            before = len(tris)
+            if part is None:
+                tris = simplify(pts, tris, simplify_to)
+            else:
+                labels = np.unique(part)
+                pieces = [simplify(pts, tris[part == p], simplify_to) for p in labels]
+                part = np.concatenate([np.full(len(t), p) for p, t in zip(labels, pieces)])
+                tris = np.vstack(pieces)
+            info["simplified"] = (before, len(tris), simplify_to)
+        # bodies touching at an edge are built apart (and so are a 3MF object's parts)
+        groups = (split_bodies(pts, tris) if part is None
+                  else [g for p in np.unique(part) for g in split_bodies(pts, tris[part == p])])
+        cache.save("mesh", (pts, tris, part, groups,
+                            {k: info[k] for k in ("triangles", "repairs", "simplified")}))
     if curves:
-        parts = [analyze(pts, g) for g in groups]
-        info["size"] = guess = guess_size([p[:2] for p in parts])
-        round_unit = None
-        if true_size and guess is not None:
-            round_unit = guess.unit
-            if guess.factor != 1.0:
-                parts = [analyze(pts * guess.factor, g) for g in groups]
-        for mesh, features, _ in parts:
-            info["snapped"] += snap(mesh, features, round_unit)
-        if blends:
+        saved = cache.load("blends" if blends else "analysis")
+        if saved is None and blends:
+            saved = cache.load("analysis")
+            done = "analysis"
+        else:
+            done = "blends" if blends else "analysis"
+        if saved is not None:
+            parts, info["size"], info["snapped"] = saved
+            info.setdefault("cached", []).append(done)
+        else:
+            parts = [analyze(pts, g) for g in groups]
+            info["size"] = guess = guess_size([p[:2] for p in parts])
+            round_unit = None
+            if true_size and guess is not None:
+                round_unit = guess.unit
+                if guess.factor != 1.0:
+                    parts = [analyze(pts * guess.factor, g) for g in groups]
+            for mesh, features, _ in parts:
+                info["snapped"] += snap(mesh, features, round_unit)
+            cache.save("analysis", (parts, info["size"], info["snapped"]), [p[0] for p in parts])
+            done = "analysis"
+        if blends and done == "analysis":
             parts = [(mesh, add_blends(mesh, features), t) for mesh, features, t in parts]
+            cache.save("blends", (parts, info["size"], info["snapped"]), [p[0] for p in parts])
     else:
         parts = [(Mesh(pts, g), [], TOL) for g in groups]
     shapes, nb, nv = [], 0, 0
@@ -1421,6 +1462,8 @@ def main():
               f"{time.time() - t:.1f}s -> {out}")
         if info["repairs"]:
             print("  mended the mesh: " + "; ".join(info["repairs"]))
+        if info.get("cached"):
+            print("  saved stages taken up: " + ", ".join(info["cached"]))
         if info["simplified"]:
             before, after, err = info["simplified"]
             print(f"  thinned out: {before:,} -> {after:,} triangles (surface moved {err} mm at most)")

@@ -53,6 +53,26 @@ real-world parts and compare face count, validity and time against the last run.
 edit code while a batch of conversions is running: processes started later import the
 edited code.
 
+Fast loop first (the owner asked for minutes per decision, not hours):
+`python C:\Users\delta\Tools\compare\quick.py TAG --base OTHERTAG` converts seven telling
+parts (Rak N-USB, the GPS case back, tray, toolbox latch, tensioner, flat mount, ring),
+one at a time, from a snapshot of the code (`compare/snap_TAG`), with the first stages of
+each conversion saved and reused (`STL2CURVES_CACHE`, `stl2curves/stages.py`: the mended
+mesh, the features, the features with blends added, each keyed to the file, the options
+and the source of the code behind it, so a stale stage is never used). A change to
+build.py or convert.py's attempt loop reuses all three stages; one to blends.py the first
+two; one to detection only the mesh. A cached run is byte-identical to a fresh one
+(checked 2026-10-09). Times compare fairly only between runs that reused the same stages
+(the `reused` column). Then the full regression below, before committing.
+
+Single parts' face counts move by chance: the same mesh with its triangles listed in
+another order came out 114 to 143 faces (toolbox latch). The file's order is kept on
+purpose: CAD exports list triangles face by face, and seeds tried in that order grow
+within one surface. Sorting the mesh by position (tried 2026-10-09) lost 20% on the GPS
+body, failed the toolbox outright and took the instrument body to 51,000 faces. A change
+anywhere shifts which seeds win nearby: judge by the totals and by what happened where
+something moved, not by one part's count.
+
 Local regression data on this machine (not in the repo):
 
 - `C:\Users\delta\Downloads\X2D+Accessory+Toolbox_stls` (4 STLs): baseline 114 / 188 /
@@ -321,7 +341,8 @@ Key contracts:
   sequences, `Bnd_Box.Get()` is broken, `Quantity_Color` returns linear RGB,
   `BRepCheck_Result.Status()` can't be read (use `BRepCheck_Analyzer.IsValid(sub)`).
 - Pickling a `Mesh` reorders its neighbour *sets*, and pass 1 tries `nbrs[i][:3]`: send
-  regions' neighbour lists along to workers, or results silently change.
+  regions' neighbour lists along to workers, or results silently change. (Sorting them
+  instead, 2026-10-09, was just another draw: the tray went 268 -> 354 faces.)
 - Windows process pools spawn a worker only when a job finds none idle, one by one in
   the submitting thread: `workers._start` calls `_launch_processes()` up front. Scripts
   that convert must have an `if __name__ == "__main__"` guard (workers re-import them).
