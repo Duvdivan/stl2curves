@@ -486,8 +486,13 @@ def attempt(mesh, features, mesh_tol, tol, fuse, faceted_volume):
         return None, []
     _mesh_defective(mesh, tol, fuse)
     if mesh.bare_bodies and nb > mesh.bare_bodies:
+        # A body the bare facets don't make: a face ran off somewhere, or a cavity passed
+        # for a body because edges beside it had their tolerance widened by millimetres
+        # (20 mm on a part with six slots inside: every slot's corners classified as on
+        # its surface, not inside it). Blamed as for the volume; blaming nothing left the
+        # halving search to throw away every curve of the part (53k triangles -> 42,925 faces).
         attempt.why = "bodies"
-        return None, []     # a body the bare facets don't make: a face ran off somewhere
+        return None, _invalid_blame(mesh, features, shape, sewing)
     change = sum(f.change for f in features)
     expected = faceted_volume + change
     allowed = sum(f.tolerance for f in features) + 1e-6 * abs(faceted_volume) + 1e-3

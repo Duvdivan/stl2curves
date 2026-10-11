@@ -96,7 +96,7 @@ Local regression data on this machine (not in the repo):
 `stl2curves/`):
 
 1. **`repair.py`** mends the mesh (duplicates, zero-thickness pairs, slivers, cracks,
-   orientation, holes, small self-crossings). **`simplify.py`** thins meshes over
+   stray flaps on a still-open mesh, orientation, holes, small self-crossings). **`simplify.py`** thins meshes over
    150k triangles with a strict error bound (vertices never move off the surface).
 2. **`bodies.py`** splits bodies that only touch along an edge; each is built on its own
    and fused at the end. A 3MF object's parts (`read3mf` labels each triangle) are

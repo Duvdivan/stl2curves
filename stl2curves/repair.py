@@ -5,6 +5,8 @@ Each step changes the mesh only where something is wrong, and says what it did:
 - triangles with a repeated corner, identical copies of a triangle, and pairs of the
   same triangle facing opposite ways (a wall of zero thickness) are dropped;
 - sliver triangles (three corners in a line) are split away;
+- stray flaps: at an edge used three times, of two triangles in one plane running
+  along it the same way, the smaller goes;
 - cracks: corners along open edges that nearly meet are joined;
 - orientation: triangles are turned to agree with their neighbours across every edge,
   and each closed piece faces outward (or, if it lies inside another piece, as a
@@ -24,6 +26,7 @@ from .features import grid_noise
 CRACK = 1e-3            # mm (and a small share of the part's size): open edges this close are joined
 SPECK = 0.1             # a self-crossing cluster smaller than this share of the part is cut out
 MARGIN_RINGS = 2        # ... together with this many rings of triangles around it
+FLAP_COS = 0.9999       # triangles at an overused edge this near one plane (either way up) are in one plane
 
 
 def repair(pts, tris):
@@ -57,6 +60,12 @@ def repair(pts, tris):
         pts, tris, joined = _close_cracks(pts, tris, max(CRACK, 1e-5 * size))
         if joined:
             notes.append(f"{joined} corners along cracks joined")
+    if len(_open_edges(tris)):
+        # (only on a mesh still open: closed ones have such flaps too, crossing
+        # themselves say, and convert as they are)
+        tris, flaps = _folded_flaps(pts, tris)
+        if flaps:
+            notes.append(f"{flaps} stray flap triangle{'s' if flaps > 1 else ''} removed")
 
     tris, flipped = _orient(pts, tris)
     if flipped:
@@ -115,6 +124,45 @@ def _duplicates(tris):
             keep[rest[0]] = True
             same += len(rest) - 1
     return tris[keep], same, opposite
+
+
+def _folded_flaps(pts, tris):
+    """Drop stray flaps: at an edge used three times or more, of two triangles in one
+    plane that both run along it the same way (which no two neighbours across an edge
+    do), the smaller. A Fusion export (189k triangles) had one at its only overused
+    edge, lying flat beside a big triangle and facing the other way; it hid one end of a
+    hole, whose open edges then never closed into a loop to fill, and the part made no
+    solid at all."""
+    if not len(tris):
+        return tris, 0
+    pairs = np.concatenate([tris[:, [0, 1]], tris[:, [1, 2]], tris[:, [2, 0]]])
+    e = np.sort(pairs, axis=1)
+    forward = pairs[:, 0] < pairs[:, 1]
+    owner = np.tile(np.arange(len(tris)), 3)
+    _, inv, count = np.unique(e, axis=0, return_inverse=True, return_counts=True)
+    inv = inv.ravel()
+    over = np.nonzero(count[inv] >= 3)[0]
+    if not len(over):
+        return tris, 0
+    a, b, c = (pts[tris[:, i]] for i in range(3))
+    n = np.cross(b - a, c - a)
+    area = np.linalg.norm(n, axis=1)
+    unit = n / np.maximum(area, 1e-300)[:, None]
+    groups = {}
+    for k in over:
+        groups.setdefault(int(inv[k]), []).append((int(owner[k]), bool(forward[k])))
+    drop = set()
+    for members in groups.values():
+        for i in range(len(members)):
+            for j in range(i + 1, len(members)):
+                (s, fs), (t, ft) = members[i], members[j]
+                if fs == ft and s not in drop and t not in drop and abs(unit[s] @ unit[t]) > FLAP_COS:
+                    drop.add(s if area[s] < area[t] else t)
+    if not drop:
+        return tris, 0
+    keep = np.ones(len(tris), bool)
+    keep[list(drop)] = False
+    return tris[keep], len(drop)
 
 
 def remove_slivers(pts, tris, noise=0.0, zone=None):
