@@ -7,11 +7,15 @@ inherit) scales every limit on the surfaces fitted where no exact design surface
 smooth blends and freeform surfaces (how close to the corners, how far they may bow
 between them), fillets on rough meshes, and the coarse-export cylinders and cones. Exact
 surfaces on clean meshes are as true as the mesh whatever it is. The limits are written
-as tuned at TUNED (0.02 mm); the default, 0.05 mm (2026-10-11), scales them by 2.5: a mesh
+as tuned at TUNED (0.02 mm); the default, 0.1 mm (2026-10-11), scales them by 5: a mesh
 never holds an exact radius and a CAD program's own spline export strays a few
-hundredths, so held to 0.02 real shapes were left as triangles and patches (quick set
-3,846 -> 3,352 faces, the measured deviation from the mesh no worse: 99% of points
-within 0.02 mm).
+hundredths, so held to 0.02 real shapes were left as triangles and patches. Quick set
+plus the gutter mount: 3,846 faces at 0.02, 3,352 at 0.05, 2,916 at 0.1, 3,978 at 0.15
+(freeform surfaces fitted that loosely break the fillets beside them: CEILING), 2,993 at
+0.2 with freeform held at 0.1, so 0.1 is where loosening stops paying. The measured
+deviation stays small (99% of mesh corners within 0.02 mm of the solid on the gutter
+mount, the GPS case back, the latch; Rak N-USB 0.008). Full regression (28 parts): 13,791
+faces at 0.05, 11,664 at 0.1, 3,007 s and 2,947 s.
 
 STL2CURVES_ACCURACY_OF ("fillets=0.05,features=0.1") holds one module's limits at an
 accuracy of its own, to judge which limits gain from loosening and which only let wrong
@@ -21,7 +25,7 @@ import os
 import sys
 
 TUNED = 0.02        # mm: the accuracy every limit was tuned at (as written in the modules)
-DEFAULT = 0.05      # mm: the accuracy used unless one is asked for
+DEFAULT = 0.1       # mm: the accuracy used unless one is asked for
 # the limits it scales, as (module, name); some are copies of others' (imported by name)
 LIMITS = [("blends", "MAX_DEVIATION"), ("blends", "MAX_EDGE_GAP"),
           ("build", "MAX_DEVIATION"), ("build", "MAX_EDGE_GAP"), ("build", "HUG_SLACK"),

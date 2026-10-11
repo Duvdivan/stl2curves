@@ -256,12 +256,20 @@ Accuracy (`accuracy.py`, `--accuracy MM`, env `STL2CURVES_ACCURACY` so workers i
 it): scales the fitted-surface limits listed in `accuracy.LIMITS` (blend and freeform
 fit and bow limits, the hug slack, fillets' FILLET_TOL/GROW_TOL, the noisy whole-region
 limits, thread pieces' PIECE_TOL, the corner refit) by mm / `TUNED` (0.02: the limits are
-written as tuned there). The default is 0.05 since 2026-10-11, at the owner's request (a
-mesh never holds an exact radius; CAD spline exports stray a few hundredths): quick set
-plus the gutter mount 3,846 -> 3,352 faces, all valid, deviation.py no worse (99% of
-mesh corners within 0.02 mm of the solid on the gutter mount, GPS case back, Rak N-USB).
-Judge changes at the default; quick.py's `--accuracy` reruns at another. Part of the
-saved-stage key.
+written as tuned there). The default is 0.1 since 2026-10-11, at the owner's request (a
+mesh never holds an exact radius; CAD spline exports stray a few hundredths), found by
+stepping it up until it stopped paying: quick set plus the gutter mount 3,846 faces at
+0.02, 3,352 at 0.05, 2,916 at 0.1, 3,978 at 0.15, 3,946 at 0.2, all valid; full
+regression 13,791 faces at 0.05, 11,664 at 0.1, same time (the ratchet, whose STL
+crosses itself, flips between valid and not with every change). deviation.py no worse:
+99% of mesh corners within 0.02 mm of the solid (gutter mount, GPS case back, latch, Rak
+N-USB). The cliff past 0.1 was freeform alone (bisected with `STL2CURVES_ACCURACY_OF`,
+which holds named modules at an accuracy of their own): fitted looser than 0.01 mm a
+freeform surface rounds over the tangent edges beside exact fillets, and those fillets
+then build invalid (the tray's r 2 corners). So freeform follows at most 0.1
+(`accuracy.CEILING`); at 0.2 with it held the set gave 2,993 faces, no gain. Judge
+changes at the default; quick.py's `--accuracy` reruns at another. Part of the
+saved-stage key (with `STL2CURVES_ACCURACY_OF`).
 
 Studio (`studio.py` + `studio.html`, `stl2curves-studio`): a local web page (stdlib
 `ThreadingHTTPServer` on 127.0.0.1, three.js from a CDN) over `convert.prepare` (first
