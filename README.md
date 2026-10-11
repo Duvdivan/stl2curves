@@ -77,10 +77,11 @@ and flat facets only), `--no-repair` take the mesh as it is, `--simplify MM` thi
 the mesh first (moving its surface by at most MM; meshes over 150,000 triangles are
 thinned by 0.005 mm automatically), `--time-limit SECONDS` (default 600, 0 for none),
 `--accuracy MM` how far smooth surfaces, fillets on rough meshes and other fitted surfaces
-may stray from the mesh (default 0.02): a looser setting rebuilds more of the part as
-curves instead of leaving it as triangles. On the GPS case back used in testing, 0.1
-gave 857 faces instead of 1,502, with the mesh still within 0.016 mm of the solid at
-99% of its corners (0.044 mm at most).
+may stray from the mesh (default 0.05): a looser setting rebuilds more of the part as
+curves instead of leaving it as triangles, a tighter one keeps it closer to the mesh. At
+the default the measured deviation stays small: on the parts used in testing, 99% of the
+mesh's corners lie within 0.02 mm of the solid. 0.02 was the default until 2026-10-11 and
+gave 13% more faces over the same parts.
 
 From a 3MF file (Bambu Studio, OrcaSlicer, PrusaSlicer...) every object on the build
 plates is converted to its own STEP, named after the file and the object, placed as on

@@ -255,11 +255,13 @@ as BRep files, the mesh once per pass via `workers.share`/`load`. What runs ther
 Accuracy (`accuracy.py`, `--accuracy MM`, env `STL2CURVES_ACCURACY` so workers inherit
 it): scales the fitted-surface limits listed in `accuracy.LIMITS` (blend and freeform
 fit and bow limits, the hug slack, fillets' FILLET_TOL/GROW_TOL, the noisy whole-region
-limits) by mm / 0.02; at the default every limit is exactly as tuned. Modules define
-those constants as `value * ACCURACY`; `set_accuracy` rescales them in place, copies
-included (build imports blends' by name). Quick set 2026-10-10: 0.02 / 0.05 / 0.1 gave
-3,790 / 3,512 / 3,043 faces (GPS case back 1,502 / 1,123 / 857, corners p99 0.006 /
-0.011 / 0.016 mm). Part of the saved-stage key.
+limits, thread pieces' PIECE_TOL, the corner refit) by mm / `TUNED` (0.02: the limits are
+written as tuned there). The default is 0.05 since 2026-10-11, at the owner's request (a
+mesh never holds an exact radius; CAD spline exports stray a few hundredths): quick set
+plus the gutter mount 3,846 -> 3,352 faces, all valid, deviation.py no worse (99% of
+mesh corners within 0.02 mm of the solid on the gutter mount, GPS case back, Rak N-USB).
+Judge changes at the default; quick.py's `--accuracy` reruns at another. Part of the
+saved-stage key.
 
 Studio (`studio.py` + `studio.html`, `stl2curves-studio`): a local web page (stdlib
 `ThreadingHTTPServer` on 127.0.0.1, three.js from a CDN) over `convert.prepare` (first
