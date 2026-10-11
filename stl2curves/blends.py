@@ -24,6 +24,10 @@ TANGENT_DEG = 35      # a neighbour this close in direction is rolled into tange
 MIN_BEND_DEG = 2      # an unrecognised facet must turn at least this far against a neighbour
 MAX_FACETS = 60       # a bigger smooth area is covered by several blends (each a manageable fit)
 GROW_EXACT_FACETS = 40   # a cylinder fitted to a blend's corners takes in neighbouring patches up to this size
+BETWEEN_WALL_FACETS = 10 # a cylinder or cone of this many facets is a wall a fillet can roll along ...
+BETWEEN_PIECE_FACETS = 400   # ... between it and another, over pieces of up to this many facets touching both ...
+BETWEEN_TOL = 0.01       # mm: ... a facet with every corner this near the rolling ball is the fillet's ...
+BETWEEN_MIN_FACETS = 6   # ... at least this many of them (and half of the pieces' facets)
 CORNER_SIZE = 1.5     # mm: a blend no bigger across than this is a corner...
 CORNER_SPREAD_DEG = 85  # ...and may turn this far
 MAX_SPLITS = 2        # a blend whose face won't fit is cut in two, at most this many times over
@@ -172,7 +176,8 @@ def add_blends(mesh, features):
     # triangles that no guess from their normals found: see features.corner_surface)
     out = [(_exact(mesh, f) or f) if f.kind == "blend" else f for f in out]
     out = _grow_exact(mesh, out)
-    return [f for k, f in enumerate(features) if k not in dropped] + out
+    kept = [f for k, f in enumerate(features) if k not in dropped] + out
+    return _between_walls(mesh, kept)
 
 
 def _exact(mesh, blend):
@@ -216,6 +221,90 @@ def _grow_exact(mesh, out):
                     alive[j] = False
                     grown = True
     return [f for f, keep in zip(out, alive) if keep]
+
+
+def _onto_spine(P, walls, targets, steps=20):
+    """The points P moved onto the curve where each wall's signed distance is its
+    target (least moves: Gauss-Newton on the two distances)."""
+    C = np.array(P, float)
+    for _ in range(steps):
+        f = np.stack([w.signed(C) - t for w, t in zip(walls, targets)], axis=1)
+        J = np.stack([w.normal(C) for w in walls], axis=1)
+        step = np.einsum("nij,nj->ni", np.linalg.pinv(np.einsum("nij,nkj->nik", J, J)), f)
+        C = C - np.einsum("nij,ni->nj", J, step)
+    return C
+
+
+def _between_walls(mesh, features):
+    """Fillets rolled between two walls found already (cylinders and cones), built as
+    pipes round the curve a ball of the fillet's radius rolls along touching both: each
+    of its centres lies the radius off both walls. Detection leaves such a fillet as
+    pieces (tori, spheres, freeform strips): a ball's path between a cylinder and a
+    slanting one is neither a line nor a circle (the gutter mount's slope, r 21, meets
+    an r 6 cylinder each side with a 2 mm fillet). The radius is the one the corners
+    fit best; facets of the pieces off that ball stay as they were (blends)."""
+    walls = [k for k, f in enumerate(features)
+             if isinstance(f.model, Revolved) and f.model.line and len(f.facets) >= BETWEEN_WALL_FACETS]
+    if len(walls) < 2:
+        return features
+    verts = [set(np.concatenate([mesh.fverts[a] for a in f.facets]).tolist()) for f in features]
+    wall_set = set(walls)
+    used = set()
+    out = []
+    for i, A in enumerate(walls):
+        for B in walls[i + 1:]:
+            pieces = [k for k in range(len(features))
+                      if k not in wall_set and k not in used and verts[k] & verts[A] and verts[k] & verts[B]
+                      and features[k].kind not in ("ball", "wedge") and features[k].model.kind != "thread"
+                      and len(features[k].facets) <= BETWEEN_PIECE_FACETS]
+            if not pieces:
+                continue
+            got = _rolled(mesh, features, (A, B), pieces)
+            if got is None:
+                continue
+            pipe, rest = got
+            used.update(pieces)
+            out.append(pipe)
+            out += rest
+    return [f for k, f in enumerate(features) if k not in used] + out
+
+
+def _rolled(mesh, features, pair, pieces):
+    """(pipe, blends for the pieces' facets off it) for a fillet between two walls, or None."""
+    walls = [features[k].model for k in pair]
+    fac = np.concatenate([features[k].facets for k in pieces])
+    V = np.unique(np.concatenate([mesh.fverts[a] for a in fac]))
+    P = mesh.pts[V]
+    # (each wall's air side: where its facets face)
+    air = [float(np.sign(np.einsum("ij,ij->i", mesh.fn[features[k].facets],
+                                   features[k].model.normal(mesh.fcent[features[k].facets])).mean())) for k in pair]
+
+    def misfit(r, side):
+        Q = _onto_spine(P, walls, [side * air[0] * r, side * air[1] * r])
+        return np.abs(np.linalg.norm(P - Q, axis=1) - r)
+    best = None
+    for side in (1, -1):        # (the centre in the air: a fillet in a corner; in the material: a rounded edge)
+        for r in np.geomspace(0.2, pipes.MAX_RADIUS, 60):
+            score = float(np.median(misfit(r, side)))
+            if best is None or score < best[0]:
+                best = (score, r, side)
+    _, r, side = best
+    for rr in np.linspace(0.9 * r, 1.1 * r, 41):
+        score = float(np.median(misfit(rr, side)))
+        if score < best[0]:
+            best = (score, rr, side)
+    _, r, side = best
+    off = dict(zip(V.tolist(), misfit(r, side)))
+    on = np.array([max(off[v] for v in mesh.fverts[a]) <= BETWEEN_TOL for a in fac])
+    if on.sum() < max(BETWEEN_MIN_FACETS, 0.5 * len(fac)):
+        return None
+    targets = [side * air[0] * r, side * air[1] * r]
+    model, dev = pipes.fit(mesh, fac[on], r, lambda ids: _onto_spine(mesh.pts[ids], walls, targets))
+    if model is None:
+        return None
+    pipe = pipes.feature(mesh, model, fac[on], tuple(features[k] for k in pieces), dev)
+    rest = [_blend(mesh, list(g), ()) for g, _ in _regions(mesh, set(fac[~on].tolist()), lambda a: [a], lambda a: -1)]
+    return pipe, rest
 
 
 def merge(mesh, features, facets):
