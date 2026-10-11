@@ -234,16 +234,19 @@ def mesh_volume(mesh):
     return float(np.einsum("ij,ij->i", a, np.cross(b, c)).sum() / 6)
 
 
-def solids_from_shells(sewn, inward=True):
+def solids_from_shells(sewn, inward=True, specks=False):
     """Turn sewn shells into solids. A shell inside another is a cavity, the rest are bodies
-    (inward False: the mesh has no inward-facing shell, so every shell is a body).
+    (inward False: the mesh has no inward-facing shell, so every shell is a body;
+    specks True: each shell less its specks, see _without_specks).
 
     Returns (shape, number of bodies, number of cavities, total volume of material).
     """
     shells = []
     ex = TopExp_Explorer(sewn, TopAbs_SHELL)
     while ex.More():
-        shell = _without_specks(TopoDS.Shell(ex.Current()))
+        shell = TopoDS.Shell(ex.Current())
+        if specks:
+            shell = _without_specks(shell)
         solid = fixed(BRepBuilderAPI_MakeSolid(shell).Solid())   # oriented outwards
         if solid.ShapeType() != TopAbs_SOLID:
             ex2 = TopExp_Explorer(solid, TopAbs_SOLID)
@@ -339,43 +342,33 @@ def solids_from_shells(sewn, inward=True):
 
 
 def _without_specks(shell):
-    """The shell less any group of faces joined to the rest by no edge and of next to no
-    area: flat facets of zero area that sewing left in the part's shell made it 'not
+    """The shell less any faces of next to no area joined by no edge to a face with area:
+    flat facets of zero area that sewing left in the part's shell made it 'not
     connected', so the solid failed the check with every face valid and nothing to blame
     (a part with six slots inside: four such faces cost the halving search half its
     curves)."""
+    tiny, ex = [], TopExp_Explorer(shell, TopAbs_FACE)
+    while ex.More():
+        props = GProp_GProps()
+        BRepGProp.SurfaceProperties_s(ex.Current(), props)
+        if abs(props.Mass()) <= SPECK_AREA:
+            tiny.append(ex.Current())
+        ex.Next()
+    if not tiny:
+        return shell
     emap = IndexedDataMap_TopoDS_Shape_List_TopoDS_Shape_TopTools_ShapeMapHasher()
     TopExp.MapShapesAndAncestors_s(shell, TopAbs_EDGE, TopAbs_FACE, emap)
-    faces = IndexedMap_TopoDS_Shape_TopTools_ShapeMapHasher()
-    TopExp.MapShapes_s(shell, TopAbs_FACE, faces)
-    n = faces.Extent()
-    parent = np.arange(n + 1)
 
-    def root(x):
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
-    for i in range(1, emap.Extent() + 1):
-        idx = [faces.FindIndex(f) for f in emap.FindFromIndex(i)]
-        for a in idx[1:]:
-            parent[root(a)] = root(idx[0])
-    groups = {}
-    for f in range(1, n + 1):
-        groups.setdefault(root(f), []).append(f)
-    if len(groups) < 2:
-        return shell
-    drop = set()
-    for members in groups.values():
-        area = 0.0
-        for f in members:
-            props = GProp_GProps()
-            BRepGProp.SurfaceProperties_s(faces.FindKey(f), props)
-            area += abs(props.Mass())
-            if area > SPECK_AREA:
-                break
-        if area <= SPECK_AREA and len(members) < n:
-            drop.update(members)
+    def joined(face):       # (to a face with area, through any of its edges)
+        ee = TopExp_Explorer(face, TopAbs_EDGE)
+        while ee.More():
+            if emap.Contains(ee.Current()):
+                for other in emap.FindFromKey(ee.Current()):
+                    if not any(other.IsSame(t) for t in tiny):
+                        return True
+            ee.Next()
+        return False
+    drop = [t for t in tiny if not joined(t)]
     if not drop:
         return shell
     out = TopoDS_Shell()
@@ -383,7 +376,7 @@ def _without_specks(shell):
     builder.MakeShell(out)
     ex = TopExp_Explorer(shell, TopAbs_FACE)
     while ex.More():
-        if faces.FindIndex(ex.Current()) not in drop:
+        if not any(ex.Current().IsSame(t) for t in drop):
             builder.Add(out, ex.Current())
         ex.Next()
     out.Closed(shell.Closed())
@@ -578,7 +571,12 @@ def attempt(mesh, features, mesh_tol, tol, fuse, faceted_volume):
     check = BRepCheck_Analyzer(shape, True, True)
     if not check.IsValid():
         mended = None
-        if not mesh.__dict__.get("defective"):      # (no repair mends a mesh that crosses itself)
+        # (zero-area specks that sewing left in a shell, joined to nothing: looked for only
+        # now, finding them takes a second or so on a few thousand faces)
+        respun = solids_from_shells(sewn, inward_shells(mesh), specks=True)[0]
+        if BRepCheck_Analyzer(respun, True, True).IsValid():
+            mended = respun
+        if mended is None and not mesh.__dict__.get("defective"):      # (no repair mends a mesh that crosses itself)
             # (a straight edge running on tangent into an arc can pass for a crossing at
             # the default precision; a coarser one, still far below the sewing, mends it)
             for precision in (None,) + FIX_PRECISIONS:
