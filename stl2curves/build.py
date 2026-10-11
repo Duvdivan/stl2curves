@@ -358,6 +358,7 @@ OUTLINE_FIRST = 300     # facets: a freeform patch this big gets its face from i
 SHARED_TOLERANCE = 0.005    # mm: a flat face mended within this keeps its shared edges and corners
 SHARED_CROWD = 0.02     # mm: a mesh point this near another keeps corners of its own, for sewing to merge
 REJOIN_SNAP = 1e-7      # mm: corners this near one mesh point are that point (copies read back from files)
+MAX_FACE_TOL = 1.0      # mm: a patch's face whose corners or edges needed wider tolerances than this doesn't fit
 # Experiments, off unless named in the environment variable STL2CURVES_TRY (comma-separated),
 # so each can be tried on its own in full regressions: exact (and swap, see convert)
 TRYING = {x.strip() for x in os.environ.get("STL2CURVES_TRY", "").split(",") if x.strip()}
@@ -1787,6 +1788,18 @@ def _shapes(items):
     return out
 
 
+def _worst_tolerance(shape):
+    """The widest tolerance of any corner or edge of the shape (mm)."""
+    worst = 0.0
+    for kind, tolerance in ((TopAbs_VERTEX, lambda x: BRep_Tool.Tolerance_s(TopoDS.Vertex(x))),
+                            (TopAbs_EDGE, lambda x: BRep_Tool.Tolerance_s(TopoDS.Edge(x)))):
+        ex = TopExp_Explorer(shape, kind)
+        while ex.More():
+            worst = max(worst, tolerance(ex.Current()))
+            ex.Next()
+    return worst
+
+
 def _wedge_face(feature, bound, mesh):
     """A sphere face trimmed by the planes through its centre that bound the corner."""
     m = feature.model
@@ -1989,6 +2002,11 @@ def build_faces(mesh, features, tol):
                 # (OpenCascade gave up on one patch, a sweep of a degenerate profile say:
                 # that patch fails like any other, not the whole conversion)
                 faces = [None]
+        if any(x is not None and _worst_tolerance(x) > MAX_FACE_TOL for x in faces):
+            # (its outline doesn't lie on its surface: a torus piece cut to shape with
+            # corners 20 mm "tolerant" swallowed six slots inside a part, which then
+            # passed for bodies of their own. Failed here, its facets get a blend instead)
+            faces = [None]
         cache[key] = faces
         if any(x is None for x in faces):
             failed.append(k)

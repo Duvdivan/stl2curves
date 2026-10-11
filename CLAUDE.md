@@ -469,6 +469,13 @@ Key contracts:
 - ShapeFix_Solid can split a zero-volume bubble (two faces lying on each other) off as a
   second shell of the solid: invalid with every face valid and nothing to blame
   (`_without_empty_shells`).
+- A solid can fail the check with every face and edge valid: sewing left a group of
+  zero-area flat facets in the part's shell joined to nothing ("not connected";
+  `_without_specks` drops them), or a face cut to shape needed corner tolerances of 20 mm
+  (`build.MAX_FACE_TOL`), which made six slots inside a part classify as on its surface,
+  hence as bodies of their own. Both failures blamed nothing, and the halving search
+  then threw away half the part's curves or all of them (test12 of the STL2STEP set:
+  42,925 -> 6,246 faces). Look for what blames nothing before tuning what blames.
 - Big multi-body meshes sew into hundreds of zero-volume shells (coincident face pairs);
   `solids_from_shells` drops them (`EMPTY_SHELL`), or body counts and fuses go wrong.
 

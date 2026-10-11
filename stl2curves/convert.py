@@ -44,7 +44,7 @@ import time
 from pathlib import Path
 
 import numpy as np
-from OCP.TopoDS import TopoDS, TopoDS_Compound, TopoDS_Iterator, TopoDS_Shape
+from OCP.TopoDS import TopoDS, TopoDS_Compound, TopoDS_Iterator, TopoDS_Shape, TopoDS_Shell
 from OCP.BRepTools import BRepTools, BRepTools_WireExplorer
 from OCP.BRep import BRep_Builder, BRep_Tool
 from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeSolid
@@ -66,7 +66,8 @@ from OCP.IFSelect import IFSelect_RetDone
 from OCP.BRepAlgoAPI import BRepAlgoAPI_Fuse
 from OCP.BRepMesh import BRepMesh_IncrementalMesh
 from OCP.TopLoc import TopLoc_Location
-from OCP.collections import List_TopoDS_Shape, IndexedMap_TopoDS_Shape_TopTools_ShapeMapHasher
+from OCP.collections import (List_TopoDS_Shape, IndexedMap_TopoDS_Shape_TopTools_ShapeMapHasher,
+                             IndexedDataMap_TopoDS_Shape_List_TopoDS_Shape_TopTools_ShapeMapHasher)
 
 from . import __version__
 from . import features as features_mod
@@ -90,6 +91,7 @@ TIME_LIMIT = 600        # seconds after which the optional refinements stop (--t
 SWAP_ROUNDS = 6        # STL2CURVES_TRY=swap: rounds of taking blamed patches out again
 FIX_PRECISIONS = (1e-5, 1e-4)   # mm: precisions ShapeFix tries on an invalid solid after its default
 EMPTY_SHELL = 1e-6      # closed shells with less volume than this share of the biggest are dropped
+SPECK_AREA = 1e-6       # mm^2: faces joined to nothing else in their shell, this small in all, are dropped
 FUSE_SECONDS = 30       # bodies whose fuse takes longer than this are handed over side by side
 TIDY_SECONDS = 120      # a final tidy-up taking longer than this is given up (the part is kept as checked)
 TIDY_WORKER_FACES = 20000   # ...on a part of at least this many faces (smaller ones are tidied in place)
@@ -241,7 +243,7 @@ def solids_from_shells(sewn, inward=True):
     shells = []
     ex = TopExp_Explorer(sewn, TopAbs_SHELL)
     while ex.More():
-        shell = TopoDS.Shell(ex.Current())
+        shell = _without_specks(TopoDS.Shell(ex.Current()))
         solid = fixed(BRepBuilderAPI_MakeSolid(shell).Solid())   # oriented outwards
         if solid.ShapeType() != TopAbs_SOLID:
             ex2 = TopExp_Explorer(solid, TopAbs_SOLID)
@@ -334,6 +336,58 @@ def solids_from_shells(sewn, inward=True):
     # checked out, see fuse_overlapping; on an assembly of many bodies it is slow)
     solid = solids[0] if len(solids) == 1 else compound(solids)
     return solid, len(solids), len(cavities), total
+
+
+def _without_specks(shell):
+    """The shell less any group of faces joined to the rest by no edge and of next to no
+    area: flat facets of zero area that sewing left in the part's shell made it 'not
+    connected', so the solid failed the check with every face valid and nothing to blame
+    (a part with six slots inside: four such faces cost the halving search half its
+    curves)."""
+    emap = IndexedDataMap_TopoDS_Shape_List_TopoDS_Shape_TopTools_ShapeMapHasher()
+    TopExp.MapShapesAndAncestors_s(shell, TopAbs_EDGE, TopAbs_FACE, emap)
+    faces = IndexedMap_TopoDS_Shape_TopTools_ShapeMapHasher()
+    TopExp.MapShapes_s(shell, TopAbs_FACE, faces)
+    n = faces.Extent()
+    parent = np.arange(n + 1)
+
+    def root(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+    for i in range(1, emap.Extent() + 1):
+        idx = [faces.FindIndex(f) for f in emap.FindFromIndex(i)]
+        for a in idx[1:]:
+            parent[root(a)] = root(idx[0])
+    groups = {}
+    for f in range(1, n + 1):
+        groups.setdefault(root(f), []).append(f)
+    if len(groups) < 2:
+        return shell
+    drop = set()
+    for members in groups.values():
+        area = 0.0
+        for f in members:
+            props = GProp_GProps()
+            BRepGProp.SurfaceProperties_s(faces.FindKey(f), props)
+            area += abs(props.Mass())
+            if area > SPECK_AREA:
+                break
+        if area <= SPECK_AREA and len(members) < n:
+            drop.update(members)
+    if not drop:
+        return shell
+    out = TopoDS_Shell()
+    builder = BRep_Builder()
+    builder.MakeShell(out)
+    ex = TopExp_Explorer(shell, TopAbs_FACE)
+    while ex.More():
+        if faces.FindIndex(ex.Current()) not in drop:
+            builder.Add(out, ex.Current())
+        ex.Next()
+    out.Closed(shell.Closed())
+    return out
 
 
 def _without_empty_shells(solid):
@@ -839,8 +893,10 @@ def invalid_face_points(shape, check=None):
 
 def misjoined_edge_points(shape):
     """The middle of each edge its shell uses wrongly: run the same way by both faces
-    beside it (one of them is flipped), or shared by more than two faces. Every face
-    can check out on its own while its shell doesn't; this says where."""
+    beside it (one of them is flipped), shared by more than two faces, or by one only
+    (an open edge sewing let through: a part with six slots inside it failed the check
+    on that alone, with nothing else to blame). Every face can check out on its own
+    while its shell doesn't; this says where."""
     out, ex = [], TopExp_Explorer(shape, TopAbs_SHELL)
     while ex.More():
         edges = IndexedMap_TopoDS_Shape_TopTools_ShapeMapHasher()
@@ -856,7 +912,7 @@ def misjoined_edge_points(shape):
                 ee.Next()
             fx.Next()
         n = uses.sum(axis=1)
-        for i in np.nonzero((n > 2) | ((n == 2) & (uses[:, 0] != 1)))[0]:
+        for i in np.nonzero((n > 2) | (n == 1) | ((n == 2) & (uses[:, 0] != 1)))[0]:
             edge = TopoDS.Edge(edges.FindKey(int(i)))
             if not BRep_Tool.Degenerated_s(edge):
                 c = BRepAdaptor_Curve(edge)
