@@ -19,7 +19,7 @@ LIMITS = [("blends", "MAX_DEVIATION"), ("blends", "MAX_EDGE_GAP"),
           ("freeform", "FIT_DEV"), ("freeform", "BULGE_MM"), ("pipes", "FIT_DEV"), ("extrude", "FIT_DEV"),
           ("features", "NOISY_MAX"), ("features", "NOISY_TYPICAL"),
           ("fillets", "FILLET_TOL"), ("fillets", "GROW_TOL"),
-          ("threads", "PIECE_TOL")]
+          ("threads", "PIECE_TOL"), ("features", "CORNER_FIT_DEV")]
 
 
 def mm():

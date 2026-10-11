@@ -205,6 +205,11 @@ Local regression data on this machine (not in the repo):
    points kept on `mesh.trouble` by `culprits`), one that fails to build falls back to
    the 60-facet blends of its area (`blends.fallback`). Whatever no freeform takes
    becomes N-sided blends.
+   A blend whose corners all lie within `CORNER_FIT_DEV` (0.005 mm) of a cylinder fitted
+   to them alone, axis free, becomes that cylinder (`features.corner_surface`): a coarse
+   export can cut a gentle curve into a few big triangles slanting across it, whose normals
+   send every axis guess astray (the gutter mount's r 21 slope). At 0.02 the GPS case
+   back's tapped thread failed (1,502 -> 3,032 faces) though other parts gained.
 6. **`build.py`** makes one face per feature plus a planar face per remaining flat facet,
    sharing each boundary edge between the two faces beside it (`Edges` cache), then
    sews. `convert._build`/`attempt` then checks the solid: valid, and volume equal to

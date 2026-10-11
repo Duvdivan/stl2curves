@@ -43,6 +43,10 @@ COPLANAR_DEG = 0.05  # triangles closer to flat than this are merged into one fa
 MAX_SAG = 0.25       # mm: the middle of a facet may sit this far inside the curve (coarse meshes)
 BEND_SLACK_DEG = 8   # neighbouring facets must bend by what the surface predicts, within this
 MIN_SPAN_DEG = 15    # a partial patch must curve through at least this much
+CORNER_FIT_FACETS = 8       # a smooth area of at least this many facets ...
+CORNER_FIT_DEV = 0.005 * ACCURACY  # mm: ... every corner this near a cylinder fitted to them is
+                            # one (at 0.02 the GPS case back's tapped thread failed: 1,502 -> 3,032)
+CORNER_FIT_MAX_R = 1000.0   # mm: ... of at most this radius (more is a plane)
 LAND_TOL = 0.002     # mm: narrow strips round a known axis with corners this near one radius ...
 LAND_MIN = 3         # ... at least this many of them (and MIN_SPAN_DEG between them) ...
 LAND_MAX_FACETS = 12 # ... of at most this many facets each (bigger ones stand alone) ...
@@ -1728,6 +1732,62 @@ def _lands(mesh, regions, axes):
                     region.free[idx] = False
                     out.append(feature)
     return out
+
+
+def corner_surface(mesh, facets):
+    """A cylinder or cone feature through every corner of these facets, its axis fitted
+    to the corners alone, or None. On a coarse export a gentle curve can be a few big
+    triangles cutting across it at a slant: their normals aren't square to the axis, so
+    the guesses from normals all go astray, and the area came out as fragments of
+    cylinders with mismatched radii, then a smooth blend (the gutter mount's slope:
+    14 facets turning 21 deg, every corner within 0.0036 mm of r 21.04)."""
+    import scipy.optimize as so
+    global _loose, _anchored
+    fac = np.asarray(facets)
+    if len(fac) < CORNER_FIT_FACETS:
+        return None
+    N = mesh.fn[fac]
+    if math.degrees(math.acos(max(-1.0, min(1.0, float((N @ N.T).min()))))) < MIN_SPAN_DEG:
+        return None
+    P = mesh.pts[np.unique(np.concatenate([mesh.fverts[f] for f in fac]))]
+    c0 = P.mean(axis=0)
+    out_n = N.mean(axis=0)
+    out_n /= max(np.linalg.norm(out_n), 1e-12)
+    guesses = [np.linalg.eigh(N.T @ N)[1][:, 0], np.linalg.svd(P - c0)[2][0]]
+    best = None
+    for g in guesses:
+        d, e1, e2 = _frame(g)
+
+        def cylinder(x, d=d, e1=e1, e2=e2):
+            dd = d + x[0] * e1 + x[1] * e2
+            dd = dd / np.linalg.norm(dd)
+            w = P - (c0 + x[2] * e1 + x[3] * e2)
+            w -= np.outer(w @ dd, dd)
+            return np.linalg.norm(w, axis=1) - x[4]
+        for r0 in (5.0, 20.0, 80.0):
+            for side in (1, -1):
+                off = side * r0 * out_n
+                fit = so.least_squares(cylinder, np.r_[0, 0, off @ e1, off @ e2, r0])
+                if best is None or np.abs(fit.fun).max() < np.abs(best[0].fun).max():
+                    best = (fit, d, e1, e2)
+    fit, d, e1, e2 = best
+    tol = CORNER_FIT_DEV + mesh.noise
+    if np.abs(fit.fun).max() > tol or not 0 < fit.x[4] < CORNER_FIT_MAX_R:
+        return None
+    axis = d + fit.x[0] * e1 + fit.x[1] * e2
+    axis /= np.linalg.norm(axis)
+    model = Revolved(c0 + fit.x[2] * e1 + fit.x[3] * e2, axis, line=(float(fit.x[4]), 0))
+    if (np.abs(model.signed(mesh.fcent[fac])) > MAX_SAG).any():
+        return None
+    region = Region(mesh, fac)
+    ok, outward, _ = region._test(model, np.arange(len(fac)))
+    if (outward != outward[0]).any():
+        return None
+    _loose, _anchored = True, True      # (the fit is the evidence: every corner on it)
+    try:
+        return _feature(mesh, model, fac, bool(outward[0]))
+    finally:
+        _loose, _anchored = False, False
 
 
 def _distinct_axes(features, mesh=None):

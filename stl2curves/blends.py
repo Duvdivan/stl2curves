@@ -23,6 +23,7 @@ SPREAD_DEG = 40       # one blend face turns at most this far from its first fac
 TANGENT_DEG = 35      # a neighbour this close in direction is rolled into tangentially
 MIN_BEND_DEG = 2      # an unrecognised facet must turn at least this far against a neighbour
 MAX_FACETS = 60       # a bigger smooth area is covered by several blends (each a manageable fit)
+GROW_EXACT_FACETS = 40   # a cylinder fitted to a blend's corners takes in neighbouring patches up to this size
 CORNER_SIZE = 1.5     # mm: a blend no bigger across than this is a corner...
 CORNER_SPREAD_DEG = 85  # ...and may turn this far
 MAX_SPLITS = 2        # a blend whose face won't fit is cut in two, at most this many times over
@@ -167,7 +168,54 @@ def add_blends(mesh, features):
     for facets, parts in _regions(mesh, free, unit, lambda a: owner[a]):
         out.append(_blend(mesh, facets, tuple(features[k] for k in parts)))
         dropped.update(parts)
+    # (a blend's area may be one cylinder after all, cut into a few big slanting
+    # triangles that no guess from their normals found: see features.corner_surface)
+    out = [(_exact(mesh, f) or f) if f.kind == "blend" else f for f in out]
+    out = _grow_exact(mesh, out)
     return [f for k, f in enumerate(features) if k not in dropped] + out
+
+
+def _exact(mesh, blend):
+    from .features import corner_surface
+    try:
+        found = corner_surface(mesh, blend.facets)
+    except Exception:
+        return None
+    if found is not None:
+        found.corner_fit = True
+        found.parts = tuple(blend.parts)   # (put back if its face can't be built)
+    return found
+
+
+def _grow_exact(mesh, out):
+    """Cylinders found from a blend's corners (_exact) taking in the small blends and
+    freeform patches beside them that lie on them too, refitted together (a coarse
+    slope cut into several patches, each a few big facets)."""
+    verts = [set(np.concatenate([mesh.fverts[a] for a in f.facets]).tolist()) for f in out]
+    alive = [True] * len(out)
+    for i, f in enumerate(out):
+        if not f.__dict__.get("corner_fit"):
+            continue
+        grown = True
+        while grown:
+            grown = False
+            for j, g in enumerate(out):
+                if (j == i or not alive[j] or len(g.facets) > GROW_EXACT_FACETS
+                        or not (g.kind == "blend" or g.model.kind == "freeform") or not verts[i] & verts[j]):
+                    continue
+                from .features import corner_surface
+                try:
+                    trial = corner_surface(mesh, np.r_[out[i].facets, g.facets])
+                except Exception:
+                    trial = None
+                if trial is not None:
+                    trial.corner_fit = True
+                    trial.parts = tuple(out[i].parts) + tuple(g.parts)
+                    out[i] = trial
+                    verts[i] |= verts[j]
+                    alive[j] = False
+                    grown = True
+    return [f for f, keep in zip(out, alive) if keep]
 
 
 def merge(mesh, features, facets):
