@@ -1190,17 +1190,19 @@ def _trimmed_cut(feature, bound, mesh, tools, loops, per_loop, tol):
         # GPS case 165 of 177 pipes built from their outline, 117 by splitting, ten times
         # slower)
         if m.kind == "pipe" or (m.kind in ("freeform", "extrusion") and len(feature.facets) >= OUTLINE_FIRST):
-            face = _outline_face(feature, mesh, base, loops, per_loop)
-            if face is None:
-                face = _split_face(feature, mesh, base, tools, loops, tol)
+            ways = (lambda: _outline_face(feature, mesh, base, loops, per_loop),
+                    lambda: _split_face(feature, mesh, base, tools, loops, tol))
         else:
-            face = _split_face(feature, mesh, base, tools, loops, tol)
-            if face is None:
-                face = _outline_face(feature, mesh, base, loops, per_loop)
-        if face is None:
-            face = _polygon_face(feature, mesh, base, loops)
-        if face is not None:
-            return face
+            ways = (lambda: _split_face(feature, mesh, base, tools, loops, tol),
+                    lambda: _outline_face(feature, mesh, base, loops, per_loop))
+        for way in ways + (lambda: _polygon_face(feature, mesh, base, loops),):
+            face = way()
+            # (a face whose edges needed tolerances of millimetres doesn't fit its outline:
+            # on a ring-shaped surface an edge can be laid on the far side of the ring, a
+            # torus face round a bore coming out 19 mm "tolerant" where it ran on tangent
+            # into a fillet. The next way may lay it right)
+            if face is not None and _worst_tolerance(face) <= MAX_FACE_TOL:
+                return face
     return None
 
 
