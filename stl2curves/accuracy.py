@@ -12,6 +12,10 @@ never holds an exact radius and a CAD program's own spline export strays a few
 hundredths, so held to 0.02 real shapes were left as triangles and patches (quick set
 3,846 -> 3,352 faces, the measured deviation from the mesh no worse: 99% of points
 within 0.02 mm).
+
+STL2CURVES_ACCURACY_OF ("fillets=0.05,features=0.1") holds one module's limits at an
+accuracy of its own, to judge which limits gain from loosening and which only let wrong
+shapes in (an experiment; it is part of the saved-stage key like the accuracy itself).
 """
 import os
 import sys
@@ -25,14 +29,43 @@ LIMITS = [("blends", "MAX_DEVIATION"), ("blends", "MAX_EDGE_GAP"),
           ("features", "NOISY_MAX"), ("features", "NOISY_TYPICAL"),
           ("fillets", "FILLET_TOL"), ("fillets", "GROW_TOL"),
           ("threads", "PIECE_TOL"), ("features", "CORNER_FIT_DEV")]
+# mm: the loosest accuracy a module's limits follow. Freeform surfaces fitted looser than
+# 0.01 mm (accuracy 0.1) round over the tangent edges beside exact fillets, and the
+# fillets then fail (2026-10-11: quick set + gutter mount 2,916 faces at 0.1, 3,978 at
+# 0.15, 3,946 at 0.2; at 0.2 with freeform held at 0.1, 2,993)
+CEILING = {"freeform": 0.1}
+# the module a copied limit comes from (its accuracy is that module's)
+HOME = {("build", "MAX_DEVIATION"): "blends", ("build", "MAX_EDGE_GAP"): "blends",
+        ("pipes", "FIT_DEV"): "freeform", ("extrude", "FIT_DEV"): "freeform"}
 
 
-def mm():
-    """The accuracy asked for (mm)."""
-    return float(os.environ.get("STL2CURVES_ACCURACY") or DEFAULT)
+def of():
+    """The modules given an accuracy of their own: {module: mm}."""
+    out = {}
+    for item in (os.environ.get("STL2CURVES_ACCURACY_OF") or "").split(","):
+        if "=" in item:
+            name, value = item.split("=", 1)
+            out[name.strip()] = float(value)
+    return out
+
+
+def mm(module=None):
+    """The accuracy asked for (mm), or the one a module's limits are held at."""
+    whole = float(os.environ.get("STL2CURVES_ACCURACY") or DEFAULT)
+    if module is None:
+        return whole
+    own = of().get(module)
+    return own if own is not None else min(whole, CEILING.get(module, whole))
+
+
+def scale(module):
+    """What a module's limits are scaled by: its tuned values times this."""
+    return mm(module) / TUNED
 
 
 SCALE = mm() / TUNED        # (the modules' limits are their tuned values times this)
+# module: the scale its limits were last set to (at import, what scale() gives)
+_held = {module: scale(module) for module in {m for m, _ in LIMITS} | set(HOME.values())}
 
 
 def set_accuracy(value):
@@ -43,9 +76,10 @@ def set_accuracy(value):
     if value <= 0:
         raise ValueError("accuracy must be more than 0 mm")
     os.environ["STL2CURVES_ACCURACY"] = repr(value)
-    new = value / TUNED
     for module, name in LIMITS:
         m = sys.modules.get(f"{__package__}.{module}")
+        home = HOME.get((module, name), module)
         if m is not None and hasattr(m, name):
-            setattr(m, name, getattr(m, name) / SCALE * new)
-    SCALE = new
+            setattr(m, name, getattr(m, name) / _held.get(home, SCALE) * scale(home))
+    _held.update((module, scale(module)) for module in _held)
+    SCALE = value / TUNED

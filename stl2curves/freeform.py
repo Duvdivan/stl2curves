@@ -22,7 +22,8 @@ import scipy.sparse as sp
 from scipy.interpolate import BSpline
 from scipy.sparse.linalg import spsolve
 
-from .accuracy import SCALE as ACCURACY
+from .accuracy import scale
+ACCURACY = scale("freeform")
 
 FIT_DEV = 0.002 * ACCURACY  # mm: the surface passes this close to every mesh corner of its area
 GRAPH_DEG = 75          # no facet turned further than this from the base's direction there

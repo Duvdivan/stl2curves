@@ -31,7 +31,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import progress
-from .accuracy import SCALE as ACCURACY
+from .accuracy import scale
+ACCURACY = scale("features")
 
 import numpy as np
 

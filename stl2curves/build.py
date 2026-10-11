@@ -50,7 +50,8 @@ from OCP.Geom import (Geom_ToroidalSurface, Geom_SphericalSurface, Geom_Cylindri
 from OCP.GeomAPI import GeomAPI_IntSS, GeomAPI_ProjectPointOnCurve
 
 from . import features as features_mod
-from .accuracy import SCALE as ACCURACY
+from .accuracy import scale
+ACCURACY = scale("build")
 from . import workers
 from .features import TWO_PI, _angle_gap, _frame, Revolved, Sphere
 from .blends import TANGENT_DEG, MAX_DEVIATION, MAX_BULGE, MAX_EDGE_GAP

@@ -33,7 +33,8 @@ import math
 
 import numpy as np
 
-from .accuracy import SCALE as ACCURACY
+from .accuracy import scale
+ACCURACY = scale("threads")
 
 MIN_FACETS = 30        # a thread has at least this many facets
 FIT_DEG = 2.0          # a seed's facet normals this close to a screw motion ...

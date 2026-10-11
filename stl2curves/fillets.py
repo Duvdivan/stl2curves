@@ -46,7 +46,8 @@ import math
 import numpy as np
 
 from . import features as F
-from .accuracy import SCALE as ACCURACY
+from .accuracy import scale
+ACCURACY = scale("fillets")
 from .features import Revolved
 
 MIN_FACE_AREA = 2       # mm^2: flat facets at least this big can be the faces a fillet joins

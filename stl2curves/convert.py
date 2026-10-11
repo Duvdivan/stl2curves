@@ -1124,7 +1124,7 @@ def prepare(path, tol, fuse=True, curves=True, true_size=False, blends=True, men
     part = None
     # (with STL2CURVES_CACHE set, the first stages are saved, and taken up again on the
     # next run of the same file if their code hasn't changed: see stages.py)
-    cache = stages.Cache(path, (tol, fuse, curves, true_size, blends, mend, simplify_to, accuracy.mm()))
+    cache = stages.Cache(path, (tol, fuse, curves, true_size, blends, mend, simplify_to, accuracy.mm()) + ((tuple(sorted(accuracy.of().items())),) if accuracy.of() else ()))
     saved = cache.load("mesh")
     if saved is not None:
         pts, tris, part, groups, kept = saved

@@ -15,7 +15,8 @@ import numpy as np
 from . import extrude
 from . import freeform
 from . import pipes
-from .accuracy import SCALE as ACCURACY
+from .accuracy import scale
+ACCURACY = scale("blends")
 from .features import Feature, Revolved, Sphere
 
 SMOOTH_DEG = 50       # facets bending less than this meet smoothly
