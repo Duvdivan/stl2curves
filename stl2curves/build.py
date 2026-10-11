@@ -1795,12 +1795,26 @@ def _wedge_face(feature, bound, mesh):
     # Keep the sphere's seam (on the far side, along d) and its poles well away from
     # the corner patch and from every trimming plane: a plane through a pole fails.
     poles = [math.cos(a) * e1 + math.sin(a) * e2 for a in np.radians(np.arange(0, 180, 7.5))]
-    pole = max(poles, key=lambda z: min(abs(z @ n) for n in feature.planes))
+    poles.sort(key=lambda z: -min(abs(z @ n) for n in feature.planes))
+    # (and a cut can still fail silently, the face coming back uncut by one plane: a
+    # rounded cube's corner, its planes and centre a few 1e-7 off square, came out a
+    # quarter sphere and left its three edges unsewn: so check, and turn the poles)
+    for pole in poles[:WEDGE_TRIES]:
+        shape = _wedge_cut(m, feature.planes, pole, d)
+        if shape is not None and _inside_planes(shape, m, feature.planes):
+            return shape
+    return None
+
+
+WEDGE_TRIES = 6     # sphere orientations tried for a corner face before giving up
+
+
+def _wedge_cut(m, planes, pole, d):
     ball = BRepPrimAPI_MakeSphere(gp_Ax2(_pnt(m.c), gp_Dir(*pole), gp_Dir(*d)), m.r).Shape()
     ex = TopExp_Explorer(ball, TopAbs_FACE)
     shape = TopoDS.Face(ex.Current())
     size = 2 * m.r + 1
-    for n in feature.planes:
+    for n in planes:
         nd, n1, n2 = _frame(n)
         corner = m.c - size * n1 - size * n2
         box = BRepPrimAPI_MakeBox(gp_Ax2(_pnt(corner), gp_Dir(*nd), gp_Dir(*n1)), 2 * size, 2 * size, size).Shape()
@@ -1809,6 +1823,23 @@ def _wedge_face(feature, bound, mesh):
             return None
         shape = common.Shape()
     return shape
+
+
+def _inside_planes(shape, m, planes):
+    """Does every edge of the cut sphere lie on the kept side of every plane?"""
+    tol = 1e-4 * m.r + 1e-6
+    ex = TopExp_Explorer(shape, TopAbs_EDGE)
+    seen = False
+    while ex.More():
+        c = BRepAdaptor_Curve(TopoDS.Edge(ex.Current()))
+        ex.Next()
+        for t in np.linspace(c.FirstParameter(), c.LastParameter(), 7):
+            q = c.Value(t)
+            w = np.array([q.X(), q.Y(), q.Z()]) - m.c
+            if any(w @ np.asarray(n) < -tol for n in planes):
+                return False
+        seen = True
+    return seen
 
 
 def settle_blends(mesh, features, tol, split, skipped):

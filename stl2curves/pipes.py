@@ -26,9 +26,10 @@ from scipy.sparse.csgraph import connected_components, minimum_spanning_tree, sh
 from scipy.spatial import cKDTree
 
 from . import freeform
+from .accuracy import scale
 from .features import Feature, Revolved, Sphere
 
-FIT_DEV = freeform.FIT_DEV      # mm: the tube passes this close to every mesh corner of its area
+FIT_DEV = 0.002 * scale("pipes")  # mm: the tube passes this close to every mesh corner of its area
 MAX_RADIUS = 10.0               # mm: fillets up to this radius
 SAME_RADIUS = 0.02              # pieces whose radii differ by less than this share are one fillet's
 SAME_SPINE = 0.01               # mm: pieces whose spines lie this close are one surface's

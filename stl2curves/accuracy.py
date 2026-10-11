@@ -37,10 +37,10 @@ LIMITS = [("blends", "MAX_DEVIATION"), ("blends", "MAX_EDGE_GAP"),
 # 0.01 mm (accuracy 0.1) round over the tangent edges beside exact fillets, and the
 # fillets then fail (2026-10-11: quick set + gutter mount 2,916 faces at 0.1, 3,978 at
 # 0.15, 3,946 at 0.2; at 0.2 with freeform held at 0.1, 2,993)
-CEILING = {"freeform": 0.1}
+CEILING = {"freeform": 0.1, "pipes": 0.1}
 # the module a copied limit comes from (its accuracy is that module's)
 HOME = {("build", "MAX_DEVIATION"): "blends", ("build", "MAX_EDGE_GAP"): "blends",
-        ("pipes", "FIT_DEV"): "freeform", ("extrude", "FIT_DEV"): "freeform"}
+        ("extrude", "FIT_DEV"): "freeform"}
 
 
 def of():
