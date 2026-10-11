@@ -166,7 +166,17 @@ Local regression data on this machine (not in the repo):
      corners on the rims), hence the profile-bend and interior-corner guards.
    - Pass 1: surfaces hypothesised from pairs of neighbouring facets.
    - Pass 2: tori around axes already found.
-   - Loose pass, band tori, merge of same-surface neighbours.
+   - Loose pass, band tori, merge of same-surface neighbours. A cylinder, torus or
+     sphere found over `SAME_FACETS` facets takes in a neighbouring piece fitted as nearly
+     the same surface (`_strip_of`: axes within 10 deg, radii within 15%) if its corners
+     lie within `SAME_TOL` (0.003 mm x accuracy scale) and its facets face the same way:
+     test13 of the STL2STEP set (a bore cut across by another, the corners along the
+     crossing up to 12 um off) had its bore in 44 strips 0.02-0.3 mm off in radius. Any
+     piece that near (not only near-same surfaces) cost the gutter mount 47 faces; taking
+     loose facets that near cost the toolbox latch 55 (a tangent fillet's first rows lie
+     as close). Refitting a cylinder by least squares where `_rings_refit` finds no two
+     rings (the same bore) wrecked the instrument body (219 -> 9,506 faces) and swung
+     the gutter mount either way: dropped (2026-10-11).
 
    Thread features are appended after the merge: their models aren't surfaces of
    revolution.
@@ -217,7 +227,12 @@ Local regression data on this machine (not in the repo):
    `tolerance`; OCC's volume, re-measured by `tessellated_volume` when it disagrees),
    and its STEP file read back the same (`file_trouble`). Features that fail are dropped and left faceted (blends give back the
    pieces they replaced; failed exact patches are retried as blends; whole rings as two
-   half rings; a halving search finds culprits, capped in time). After
+   half rings; a halving search finds culprits, capped in time). A big exact patch (100+
+   facets) blamed for trouble gives up only its facets near it (`features.carve_exact`,
+   as freeform patches and thread pieces do), and gets its second chance whole: quick set
+   2,908 -> 2,754 faces (Rak N-USB 946 -> 830), full regression -3% faces, -11% time.
+   A single mesh edge along a trimmed outline gets an arc bowed onto the patch's surface
+   only if the bow is possible on it (`_tightest_radius`), else the chord. After
    `TROUBLE_SECONDS` per body the drop loop "hurries": `culprits` blames every patch
    within 0.5 mm of trouble, four times further each round (a 920k-triangle mesh spent
    95 min dropping a few patches per 3-minute sew). Blame ties (trouble on an edge

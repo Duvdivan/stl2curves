@@ -32,7 +32,7 @@ LIMITS = [("blends", "MAX_DEVIATION"), ("blends", "MAX_EDGE_GAP"),
           ("freeform", "FIT_DEV"), ("freeform", "BULGE_MM"), ("pipes", "FIT_DEV"), ("extrude", "FIT_DEV"),
           ("features", "NOISY_MAX"), ("features", "NOISY_TYPICAL"),
           ("fillets", "FILLET_TOL"), ("fillets", "GROW_TOL"),
-          ("threads", "PIECE_TOL"), ("features", "CORNER_FIT_DEV")]
+          ("threads", "PIECE_TOL"), ("features", "CORNER_FIT_DEV"), ("features", "SAME_TOL")]
 # mm: the loosest accuracy a module's limits follow. Freeform surfaces fitted looser than
 # 0.01 mm (accuracy 0.1) round over the tangent edges beside exact fillets, and the
 # fillets then fail (2026-10-11: quick set + gutter mount 2,916 faces at 0.1, 3,978 at

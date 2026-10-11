@@ -44,6 +44,11 @@ COPLANAR_DEG = 0.05  # triangles closer to flat than this are merged into one fa
 MAX_SAG = 0.25       # mm: the middle of a facet may sit this far inside the curve (coarse meshes)
 BEND_SLACK_DEG = 8   # neighbouring facets must bend by what the surface predicts, within this
 MIN_SPAN_DEG = 15    # a partial patch must curve through at least this much
+EXACT_CARVE_MIN = 100       # facets: a cylinder, cone, torus or sphere patch this big blamed for trouble gives up only its facets near it
+SAME_FACETS = 30            # a cylinder, torus or sphere found over this many facets ...
+SAME_TOL = 0.003 * ACCURACY   # mm: ... takes in a strip beside it whose corners lie this near it,
+SAME_TILT_DEG = 10          # ... fitted as nearly the same surface: axes within this,
+SAME_SHARE = 0.15           # ... radii (and sphere centres) within this share
 CORNER_FIT_FACETS = 8       # a smooth area of at least this many facets ...
 CORNER_FIT_DEV = 0.005 * ACCURACY  # mm: ... every corner this near a cylinder fitted to them is
                             # one (at 0.02 the GPS case back's tapped thread failed: 1,502 -> 3,032)
@@ -1604,6 +1609,69 @@ def snap(mesh, features, round_unit=None):
     return changed
 
 
+def _strip_of(model, other):
+    """Is `other` nearly the surface `model` is: both cylinders (or both tori) round axes
+    within SAME_TILT_DEG of each other, their radii within SAME_SHARE; or both spheres,
+    radii within SAME_SHARE and centres that near?"""
+    if isinstance(model, Sphere) and isinstance(other, Sphere):
+        return (abs(model.r - other.r) <= SAME_SHARE * model.r
+                and np.linalg.norm(model.c - other.c) <= SAME_SHARE * model.r)
+    if not (isinstance(model, Revolved) and isinstance(other, Revolved)):
+        return False
+    if abs(model.d @ other.d) < math.cos(math.radians(SAME_TILT_DEG)):
+        return False
+    if model.line and other.line and model.line[1] == 0 and other.line[1] == 0:
+        return abs(model.line[0] - other.line[0]) <= SAME_SHARE * model.line[0]
+    if model.circle and other.circle:
+        return (abs(model.circle[2] - other.circle[2]) <= SAME_SHARE * model.circle[2]
+                and abs(model.circle[0] - other.circle[0]) <= SAME_SHARE * max(model.circle[0], model.circle[2]))
+    return False
+
+
+def _holds(mesh, model, facets, tol, convex):
+    """Do these facets' corners all lie within tol of the model's surface, each facet
+    facing along it (within NORMAL_DEG) the way a patch of it that is convex (or not) does?"""
+    P = mesh.pts[np.unique(np.concatenate([mesh.fverts[f] for f in facets]))]
+    if np.abs(model.signed(P)).max() > tol:
+        return False
+    facing = np.einsum("ij,ij->i", mesh.fn[facets], model.normal(mesh.fcent[facets]))
+    return bool(((facing if convex else -facing) >= math.cos(math.radians(NORMAL_DEG))).all())
+
+
+def _described(mesh, model, fids, convex):
+    """_feature, else the same with its outline rules waived: for a patch whose surface
+    is pinned down already (taking in its neighbours: see _merge_same_surface)."""
+    global _loose, _anchored
+    got = _feature(mesh, model, fids, convex)
+    if got is None:
+        _loose, _anchored = True, True
+        try:
+            got = _feature(mesh, model, fids, convex)
+        finally:
+            _loose, _anchored = False, False
+    return got
+
+
+def carve_exact(mesh, feature, points, reach):
+    """A big cylinder, cone, torus or sphere patch blamed for trouble at these points less
+    its facets within reach of them (left flat): [the patch], or None if it is small, or
+    would lose half of itself. A bore cut across by another failed only where the slot's
+    edge, both bores and the fillets between them met in a few small blends, and dropped
+    whole its 232 facets went back to triangles."""
+    if (points is None or not len(points) or len(feature.facets) < EXACT_CARVE_MIN
+            or not isinstance(feature.model, (Revolved, Sphere))):
+        return None
+    from scipy.spatial import cKDTree
+    facets = feature.facets
+    size = np.array([np.linalg.norm(mesh.pts[mesh.fverts[a]] - mesh.fcent[a], axis=1).max() for a in facets])
+    d, _ = cKDTree(np.asarray(points, float)).query(mesh.fcent[facets])
+    keep = facets[d > reach + size]
+    if len(keep) == len(facets) or len(keep) < len(facets) / 2:
+        return None
+    got = _described(mesh, feature.model, keep, feature.convex)
+    return None if got is None else [got]
+
+
 def _merge_same_surface(mesh, features):
     """Join neighbouring patches that lie on the same surface (a hole split in two by a
     seam in the mesh, say), so each becomes one face."""
@@ -1614,15 +1682,31 @@ def _merge_same_surface(mesh, features):
         for i in range(len(features)):
             for j in range(i + 1, len(features)):
                 a, b = features[i], features[j]
-                if a.convex != b.convex or not (verts[i] & verts[j]):
+                if not (verts[i] & verts[j]):
                     continue
-                if (np.abs(a.model.signed(mesh.pts[list(verts[j])])).max() > _tol()
-                        or np.abs(b.model.signed(mesh.pts[list(verts[i])])).max() > _tol()):
+                # (one surface holding both is enough. And a cylinder found over
+                # SAME_FACETS facets or more, sure of itself, takes in a strip beside it
+                # fitted as nearly the same cylinder if its corners lie within SAME_TOL:
+                # a bore cut across by another had the corners along the crossing up to
+                # 12 um off, and held to the mesh tolerance came out as 44 strips, each a
+                # cylinder 0.02-0.3 mm off over its narrow arc. Only such strips: taking
+                # whatever lay that near cost the gutter mount 47 faces)
+                holder = None
+                for x, y in sorted(((a, b), (b, a)), key=lambda xy: -len(xy[0].facets)):
+                    if len(x.facets) >= SAME_FACETS and _strip_of(x.model, y.model):
+                        ok = _holds(mesh, x.model, y.facets, max(SAME_TOL, _tol()), x.convex)
+                    else:
+                        ok = x.convex == y.convex and _holds(mesh, x.model, y.facets, _tol(), x.convex)
+                    if ok:
+                        holder = x
+                        break
+                if holder is None:
                     continue
                 fids = np.concatenate([a.facets, b.facets])
                 if not _simple_outline(mesh, fids):
                     continue                # outline touches itself (e.g. equal holes crossing)
-                both = _feature(mesh, a.model, fids, a.convex)
+                both = (_described if len(holder.facets) >= SAME_FACETS else _feature)(
+                    mesh, holder.model, fids, holder.convex)
                 if both is None:
                     continue
                 features[i] = both

@@ -507,8 +507,13 @@ def _run_edge(edges, bounds, tag, ids, patch_side=False):
         m = bounds[k].m
         a, b = edges.pts[ids[0]], edges.pts[ids[1]]
         mid = ((a + b) / 2)[None]
-        mid = mid[0] - m.signed(mid)[0] * m.normal(mid)[0]
-        return _safe_arc(a, mid, b)
+        bow = m.signed(mid)[0]
+        # (no more than a chord this long can sag on the surface's tightest curve: a mesh
+        # edge running across the surface rather than along it can project its middle
+        # far off, and the arc through it left a torus face's corners 19 mm "tolerant")
+        if abs(bow) > 2 * float(np.sum((a - b) ** 2)) / (8 * _tightest_radius(m)) + 1e-4:
+            return edges.line(int(ids[0]), int(ids[1]))
+        return _safe_arc(a, mid[0] - bow * m.normal(mid)[0], b)
     if label is None:
         return edges.get(ids, edges.spline)
     bound = bounds[k]
@@ -537,6 +542,17 @@ def _following(edge, pts):
     rel = pts - np.array([centre.X(), centre.Y(), centre.Z()])
     turn = np.cross(rel[:-1], rel[1:]).sum(axis=0) @ np.array([axis.X(), axis.Y(), axis.Z()])
     return TopoDS.Edge(edge.Reversed()) if turn < 0 else edge
+
+
+def _tightest_radius(m):
+    """The smallest radius of curvature anywhere on the model's surface (mm)."""
+    if isinstance(m, Sphere):
+        return m.r
+    if isinstance(m, Revolved):
+        if m.circle:
+            return m.circle[2]
+        return max(abs(m.line[0]), 1e-3) if m.line[1] == 0 else 1e-3
+    return 1e-3
 
 
 def _safe_arc(a, mid, b):

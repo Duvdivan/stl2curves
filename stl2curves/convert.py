@@ -77,6 +77,7 @@ from .build import build_faces, sew, features_near, point_facet_distance, settle
 from . import workers
 from .bodies import split_bodies
 from .threads import carve as thread_carve
+from .features import carve_exact
 from .blends import add_blends, split as split_blend, _blend as as_blend, fallback as blend_fallback, carve, pipe_fallback
 from .repair import repair
 from . import accuracy, progress, stages
@@ -1049,6 +1050,12 @@ def _build(mesh, features, mesh_tol, tol, fuse, info):
                     continue
                 elif f.model.kind in ("pipe", "extrusion"):
                     halves = pipe_fallback(mesh, f)     # (its pieces as they were, blends between)
+                elif attempt.blamed and (carved := carve_exact(
+                        mesh, f, mesh.__dict__.get("trouble"), HURRY_REACH * 4 ** max(0, mesh.hurry - 1))):
+                    back += carved      # (a big exact patch likewise: only its facets near the trouble,
+                    f.parts = tuple(carved)     # and whole again in the second chance if the part takes it)
+                    blamed.append(f)
+                    continue
                 elif attempt.blamed:
                     halves = None
                 elif f.kind == "blend":
