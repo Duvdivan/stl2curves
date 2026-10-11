@@ -573,8 +573,11 @@ def attempt(mesh, features, mesh_tol, tol, fuse, faceted_volume):
         mended = None
         # (zero-area specks that sewing left in a shell, joined to nothing: looked for only
         # now, finding them takes a second or so on a few thousand faces)
-        respun = solids_from_shells(sewn, inward_shells(mesh), specks=True)[0]
-        if BRepCheck_Analyzer(respun, True, True).IsValid():
+        try:
+            respun = solids_from_shells(sewn, inward_shells(mesh), specks=True)[0]
+        except RuntimeError:
+            respun = None       # (no closed shell left without them: the check's verdict stands)
+        if respun is not None and BRepCheck_Analyzer(respun, True, True).IsValid():
             mended = respun
         if mended is None and not mesh.__dict__.get("defective"):      # (no repair mends a mesh that crosses itself)
             # (a straight edge running on tangent into an arc can pass for a crossing at
