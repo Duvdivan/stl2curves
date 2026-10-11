@@ -75,6 +75,7 @@ from .sizing import guess_size
 from .build import build_faces, sew, features_near, point_facet_distance, settle_blends, TRYING
 from . import workers
 from .bodies import split_bodies
+from .threads import carve as thread_carve
 from .blends import add_blends, split as split_blend, _blend as as_blend, fallback as blend_fallback, carve, pipe_fallback
 from .repair import repair
 from . import accuracy, progress, stages
@@ -972,6 +973,14 @@ def _build(mesh, features, mesh_tol, tol, fuse, info):
                         back += carved
                         continue
                     halves = blend_fallback(mesh, f)
+                elif f.model.kind == "thread" and attempt.blamed and (carved := thread_carve(
+                        mesh, f, mesh.__dict__.get("trouble"), HURRY_REACH * 4 ** max(0, mesh.hurry - 1))):
+                    back += carved      # (a thread piece likewise: only its facets near the trouble)
+                    # (and whole again in the second chance below, if the part builds
+                    # with it then: dropped pieces often do, carved ones never got to)
+                    f.parts = tuple(carved)
+                    blamed.append(f)
+                    continue
                 elif f.model.kind in ("pipe", "extrusion"):
                     halves = pipe_fallback(mesh, f)     # (its pieces as they were, blends between)
                 elif attempt.blamed:

@@ -42,6 +42,7 @@ AGREE_DEG = 3.0        # facet normals this close to the motion may belong to th
 SMALLEST_SEED = 1.0    # mm: radius of the smallest balls of facets tried as seeds
 MAX_FITS = 300         # seeds tried at most, per part
 SAME_PITCH = 0.1       # share: a seed's motion within this of a found thread's pitch is its own
+CARVE_MIN = 100        # facets: a piece this big blamed for trouble gives up only its facets near it
 BAND = 0.02            # mm: radii binned this finely to find the crest's and root's corners
 MIN_GATHER = 0.8       # share of a crest's or root's corners on a few helix lines
 ON_TOL = 0.01          # mm (plus the file's rounding): corners this near lie on the thread
@@ -323,6 +324,38 @@ def patches(mesh, thread, facets):
             if len(part) >= 3:
                 out.append(_piece_feature(mesh, thread, piece, part))
     return out
+
+
+def carve(mesh, feature, points, reach):
+    """A thread piece blamed for trouble at these points (a gap at its outline) less
+    its facets within reach of them, which are left flat: its connected stretches, each
+    a piece of its own on the same surface; None if it would lose half of itself.
+    Dropped whole, a flank running all of a thread's turns took thousands of facets
+    with it (the gutter mount's screw at --accuracy 0.05: 5,936 facets, 6,184 faces)."""
+    if points is None or not len(points) or len(feature.facets) < CARVE_MIN or feature.__dict__.get("carved"):
+        return None                     # (carved once already: blamed again, it goes)
+    from scipy.spatial import cKDTree
+    facets = feature.facets
+    size = np.array([np.linalg.norm(mesh.pts[mesh.fverts[a]] - mesh.fcent[a], axis=1).max() for a in facets])
+    d, _ = cKDTree(np.asarray(points, float)).query(mesh.fcent[facets])
+    keep = facets[d > reach + size]
+    if len(keep) == len(facets) or len(keep) < len(facets) / 2:
+        return None
+    piece = feature.model
+    out = [_piece_feature(mesh, piece.thread, piece, part) for part in _stretches(mesh, keep.tolist())]
+    for f in out:
+        f.carved = True
+    return out
+
+
+def _stretches(mesh, group):
+    """The connected stretches (3 facets or more) of a piece's facets."""
+    left = set(group)
+    while left:
+        part = _reach(mesh, [min(left)], list(left))
+        left -= set(part.tolist())
+        if len(part) >= 3:
+            yield part
 
 
 def piece_tol(thread):
