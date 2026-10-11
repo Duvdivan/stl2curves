@@ -510,11 +510,15 @@ def _run_edge(edges, bounds, tag, ids, patch_side=False):
     if label is None:
         return edges.get(ids, edges.spline)
     bound = bounds[k]
-    if label in ("lo", "hi") and len(ids) > 3 and ids[0] == ids[-1] and bound.f.kind != "wedge":
+    # (only for a patch all the way round: on a D-shaped hole, a cylinder 298 deg round
+    # with a flat across the rest, every corner of the end face's hole is on the circle,
+    # the flat's two ends too, and the hole came out round, the flat's edge gone)
+    if (label in ("lo", "hi") and len(ids) > 3 and ids[0] == ids[-1] and bound.f.kind != "wedge"
+            and bound.f.span >= TWO_PI - 1e-9):
         # a whole natural boundary circle: the exact circle (as the face beside it uses)
         return _following(bound.full_circle(label), edges.pts[ids])
     if (label in ("u0", "u1") and len(ids) > 3 and ids[0] == ids[-1] and bound.f.kind != "wedge"
-            and not bound.m.line):
+            and not bound.m.line and bound.f.hi - bound.f.lo >= TWO_PI - 1e-9):
         # likewise the whole profile circle of a torus
         return _following(bound.full_profile(label), edges.pts[ids])
     return edges.get(ids, lambda canon: bound.edge(label, edges.pts[canon]))

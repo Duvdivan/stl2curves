@@ -816,6 +816,11 @@ def _whole_noisy(mesh, region, model):
     facing = np.abs(np.einsum("ij,ij->i", region.n, surface_n))
     if (out != out[0]).any() or (facing < math.cos(math.radians(NORMAL_DEG))).any():
         return None
+    if (np.abs(model.signed(region.c)) > MAX_SAG).any():
+        # a flat across the round (a D-shaped hole's: its corners on the circle, its
+        # middle 1.15 mm inside it) is a face of its own, not a coarse facet of the round;
+        # taken in, the cylinder couldn't be built round it and the hole was left faceted
+        return None
     feature = _feature(mesh, model, region.facets, bool(out[0]))
     if feature is None:
         return None
