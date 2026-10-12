@@ -38,6 +38,8 @@ import numpy as np
 
 TOL = 0.001          # mm: CAD exports put mesh corners on the true surface to within this
 FLOAT_TOL = 2e-7     # plus this fraction of the largest coordinate (STL stores 32-bit floats)
+MIRROR = False          # search one side of a mirror-symmetric part, the other by mirroring (off: see CLAUDE.md)
+MIRROR_SHARE = 0.5      # a mirrored surface takes the facets on it if they cover this share of its own area
 NORMAL_DEG = 30      # a facet may tilt this far from the true surface normal (coarse meshes)
 SMOOTH_DEG = 40      # facets meeting at a gentler bend than this can be one curved surface
 COPLANAR_DEG = 0.05  # triangles closer to flat than this are merged into one facet
@@ -882,7 +884,27 @@ def analyze(pts, tris):
     progress.step("grouping triangles into flat facets")
     mesh = Mesh(pts, tris)
     _mesh_tol = TOL + FLOAT_TOL * float(np.abs(pts).max())
+    # (a part symmetric about a plane, wholly or in part, is searched on one side: what
+    # is found there is tried mirrored on the other, see symmetry.py)
+    mesh.mirror = mesh.mirror_skip = None
+    if MIRROR:
+        from . import symmetry
+        progress.step("looking for mirror symmetry")
+        found = symmetry.planes(mesh.pts, mesh.tris)
+        if found:
+            mesh.mirror = found[0][:2]
+            mesh.mirror_skip = symmetry.mirrored(mesh, mesh.mirror)
     regions = [Region(mesh, g) for g in mesh.smooth_regions()]
+    if mesh.mirror_skip is not None:
+        # (only smooth areas lying wholly on the far side, each a twin of one on the near
+        # side: one crossing the plane is searched as before, from every seed, or another
+        # seed's guess wins there. Skipping the far half of a ring's dome let a cone that
+        # fits it loosely be found first)
+        for region in regions:
+            if not mesh.mirror_skip[region.facets].all():
+                mesh.mirror_skip[region.facets] = False
+        if not mesh.mirror_skip.any():
+            mesh.mirror = mesh.mirror_skip = None
     features = []
 
     # Pass 0: smooth regions that are all one surface, fitted whole.
@@ -902,6 +924,10 @@ def analyze(pts, tris):
     from . import threads
     progress.step("looking for screw threads")
     free = [region.facets[region.free] for region in regions]
+    if mesh.mirror_skip is not None:
+        # (a facet mirroring onto the mesh is no thread's: mirrored, a thread turns the
+        # other way and lands off the mesh)
+        free = [f[~mesh.mirror_skip[f]] for f in free]
     screws = []
     for thread, fids in threads.find(mesh, np.concatenate(free) if free else np.zeros(0, int)):
         screws += threads.patches(mesh, thread, fids)
@@ -932,16 +958,18 @@ def analyze(pts, tris):
         taken[f.facets] = True
     known = [r for r in (_radius(f.model) for f in features) if r]
     rolled = fillets.find(mesh, regions, taken, known, walls=features)
-    for x in rolled:
-        x.__dict__["rolled"] = True     # (pinned down by the faces it joins: see _merge_same_surface)
     claimed = [int(f) for x in rolled for f in x.facets]
     for region in regions:
         region.free &= ~np.isin(region.facets, claimed)
+    rolled += _mirror_pass(mesh, regions, rolled)
+    for x in rolled:
+        x.__dict__["rolled"] = True     # (pinned down by the faces it joins: see _merge_same_surface)
     features += rolled
 
     # Pass 1: from each pair of neighbouring facets, work out what surface they're on.
     progress.step("finding curved surfaces")
     features += _pairs_pass(mesh, regions)
+    features += _mirror_pass(mesh, regions, features)
 
     # Pass 2: tori (and anything missed) around the axes of the patches found so far.
     # A curved rounded edge always shares its axis with a neighbouring hole, pin or
@@ -960,6 +988,12 @@ def analyze(pts, tris):
         # can be allowed that much more: the CAD program's own export is often as loose)
         features += _axis_pass(mesh, regions, axes, AXIS_NOISE * mesh.noise)
     features += _lands(mesh, regions, _distinct_axes(features, mesh) + thread_axes)
+    features += _mirror_pass(mesh, regions, features)
+    if mesh.mirror_skip is not None:
+        # (from here on everything left is searched, on both sides: whatever the mirror
+        # didn't explain, an asymmetric detail or a surface grown differently)
+        mesh.mirror_skip = None
+        mesh.__dict__.pop("shared_as", None)
     progress.step("finding what is left")
     features += _loose_pass(mesh, regions, features)
     features = _band_tori(mesh, regions, features)
@@ -1288,9 +1322,68 @@ class _Settings:
 
 def _seeds(region, i, how):
     """What facet i is tried with: each of its first three neighbours ("pairs"), or on
-    its own ("axis")."""
+    its own ("axis"); nothing if it mirrors a facet on the side searched."""
+    skip = region.mesh.__dict__.get("mirror_skip")
+    if skip is not None and skip[region.facets[i]]:
+        return ()
     return region.nbrs[i][:3] if how[0] == "pairs" else (None,)
 
+
+def _mirror_pass(mesh, regions, features):
+    """The surfaces found on the side searched, mirrored onto the other (symmetry.py):
+    for each, the free facets there lying on its mirror image (as closely as it lies on
+    its own facets, and facing the same way) and within its mirrored outline, made a
+    patch of that surface. Taken by footprint, not grown: a fillet found loosely
+    (fillets.py) wouldn't regrow at the mesh tolerance."""
+    skip = mesh.__dict__.get("mirror_skip")
+    if skip is None or not features:
+        return []
+    from . import symmetry
+    from scipy.spatial import cKDTree
+    where = {}
+    for region in regions:
+        for i, f in enumerate(region.facets.tolist()):
+            where[f] = (region, i)
+    free = np.zeros(len(mesh.farea), bool)
+    for f, (region, i) in where.items():
+        free[f] = region.free[i]
+    for f in features:
+        free[f.facets] = False      # (whatever a patch has, as the regions may not say)
+    found = []
+    for f in features:
+        m = symmetry.mirror_model(f.model, mesh.mirror)
+        if m is None:
+            continue
+        V = np.unique(np.concatenate([mesh.fverts[a] for a in f.facets]))
+        Pm = symmetry.mirror_point(mesh.pts[V], mesh.mirror)
+        lo, hi = Pm.min(axis=0) - _tol(), Pm.max(axis=0) + _tol()
+        cand = np.nonzero(free & skip & np.all((mesh.fcent >= lo) & (mesh.fcent <= hi), axis=1))[0]
+        if not len(cand):
+            continue
+        # (inside its mirrored outline: each facet's mirrored middle within the size of
+        # the nearest of its own facets; and as close to it as its own corners lie: a
+        # cone held to its patch's worst gap took the far half of a dome beside it)
+        size = np.array([float(np.ptp(mesh.pts[mesh.fverts[a]], axis=0).max()) for a in f.facets])
+        near_d, near_i = cKDTree(mesh.fcent[f.facets]).query(symmetry.mirror_point(mesh.fcent[cand], mesh.mirror))
+        cand = cand[near_d <= size[near_i] + _tol()]
+        tol = max(_tol(m), 1.1 * float(np.abs(f.model.signed(mesh.pts[V])).max()))
+        facing = np.sign(np.einsum("ij,ij->i", mesh.fn[f.facets], f.model.normal(mesh.fcent[f.facets])) @ mesh.farea[f.facets])
+        keep = []
+        for a in cand.tolist():
+            C = mesh.pts[mesh.fverts[a]]
+            if np.abs(m.signed(C)).max() <= tol and np.sign(mesh.fn[a] @ m.normal(mesh.fcent[a][None])[0]) == facing:
+                keep.append(a)
+        if len(keep) < 3 or mesh.farea[keep].sum() < MIRROR_SHARE * mesh.farea[f.facets].sum():
+            continue
+        got = _described(mesh, m, np.array(keep), f.convex)
+        if got is None:
+            continue
+        free[keep] = False
+        for a in keep:
+            region, i = where[a]
+            region.free[i] = False
+        found.append(got)
+    return found
 
 def _open(region, i, j, how):
     """Is the seed (i, j) to be tried, the region standing as it does?"""

@@ -157,6 +157,7 @@ def find(mesh, regions, taken=None, known=(), walls=()):
         return groups[X][~used[groups[X]]]
 
     corners = _Corners(mesh)
+    skip = mesh.__dict__.get("mirror_skip")
     cache = np.full(len(mesh.farea), -1.0)       # (verdicts on facets, reset after each try)
     vouched = sorted(set(round(float(r), 6) for r in known if r > 0))
     found = []
@@ -185,6 +186,8 @@ def find(mesh, regions, taken=None, known=(), walls=()):
                 else:
                     if used[A] or used[B]:
                         continue
+                    if skip is not None and skip[A] and skip[B]:
+                        continue        # (both on the far side of a mirror plane: found mirrored)
                     if round_ == 0 and not _could_join(mesh, A, B, plane_pt):
                         continue
                     for X, Y in ((A, B), (B, A)):    # (from either face: one may border others too)

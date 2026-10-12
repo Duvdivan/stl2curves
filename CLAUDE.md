@@ -406,6 +406,18 @@ by full regressions (`compare/regress_try.sh` runs them all):
   chords against a coarse neighbour stay, beyond `MAX_EDGE_TOL`. Every fix here redoes
   what build's face construction already does: the likelier route is build's faces,
   joined (`rejoin`), without the sewing.
+- `MIRROR` (features.py, off; `symmetry.py`, 2026-10-12): mirror planes are found in about a second
+  (candidates through the centroid or box middle, square to the axes or principal axes, kept
+  if half the corners reflect onto the mesh within 0.02 mm: most of the owner's parts have
+  one, many wholly). Far-side facets that mirror onto the mesh are skipped as seeds (all seed
+  passes, `fillets.find` pairs with both faces far, the thread search), and every surface
+  found is laid over the far side by footprint (`_mirror_pass`: facets whose mirrored middle
+  lies within its own facets' size, on the mirrored surface as closely as its own corners).
+  Skipping seeds in smooth areas crossing the plane changed which guess won (a ring's dome
+  became a cone, -0.8% volume; tensioner +53 faces with a loose footprint): so only areas
+  wholly on the far side skip, and then the gain is small: instrument body analysis 175 ->
+  165 s (121 s skipping everywhere), latch 9.4 -> 7.7 s, analysis being a third of the time.
+  The surface lookup samples edges and area, not a grid (a grid gave 44M points).
 - `local.py` (helpers, always available): swap faces/edges in a big shape at the cost of
   the faces touched (`apply_local`: two-step ReShape), local edge maps; `tests/test_local.py`.
 
