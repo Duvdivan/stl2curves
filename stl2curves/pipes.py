@@ -31,6 +31,9 @@ from .features import Feature, Revolved, Sphere
 
 FIT_DEV = 0.002 * scale("pipes")  # mm: the tube passes this close to every mesh corner of its area
 MAX_RADIUS = 10.0               # mm: fillets up to this radius
+CHAIN_PIECES = 5                # a pipe is at most this many cylinders and tori in a row ...
+CHAIN_REACH = 1.0               # ... each reaching this many radii along its spine
+LONG_STRAIGHT = 5.0             # radii: a cylinder piece this long is a straight fillet, never a pipe's
 REAL_SIDE_SHARE = 0.25          # a face beside a piece counts as its side if it shares this share of the main side's edges
 SAME_RADIUS = 0.02              # pieces whose radii differ by less than this share are one fillet's
 SAME_SPINE = 0.01               # mm: pieces whose spines lie this close are one surface's
@@ -445,6 +448,19 @@ def _real(mesh, features, owner, k, mates):
     return True
 
 
+def _long_straight(mesh, f):
+    """Is f a cylinder running LONG_STRAIGHT radii along its axis? A straight fillet: a
+    cylinder fits a fillet along a curve only over a short stretch (bowing off it by
+    L^2/8R, a micron over 0.6 mm round a 50 mm bend), so a long one is real whatever lies
+    at its ends (a box's 62 mm bottom fillet, its sides judged by the many short edges
+    to the corner pieces at its end, went into a pipe with them)."""
+    m = f.model
+    if not (isinstance(m, Revolved) and m.line and m.line[1] == 0):
+        return False
+    P = mesh.pts[np.unique(np.concatenate([mesh.fverts[g] for g in f.facets]))]
+    return float(np.ptp((P - m.a) @ m.d)) >= LONG_STRAIGHT * m.line[0]
+
+
 def add_pipes(mesh, features):
     """The features with each chain of fillet pieces that one tube fits replaced by a
     pipe, which remembers the pieces (put back if its face can't be built)."""
@@ -474,7 +490,7 @@ def add_pipes(mesh, features):
         for b in touch[a]:
             if surface[b] == b and b > a and _same_spine(features[a].model, features[b].model):
                 surface[b] = surface[a]
-    stays = {k for k in radius if _real(mesh, features, owner, k, touch[k])}
+    stays = {k for k in radius if _real(mesh, features, owner, k, touch[k]) or _long_straight(mesh, features[k])}
     # chains grow from the pieces reaching furthest along their spines
     extent = {}
     for k in radius:
@@ -500,9 +516,156 @@ def add_pipes(mesh, features):
                for k in sorted(pieces, key=lambda k: -len(features[k].facets))[:3]):
             continue
         used.update(parts)
-        out.append(feature(mesh, model, facets, tuple(features[k] for k in parts), dev))
+        piped = feature(mesh, model, facets, tuple(features[k] for k in parts), dev)
+        out += _exact_tube(mesh, piped) or [piped]
     mesh.__dict__.pop("_vn", None)      # (the mesh goes to every worker: no extra baggage)
     return [f for k, f in enumerate(features) if k not in used or k in stays] + out
+
+
+def _exact_tube(mesh, piped):
+    """The pipe as the cylinders and tori its tube is made of, if each holds every corner
+    of its stretch within FIT_DEV, else None: [one feature] if one surface takes it all,
+    else the pieces of a chain of straight runs and circular arcs.
+
+    A fillet run along an edge loop is a chain of such pieces wherever the loop is
+    lines and arcs (CAD rounds the edges in turn: a latch's r 0.495 fillet round a face
+    whose corner an r 0.99 fillet had rounded is a cylinder, a torus whose centre circle
+    is hardly bigger than its tube, and a cylinder). Detection cuts such a torus into
+    narrow slices that each fit a small sphere, and the chain of them is joined here as
+    a pipe; its spine then runs straight, round a circle and straight again. Only a few
+    pieces, each a fair stretch of the spine: a spline-shaped edge also fits many short
+    arcs, and stays one pipe."""
+    m = piped.model
+    facets = np.asarray(piped.facets)
+    s = m.foot(mesh.fcent[facets])
+    lo, hi = float(s.min()), float(s.max())
+    n = int(min(400, max(24, math.ceil((hi - lo) / (m.r / 4)))))
+    S = np.linspace(lo, hi, n)
+    Q = m.spine(S)
+    whole = _exact_fit(mesh, facets, m.r, Q, piped.convex)
+    if whole is not None:
+        whole.parts = (piped,)     # (if its face can't be built: the pipe again, then its pieces)
+        return [whole]
+    runs, i = [], 0
+    while i < n - 1:
+        j = i + 2
+        while j < n and _spine_shape(Q[i:j + 1], m.r) is not None:
+            j += 1
+        j = max(i + 1, j - 1)
+        runs.append((i, j))
+        i = j
+    if not 2 <= len(runs) <= CHAIN_PIECES or any(S[j] - S[i] < CHAIN_REACH * m.r for i, j in runs):
+        return None
+    # (each run its stretch's facets, by where their middles' feet fall; a run no surface
+    # fits joins its neighbours that don't either, and that stretch stays a pipe, refitted
+    # on its own from this one's spine: a straight run into a corner whose ball path bends
+    # off a circle is a cylinder and a shorter pipe)
+    out, rest = [], []
+    for i, j in runs:
+        mine = facets[(s >= S[i] - 1e-9) & (s <= S[j] + 1e-9) & ~np.isin(facets, [x for g in out for x in g.facets])]
+        got = _exact_fit(mesh, mine, m.r, Q[i:j + 1], piped.convex) if len(mine) >= 3 else None
+        if got is None:
+            rest.append(mine)
+        else:
+            out.append(got)
+    if not out:
+        return None
+    taken = np.concatenate([g.facets for g in out])
+    left = facets[~np.isin(facets, taken)]
+    if len(left):
+        def guess(V):
+            return m.spine(m.foot(mesh.pts[V]))
+        for group in _connected(mesh, left):
+            model, dev = fit(mesh, group, m.r, guess)
+            if model is None:
+                return None
+            inside = set(group.tolist())
+            out.append(feature(mesh, model, group, tuple(p for p in piped.parts if set(p.facets.tolist()) <= inside), dev))
+    return out
+
+
+def _connected(mesh, facets):
+    """The facets in groups joined by shared edges."""
+    left, groups = set(int(a) for a in facets), []
+    while left:
+        stack = [left.pop()]
+        group = list(stack)
+        while stack:
+            a = stack.pop()
+            for b in mesh.nbrs[a]:
+                if b in left:
+                    left.remove(b)
+                    stack.append(b)
+                    group.append(b)
+        groups.append(np.array(sorted(group)))
+    return groups
+
+
+def _spine_shape(Q, r):
+    """Whether spine points Q lie on a line ("line") or a circle ("circle") within
+    FIT_DEV, else None."""
+    c = Q.mean(axis=0)
+    _, _, Vt = np.linalg.svd(Q - c)
+    X = Q - c
+    if np.linalg.norm(X - np.outer(X @ Vt[0], Vt[0]), axis=1).max() <= FIT_DEV:
+        return "line"
+    if np.abs(X @ Vt[2]).max() > FIT_DEV:
+        return None
+    x, y = X @ Vt[0], X @ Vt[1]
+    (p, q, k), *_ = np.linalg.lstsq(np.c_[x, y, np.ones_like(x)], x * x + y * y, rcond=None)
+    R = math.sqrt(max(k + p * p / 4 + q * q / 4, 0.0))
+    if not 0 < R < 100 * r:
+        return None
+    return "circle" if np.abs(np.hypot(x - p / 2, y - q / 2) - R).max() <= FIT_DEV else None
+
+
+def _exact_fit(mesh, facets, r, Q, convex):
+    """The cylinder or torus (round the line or circle of spine points Q) holding every
+    corner of the facets within FIT_DEV, refitted by least squares: a feature, or None."""
+    from .features import _described
+    from scipy.optimize import least_squares
+    P = mesh.pts[np.unique(np.concatenate([mesh.fverts[a] for a in facets]))]
+    c = Q.mean(axis=0)
+    _, _, Vt = np.linalg.svd(Q - c)
+
+    def direction(x):
+        return np.array([math.sin(x[0]) * math.cos(x[1]), math.sin(x[0]) * math.sin(x[1]), math.cos(x[0])])
+
+    def angles(d):
+        return [math.acos(float(np.clip(d[2], -1, 1))), math.atan2(d[1], d[0])]
+
+    tries = []
+    # (a straight spine: a cylinder round it)
+    def cylinder(x):
+        return Revolved(x[:3], direction(x[3:5]), line=(float(x[5]), 0.0))
+    tries.append((cylinder, np.r_[c, angles(Vt[0]), r]))
+    # (a spine in a plane, on a circle: a torus round the plane's normal)
+    x, y = (Q - c) @ Vt[0], (Q - c) @ Vt[1]
+    (p, q, k), *_ = np.linalg.lstsq(np.c_[x, y, np.ones_like(x)], x * x + y * y, rcond=None)
+    R = math.sqrt(max(k + p * p / 4 + q * q / 4, 0.0))
+    # (a nearly straight spine is the cylinder's; and a fillet's ball can't roll round an
+    # arc tighter than itself: a spindle torus, its centre circle smaller than its tube,
+    # fitted a box corner's spline patch within 0.01 mm at the mesh corners and built 0.17
+    # off the part between them)
+    if r < R < 100 * r:
+        centre = c + p / 2 * Vt[0] + q / 2 * Vt[1]
+
+        def torus(x):
+            d = direction(x[3:5])
+            return Revolved(x[:3], d, circle=(float(x[5]), float(x[:3] @ d), float(x[6])))
+        tries.append((torus, np.r_[centre, angles(Vt[2]), R, r]))
+    for make, x0 in tries:
+        try:
+            x = least_squares(lambda x: make(x).signed(P), x0, x_scale="jac", max_nfev=200).x
+        except (ValueError, np.linalg.LinAlgError):
+            continue
+        model = make(x)
+        if np.abs(model.signed(P)).max() > FIT_DEV or (model.circle and model.circle[0] <= model.circle[2]):
+            continue
+        got = _described(mesh, model, np.asarray(facets), convex)
+        if got is not None:
+            return got
+    return None
 
 
 def _chain(mesh, features, owner, seed, radius, used):

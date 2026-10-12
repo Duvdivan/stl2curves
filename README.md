@@ -18,6 +18,7 @@ works out which surface each part of the mesh really lies on and rebuilds it exa
 | swept fillets | constant-radius rounded edges along any other curve (where a flat face meets a tilted hole or slot, along a spline-shaped outline) |
 | screw threads | bolts, threaded holes and sockets (helical surfaces, with the thread named) |
 | freeform surfaces | crowns that fade out round a bend, curvature-continuous ("smooth") fillets, walls of slots milled along a curve |
+| transition corners | where rounded edges of different radii meet (one freeform patch from where each fillet stops) |
 | smooth blends | where rounded edges meet at a corner, fillets along spline-shaped edges |
 
 Surfaces can be cut to any outline (a hole running out through a sloped face, two
@@ -197,7 +198,19 @@ Without it the size is left alone (a slight scale is often deliberate, for fit).
    each fitting a short stretch. Such a chain becomes one tube round a fitted spline
    (the path of the ball's centre), passing within 0.002 mm of every mesh corner. Pieces
    that are real fillets (lying between faces that share their axis, like a torus round
-   a hole's rim) stay as they are.
+   a hole's rim), and long straight cylinders, stay as they are. A pipe whose spine
+   is a line or a circle becomes that cylinder or torus, and one whose spine runs
+   straight, round a circle and straight again becomes those pieces: CAD rounds edges
+   in turn, so a fillet along an edge loop that an earlier fillet rounded off is a
+   chain of cylinders and tori (a torus whose centre circle is hardly bigger than its
+   tube, which detection had cut into narrow sphere slices).
+   Where fillets of different radii meet (a box's r 2 bottom edges and r 1.5 upright
+   edge: no ball can roll round an arc tighter than itself), CAD fills the corner with
+   a spline patch of its own, which detection cuts into narrow slices of small spheres,
+   cylinders and tori centred elsewhere. A smooth area of such small pieces and loose
+   facets, between two or more fillets, with the pieces of about the fillets' radii and
+   the area no bigger across than a few of them, becomes one freeform surface if one
+   fits it, from where each fillet stops fitting.
 4. **Freeform surfaces and blends** (`freeform.py`, `blends.py`) — curved areas left
    over (unrecognised facets, and small pieces that only stand in for a surface they
    don't really fit, such as narrow cylinder strips across a spline-shaped bend) are

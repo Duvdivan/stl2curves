@@ -28,6 +28,8 @@ CASES = {
     "test_hard.stl": ("make_hard.py", 35134.2571, 0.05, 31),      # chamfers, slot, crossing / sloped holes
     "test_lid.stl": ("make_lid.py", 57600.4078, 0.05, 45),        # fillet network, tori, cones
     "test_sphere.stl": ("make_spheres.py", 34303.8040, 0.01, 34),  # domes, dimples, balls, corners
+    "test_corners.stl": ("make_corners.py", 32796.5606, 0.1, 30),    # fillet chains, spline corners (CAD: 26)
+    "test_corners2.stl": ("make_corners.py", 14072.0767, 0.1, 34),   # vertex blends of three radii (CAD: 26)
 }
 
 

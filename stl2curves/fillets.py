@@ -53,7 +53,7 @@ from .features import Revolved
 MIN_FACE_AREA = 2       # mm^2: flat facets at least this big can be the faces a fillet joins
 MIN_ANGLE_DEG = 30      # the faces must meet at least this far from flat...
 MAX_ANGLE_DEG = 170     # ...and not be (nearly) parallel
-LINK_RINGS = 24         # a fillet's band is at most this many facets across
+LINK_RINGS = 48         # a fillet's band is at most this many facets across (a finely cut r 3 fillet: 28)
 FACE_TO_STRIP = 3       # each face a fillet joins is at least this many times its biggest band facet
 FILLET_TOL = 0.02 * ACCURACY  # mm: how far most band corners may lie off the fillet found from them ...
 GROW_TOL = 0.05 * ACCURACY  # mm: ... and its facets' corners at most (meshes lose accuracy at fillets)
@@ -772,6 +772,19 @@ def _fillet(mesh, nbrs, used, sec, plane_pt, noise, vouched, corners, cache):
         # corners all lie at its two ends, where the faces end too)
         core = sec.coords(V[(t >= t0 - exact) & (t <= t1 + exact)])
         if len(core) < 4:
+            # (or past them, into the corner patches at both ends where it meets fillets
+            # of other radii: a box's r 4 bottom fillet ran 1 mm on past the faces'
+            # shared stretch at each end, with no corner inside it. Then the corners of
+            # the strips reaching across that stretch and ending within about a radius
+            # of it, as the fillet's facets are taken below)
+            reach = math.exp(DEPTH_AGREE) * middle + exact
+            P, first = corners.of(band)
+            tt = sec.along(P)
+            lo, hi = np.minimum.reduceat(tt, first), np.maximum.reduceat(tt, first)
+            strips = band[(lo < t1 - exact) & (hi > t0 + exact) & (lo >= t0 - reach) & (hi <= t1 + reach)]
+            if len(strips):
+                core = sec.coords(mesh.pts[np.unique(np.concatenate([mesh.fverts[g] for g in strips]))])
+        if len(core) < 4:
             return None
         fit = _radius(core, cfg, noise, vouched)
         if fit is None:
@@ -799,7 +812,7 @@ def _fillet(mesh, nbrs, used, sec, plane_pt, noise, vouched, corners, cache):
             Q = sec.coords(P)
             return np.maximum.reduceat(np.abs(np.linalg.norm(Q - o, axis=1) - r), first), P, first
 
-        def on(gs):
+        def on(gs, band_only=True, slack=0.0):
             # on the fillet, and not far past where both sides run (a fillet stops where
             # the edge it rounds off does; whatever carries on round a corner from there
             # is another surface)
@@ -810,10 +823,18 @@ def _fillet(mesh, nbrs, used, sec, plane_pt, noise, vouched, corners, cache):
             # (reaching into the stretch both run along: the run-on is the end of a strip
             # running the fillet's length, not a facet of a rounded corner beyond)
             inside = (lo < t1 - exact) & (hi > t0 + exact)
-            return in_band[gs] & inside & (lo >= t0 - run_on) & (hi <= t1 + run_on) & (off <= allowed)
+            mine = in_band[gs] if band_only else (~used[gs] & ~a_mask[gs] & not_B(gs) & (mesh.farea[gs] <= small))
+            return mine & inside & (lo >= t0 - run_on) & (hi <= t1 + run_on) & (off <= allowed + slack)
 
         start = seeds[on(seeds)]
         facets = spread(start, on) if len(start) else np.zeros(0, int)
+        if len(facets):
+            # (and the rows beside each face, which lie within a hair of it too, so no
+            # radius could be read off them and the band left them out: on a finely
+            # meshed r 4 fillet they were fitted on their own as r 4.067. Held a little
+            # less closely: the fillet read off the band's ends lay 0.003 mm off the true
+            # one along them, and where it touches the face either would do)
+            facets = spread(facets, lambda gs: on(gs, band_only=False, slack=FILLET_TOL / 4))
         if not len(facets) or not reaches_B(facets):
             return None
         # it must bend on the way (one flat strip with its edges on both is a chamfer),

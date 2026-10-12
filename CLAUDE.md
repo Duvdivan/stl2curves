@@ -27,7 +27,7 @@ pip install -r requirements.txt                 # cadquery-ocp>=8 (+vtk), numpy,
 python -m stl2curves part.stl                   # -> part.step next to it (from the clone root)
 python -m stl2curves part.stl --out DIR --details   # list every rebuilt / skipped feature
 python -m stl2curves.render part.step           # PNG preview coloured by surface type
-python tests/run_tests.py                       # regression suite (5 CAD parts, a few minutes)
+python tests/run_tests.py                       # regression suite (7 CAD parts, a few minutes)
 ```
 
 From another directory, set `PYTHONPATH` to the clone root first (as `stl2curves.bat` and
@@ -164,6 +164,14 @@ Local regression data on this machine (not in the repo):
      surface joined): face square to the axis gives a torus, face along a cylinder's
      axis a cylinder. A coarse chamfer round a hole fits a torus exactly (all its
      corners on the rims), hence the profile-bend and interior-corner guards.
+     Fine meshes (2026-10-12, `tests/make_corners.py`): a band can be 28 strips across
+     (`LINK_RINGS` 48, was 24); strips running a fillet's whole length can end past the
+     faces' shared stretch, into corner patches at both ends (the radius is then read
+     from the strips reaching across it); and the rows beside each face lie within a
+     hair of it, so no radius can be read off them: once the fillet is fitted they join
+     it if on it (a little looser than the fit, which lay 0.003 mm off the true one),
+     else pass 1 fitted them as r 4.067 beside an r 4 fillet. Rolled fillets are
+     marked `rolled` and count as sure holders in the merge.
    - Pass 1: surfaces hypothesised from pairs of neighbouring facets.
    - Pass 2: tori around axes already found.
    - Loose pass, band tori, merge of same-surface neighbours. A cylinder, torus or
@@ -176,7 +184,10 @@ Local regression data on this machine (not in the repo):
      loose facets that near cost the toolbox latch 55 (a tangent fillet's first rows lie
      as close). Refitting a cylinder by least squares where `_rings_refit` finds no two
      rings (the same bore) wrecked the instrument body (219 -> 9,506 faces) and swung
-     the gutter mount either way: dropped (2026-10-11).
+     the gutter mount either way: dropped (2026-10-11). Two pieces each lying on the
+     other's surface at the mesh tolerance merge with the outline rules waived, however
+     small (test7's 62 mm bottom fillet came as 26 and 12 facets of one cylinder, their
+     triangles interleaved; the 12 couldn't be cut alone): GPS case back -32 faces.
 
    Thread features are appended after the merge: their models aren't surfaces of
    revolution.
@@ -198,7 +209,20 @@ Local regression data on this machine (not in the repo):
    tell (it bridges a line-to-arc junction within 0.002 mm once the arc is 3 mm or more),
    and reach can't either (round an ellipse's ends a torus fits for 90 deg). Pipes are
    `kind="trimmed"` with a `Pipe` model (`kind="pipe"`, built like freeform faces); one
-   that fails to build gives back its pieces.
+   that fails to build gives back its pieces. A cylinder piece `LONG_STRAIGHT` (5) radii
+   long never joins a chain (a cylinder hugs a curved fillet only over a fraction of a
+   mm). Judging sides by edge length instead of edge count also fixed test7, but cost
+   the latch 29 faces and moved the gutter mount's volume 9 mm^3: dropped. A pipe whose
+   spine is a line or circle becomes that cylinder or torus (`_exact_tube`, least
+   squares from the spine's own line or circle, every corner within `FIT_DEV`; tori
+   whose centre circle is no bigger than their tube refused: a spindle torus fitted a
+   spline corner at the corners and built 0.17 mm off between them), and one whose
+   spine is a few straight runs and arcs (`CHAIN_PIECES`, each `CHAIN_REACH` radii
+   long) becomes those pieces, a run no surface fits staying a shorter pipe refitted
+   from this one's spine: CAD rounds edges in turn, so a fillet along a loop an earlier
+   fillet rounded off is cylinders and tori (the latch's r 0.495 round an r 0.99 arc:
+   a torus with a 0.52 centre circle, cut by detection into sphere slices). An exact
+   tube that fails to build gives back its pipe (`convert.good`).
    Then `blends.py` groups leftover curved facets (and "scrap" pieces that only stand in
    for a surface) into smooth areas. A big area (over `MAX_FACETS` facets or 5 mm
    across) is first tried as one **`freeform.py`** surface: a P-spline height field
@@ -213,7 +237,21 @@ Local regression data on this machine (not in the repo):
    `kind="trimmed"` with a `Freeform` model (`signed`, `normal` like any surface); a
    big one blamed for trouble loses only its facets near it (`blends.carve`, trouble
    points kept on `mesh.trouble` by `culprits`), one that fails to build falls back to
-   the 60-facet blends of its area (`blends.fallback`). Whatever no freeform takes
+   the 60-facet blends of its area (`blends.fallback`). Before all that, transitions
+   (`_transitions`): where fillets of different radii meet and no ball can roll round
+   the arc (test7's r 2 bottom loop round r 1.5 upright edges), CAD makes a spline
+   corner patch, which detection cuts into sphere slices drifting 0.04 mm apart, tilted
+   cylinders and tori. A smooth area of small pieces (reaching no further than
+   `TRANSITION_REACH` radii, or specks of `TRANSITION_SPECK` facets whatever their
+   radius) and small loose facets (any bend: on a fine mesh neighbours bend less than
+   MIN_BEND_DEG), between `TRANSITION_MIN_FILLETS` fillets, the pieces' radii within
+   `TRANSITION_RADII` of theirs (all but `TRANSITION_ODD` of the facets), no loose
+   facet longer than `TRANSITION_SLIVER` radii (a corner spanning a fillet's
+   full-length sliver bowed 0.35 mm off), at least the smallest radius across and at
+   most a few of the biggest, becomes one freeform patch if one fits. Unguarded it
+   took 16 spline stretches and specks of the GPS case back: 871 -> 1,220 faces.
+   test7 217 -> 172 faces (the other tool's count); `tests/make_corners.py`'s boxes
+   735 -> 26 (the CAD model's own count) and 186 -> 30. Whatever no freeform takes
    becomes N-sided blends.
    A blend whose corners all lie within `CORNER_FIT_DEV` (0.005 mm) of a cylinder fitted
    to them alone, axis free, becomes that cylinder (`features.corner_surface`): a coarse

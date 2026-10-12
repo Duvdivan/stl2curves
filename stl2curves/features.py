@@ -932,6 +932,8 @@ def analyze(pts, tris):
         taken[f.facets] = True
     known = [r for r in (_radius(f.model) for f in features) if r]
     rolled = fillets.find(mesh, regions, taken, known, walls=features)
+    for x in rolled:
+        x.__dict__["rolled"] = True     # (pinned down by the faces it joins: see _merge_same_surface)
     claimed = [int(f) for x in rolled for f in x.facets]
     for region in regions:
         region.free &= ~np.isin(region.facets, claimed)
@@ -1719,6 +1721,14 @@ def _fill_pinholes(mesh, features):
     return features
 
 
+def _sure(f):
+    """Is the patch sure of its surface: found over SAME_FACETS facets, or a fillet rolled
+    between two flat faces (fillets.py: the faces pin it down, however few its strips; a
+    box's r 4 bottom fillet, 23 strips running its length, had the slivers along the
+    bottom face fitted on their own as r 4.067)?"""
+    return len(f.facets) >= SAME_FACETS or bool(f.__dict__.get("rolled"))
+
+
 def _merge_same_surface(mesh, features):
     """Join neighbouring patches that lie on the same surface (a hole split in two by a
     seam in the mesh, say), so each becomes one face."""
@@ -1740,7 +1750,7 @@ def _merge_same_surface(mesh, features):
                 # whatever lay that near cost the gutter mount 47 faces)
                 holder = None
                 for x, y in sorted(((a, b), (b, a)), key=lambda xy: -len(xy[0].facets)):
-                    if len(x.facets) >= SAME_FACETS and _strip_of(x.model, y.model):
+                    if _sure(x) and _strip_of(x.model, y.model):
                         ok = _holds(mesh, x.model, y.facets, max(SAME_TOL, _tol()), x.convex)
                     else:
                         ok = x.convex == y.convex and _holds(mesh, x.model, y.facets, _tol(), x.convex)
@@ -1752,8 +1762,15 @@ def _merge_same_surface(mesh, features):
                 fids = np.concatenate([a.facets, b.facets])
                 if not _simple_outline(mesh, fids):
                     continue                # outline touches itself (e.g. equal holes crossing)
-                both = (_described if len(holder.facets) >= SAME_FACETS else _feature)(
-                    mesh, holder.model, fids, holder.convex)
+                # (the outline rules are waived for a sure holder, and for two pieces each
+                # lying on the other's surface: each passed them alone. A box's 63 mm r 2
+                # bottom fillet came as 26 and 12 facets of one cylinder, their long
+                # triangles interleaved, and together failed the outline rules; the 12,
+                # touching one another only at corners, then couldn't be cut)
+                other = b if holder is a else a
+                sure = _sure(holder) or (
+                    other.convex == holder.convex and _holds(mesh, other.model, holder.facets, _tol(), other.convex))
+                both = (_described if sure else _feature)(mesh, holder.model, fids, holder.convex)
                 if both is None:
                     continue
                 features[i] = both

@@ -1050,6 +1050,8 @@ def _build(mesh, features, mesh_tol, tol, fuse, info):
                     continue
                 elif f.model.kind in ("pipe", "extrusion"):
                     halves = pipe_fallback(mesh, f)     # (its pieces as they were, blends between)
+                elif f.kind != "blend" and len(f.parts) == 1 and f.parts[0].model.kind == "pipe":
+                    halves = list(f.parts)      # (a pipe found to be a cylinder or torus: the pipe again)
                 elif attempt.blamed and (carved := carve_exact(
                         mesh, f, mesh.__dict__.get("trouble"), HURRY_REACH * 4 ** max(0, mesh.hurry - 1))):
                     back += carved      # (a big exact patch likewise: only its facets near the trouble,

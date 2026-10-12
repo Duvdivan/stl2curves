@@ -44,6 +44,12 @@ STRIP_DEG = 45        # an exact patch turning less than this beside freeform pi
 FREEFORM_MIN_SIZE = 5.0     # mm across: a smaller area of MAX_FACETS or fewer is left to the blends
 GROW_COS = math.cos(math.radians(10))   # a facet a freeform piece takes in faces within 10 deg of it
 CARVE_MIN = 200       # facets: a freeform patch this big blamed for trouble loses just its facets near it
+TRANSITION_REACH = 3.0  # radii: a piece reaching no further than this many of its radii may be part of a transition
+TRANSITION_MIN_FILLETS = 2   # ...which runs between at least this many fillets (cylinders, tori, pipes)
+TRANSITION_RADII = 2.0       # ...its pieces' radii within this factor of theirs ...
+TRANSITION_ODD = 0.2         # ... all but this share of their facets
+TRANSITION_SLIVER = 2.0      # radii: no loose facet of one runs further than this
+TRANSITION_SPECK = 8         # facets: a piece this small may be part of one whatever its radius
 
 
 class Blend:
@@ -124,6 +130,7 @@ def add_blends(mesh, features):
     # (first the pieces of fillets along curved edges joined into pipes: they are pieces
     # of tori, cylinders and spheres the passes below would take for scraps)
     features = pipes.add_pipes(mesh, features)
+    features = _transitions(mesh, features)
     nf = len(mesh.farea)
     owner = np.full(nf, -1)
     for k, f in enumerate(features):
@@ -179,6 +186,166 @@ def add_blends(mesh, features):
     out = _grow_exact(mesh, out)
     kept = [f for k, f in enumerate(features) if k not in dropped] + out
     return _between_walls(mesh, kept)
+
+
+def _transitions(mesh, features):
+    """The features with each transition between fillets made one freeform patch.
+
+    Where fillets of different radii meet (a box's r 2 bottom edges and r 1.5 upright
+    edge at a corner), CAD fills the corner with a surface of its own, swept by a ball
+    whose path bends off the fillets' and whose radius changes along it. Detection cuts
+    it into narrow slices that each fit a small sphere, cylinder or torus centred
+    somewhere else, plus facets nothing explains: a box corner came out as seven r 1.5
+    sphere slices whose centres drift 0.04 mm apart, a dozen cylinders tilted every way
+    and a torus, and was built as fifteen faces and some triangles. The whole area,
+    from where each fillet stops fitting, is one smooth surface (a P-spline height field
+    over the plane facing its mean direction fits such a corner within 0.003 mm).
+
+    A transition: a smooth area (no crease) of small pieces (Revolved or Sphere,
+    reaching no further than TRANSITION_REACH radii: a fillet runs on further) and
+    loose curved facets, holding two or more pieces no one surface of theirs fits all
+    of, and bordered by TRANSITION_MIN_FILLETS other curved patches or more (the fillets
+    it joins). Its pieces are remembered, as freeform patches', and given back if its
+    face can't be built."""
+    nf = len(mesh.farea)
+    owner = np.full(nf, -1)
+    for k, f in enumerate(features):
+        owner[f.facets] = k
+    small = SMALL_FACET * mesh.farea.max()
+
+    def minor(k):
+        f = features[k]
+        if f.kind not in ("trimmed", "revolve") or f.__dict__.get("vouched") or f.parts:
+            return False
+        if not isinstance(f.model, (Revolved, Sphere)):
+            return False
+        r = _radius(f.model, mesh.fcent[f.facets])
+        if not r or r > pipes.MAX_RADIUS:
+            return False
+        if len(f.facets) <= TRANSITION_SPECK:
+            return True         # (a speck: its radius, fitted to a sliver or two, means nothing)
+        P = mesh.pts[np.unique(np.concatenate([mesh.fverts[a] for a in f.facets]))]
+        return float(np.linalg.norm(np.ptp(P, axis=0))) <= TRANSITION_REACH * r
+
+    pieces = {k for k in range(len(features)) if minor(k)}
+
+    def fillet_radius(k):
+        """A fillet's radius (a cylinder's, a torus's tube's, a pipe's), else None."""
+        m = features[k].model
+        r = m.r if m.kind == "pipe" else pipes.tube_radius(m) if isinstance(m, Revolved) else None
+        return r if r and r <= pipes.MAX_RADIUS else None
+
+    def loose(a):
+        # (a small facet nothing took, however little it bends against its neighbours:
+        # on a finely meshed corner patch two neighbouring triangles can be coplanar
+        # enough to be one facet, and were left as holes in it)
+        return owner[a] < 0 and mesh.farea[a] <= small and bool(mesh.nbrs[a])
+
+    def unit(a):
+        return [int(x) for x in features[owner[a]].facets] if owner[a] >= 0 else [int(a)]
+
+    member = np.zeros(nf, bool)
+    for k in pieces:
+        member[features[k].facets] = True
+    for a in np.nonzero(owner < 0)[0]:
+        if loose(a):
+            member[a] = True
+    limit = math.cos(math.radians(CREASE_DEG))
+    seen = np.zeros(nf, bool)
+    out, used = [], set()
+    for seed in np.nonzero(member & (owner >= 0))[0]:
+        if seen[seed]:
+            continue
+        area = unit(seed)
+        seen[area] = True
+        stack = list(area)
+        while stack:
+            a = stack.pop()
+            for b in mesh.nbrs[a]:
+                if seen[b] or not member[b] or mesh.fn[a] @ mesh.fn[b] < limit:
+                    continue
+                u = unit(b)
+                seen[u] = True
+                area += u
+                stack += u
+        facets = np.array(sorted(set(area)))
+        parts = sorted({int(owner[a]) for a in facets if owner[a] >= 0})
+        if len(parts) < 2:
+            continue
+        # (between real fillets: long ones, of a radius each, and the pieces of about
+        # their radii, the area no bigger across than a few of them. On a freeform
+        # part, specks of scrap strips 0.07 to 1.2 mm in radius and flat stretches of
+        # spline with stray tori on them met every other test, and went the same way)
+        border = {int(owner[b]) for a in facets for b in mesh.nbrs[a] if owner[b] >= 0 and not member[b]}
+        radii = [r for r in (fillet_radius(k) for k in border) if r]
+        if len(radii) < TRANSITION_MIN_FILLETS:
+            continue
+        lo, hi = min(radii), max(radii)
+        # (no loose facet longer than a couple of the fillets' radii: a CAD mesh cuts a
+        # straight fillet into slivers running its whole length, and a corner patch
+        # spanning one of those bowed 0.35 mm off the part between its corners; then
+        # the stretch of what is left holding the most of the pieces)
+        long = {int(a) for a in facets if owner[a] < 0
+                and np.ptp(mesh.pts[mesh.fverts[a]], axis=0).max() > TRANSITION_SLIVER * hi}
+        if long:
+            groups = _connected_units(mesh, [int(a) for a in facets if int(a) not in long], unit)
+            if not groups:
+                continue
+            facets = max(groups, key=lambda g: (sum(owner[a] >= 0 for a in g), len(g)))
+            parts = sorted({int(owner[a]) for a in facets if owner[a] >= 0})
+            if len(parts) < 2:
+                continue
+        # (most of the pieces, by facets: specks of junk radius don't count)
+        weight = [len(features[k].facets) for k in parts]
+        odd = [len(features[k].facets) for k in parts
+               if not lo / TRANSITION_RADII <= (_radius(features[k].model, mesh.fcent[features[k].facets]) or 0)
+               <= hi * TRANSITION_RADII]
+        if sum(odd) > TRANSITION_ODD * sum(weight):
+            continue
+        P = mesh.pts[np.unique(np.concatenate([mesh.fverts[a] for a in facets]))]
+        size = float(np.linalg.norm(np.ptp(P, axis=0)))
+        if not lo <= size <= TRANSITION_REACH * 2 * hi:
+            continue
+        if any(np.abs(features[k].model.signed(P)).max() <= freeform.FIT_DEV for k in parts):
+            continue        # (one surface after all: pieces of it, not a transition)
+        # (or one cylinder or cone through every corner: specks and loose rows of a
+        # straight fillet, which came out as freeform patches 0.0001 mm off a cylinder)
+        from .features import corner_surface
+        try:
+            exact = corner_surface(mesh, facets)
+        except Exception:
+            exact = None
+        if exact is not None:
+            exact.corner_fit = True
+            exact.parts = tuple(features[k] for k in parts)     # (put back if its face can't be built)
+            out.append(exact)
+            used.update(parts)
+            continue
+        model, dev = freeform.fit(mesh, facets)
+        if model is None:
+            continue
+        out.append(freeform.feature(mesh, model, facets, tuple(features[k] for k in parts), dev))
+        used.update(parts)
+    return [f for k, f in enumerate(features) if k not in used] + out
+
+
+def _connected_units(mesh, facets, unit):
+    """The facets in groups joined by shared edges (a piece's facets all in one)."""
+    left, groups = set(facets), []
+    while left:
+        group = set(unit(next(iter(left)))) & left
+        left -= group
+        stack = list(group)
+        while stack:
+            a = stack.pop()
+            for b in mesh.nbrs[a]:
+                if b in left:
+                    u = set(unit(b)) & left
+                    left -= u
+                    group |= u
+                    stack += list(u)
+        groups.append(np.array(sorted(group)))
+    return groups
 
 
 def _exact(mesh, blend):
