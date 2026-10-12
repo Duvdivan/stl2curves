@@ -31,6 +31,7 @@ from .features import Feature, Revolved, Sphere
 
 FIT_DEV = 0.002 * scale("pipes")  # mm: the tube passes this close to every mesh corner of its area
 MAX_RADIUS = 10.0               # mm: fillets up to this radius
+REAL_SIDE_SHARE = 0.25          # a face beside a piece counts as its side if it shares this share of the main side's edges
 SAME_RADIUS = 0.02              # pieces whose radii differ by less than this share are one fillet's
 SAME_SPINE = 0.01               # mm: pieces whose spines lie this close are one surface's
 MIN_SPAN = 0.5                  # mm: spine knots no closer than this
@@ -422,6 +423,10 @@ def _real(mesh, features, owner, k, mates):
     sides = sorted(count, key=lambda x: -count[x])[:2]
     if not sides:
         return False
+    # (a side is what runs along it, not a speck at its end: a box's 63 mm edge fillet
+    # touched a few loose facets of the corner ball at one end, 3 edges against 24, and
+    # went into a pipe with the corner's pieces)
+    sides = [x for x in sides if count[x] >= REAL_SIDE_SHARE * count[sides[0]]]
     for key in sides:
         if key == -1:
             return False        # (loose curved facets: a surface nothing explained)

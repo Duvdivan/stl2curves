@@ -45,6 +45,7 @@ MAX_SAG = 0.25       # mm: the middle of a facet may sit this far inside the cur
 BEND_SLACK_DEG = 8   # neighbouring facets must bend by what the surface predicts, within this
 MIN_SPAN_DEG = 15    # a partial patch must curve through at least this much
 EXACT_CARVE_MIN = 100       # facets: a cylinder, cone, torus or sphere patch this big blamed for trouble gives up only its facets near it
+PINHOLE_FACETS = 4          # facets: a hole this small closed in by one patch, on its corners, is the patch's
 SAME_FACETS = 30            # a cylinder, torus or sphere found over this many facets ...
 SAME_TOL = 0.003 * ACCURACY   # mm: ... takes in a strip beside it whose corners lie this near it,
 SAME_TILT_DEG = 10          # ... fitted as nearly the same surface: axes within this,
@@ -962,7 +963,7 @@ def analyze(pts, tris):
     features = _band_tori(mesh, regions, features)
     # (the thread's pieces ahead of what was found round its ends: if the solid won't
     # check out with everything, the search for culprits keeps what comes first)
-    return mesh, _merge_same_surface(mesh, features) + screws + ends, _mesh_tol
+    return mesh, _fill_pinholes(mesh, _merge_same_surface(mesh, features)) + screws + ends, _mesh_tol
 
 
 def _tube_fit(P, model, steps=30):
@@ -1670,6 +1671,52 @@ def carve_exact(mesh, feature, points, reach):
         return None
     got = _described(mesh, feature.model, keep, feature.convex)
     return None if got is None else [got]
+
+
+def _fill_pinholes(mesh, features):
+    """Hand each small group of facets no patch has (PINHOLE_FACETS at most) that only one
+    patch borders smoothly, every corner of it a corner of that patch and its middle as
+    near the surface as the patch's own facets, to the patch. Triangles left out of a
+    coarse fillet where it ends at a corner ball (a fan round one corner, alternately the
+    fillet's and nobody's) pinched its outline into loops touching at that corner, and
+    such a face wouldn't cut, nor would a blend over it fill (a comb's prong tips: four
+    fillets of 97 facets went back to triangles, 1,064 -> 839 faces)."""
+    owner = np.full(len(mesh.farea), -1)
+    for k, f in enumerate(features):
+        owner[f.facets] = k
+    corners = [None] * len(features)
+    grown = {}
+    seen = set()
+    for g0 in np.nonzero(owner < 0)[0].tolist():
+        if g0 in seen:
+            continue
+        group, stack, around = [], [g0], set()
+        seen.add(g0)
+        while stack and len(group) <= PINHOLE_FACETS:
+            g = stack.pop()
+            group.append(g)
+            for h in mesh.nbrs[g]:
+                h = int(h)
+                if owner[h] >= 0:
+                    around.add(int(owner[h]))
+                elif h not in seen:
+                    seen.add(h)
+                    stack.append(h)
+        if stack or len(group) > PINHOLE_FACETS or len(around) != 1:
+            continue
+        k = around.pop()
+        if corners[k] is None:
+            corners[k] = set(np.concatenate([mesh.fverts[a] for a in features[k].facets]).tolist())
+        f = features[k]
+        if (all(set(mesh.fverts[g].tolist()) <= corners[k] for g in group)
+                and np.abs(f.model.signed(mesh.fcent[group])).max() <= max(f.worst, _tol(f.model))):
+            grown.setdefault(k, []).extend(group)
+    for k, extra in grown.items():
+        f = features[k]
+        wider = _described(mesh, f.model, np.r_[f.facets, extra], f.convex)
+        if wider is not None:
+            features[k] = wider
+    return features
 
 
 def _merge_same_surface(mesh, features):
