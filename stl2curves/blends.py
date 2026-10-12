@@ -399,7 +399,10 @@ def _onto_spine(P, walls, targets, steps=20):
         f = np.stack([w.signed(C) - t for w, t in zip(walls, targets)], axis=1)
         J = np.stack([w.normal(C) for w in walls], axis=1)
         step = np.einsum("nij,nj->ni", np.linalg.pinv(np.einsum("nij,nkj->nik", J, J)), f)
-        C = C - np.einsum("nij,ni->nj", J, step)
+        move = np.einsum("nij,ni->nj", J, step)
+        C = C - move
+        if not len(move) or np.abs(move).max() < 1e-10:
+            break       # (settled: Gauss-Newton gets there in a few steps; always 20 cost 70 s on a big part)
     return C
 
 
@@ -415,16 +418,29 @@ def _between_walls(mesh, features):
              if isinstance(f.model, Revolved) and f.model.line and len(f.facets) >= BETWEEN_WALL_FACETS]
     if len(walls) < 2:
         return features
-    verts = [set(np.concatenate([mesh.fverts[a] for a in f.facets]).tolist()) for f in features]
     wall_set = set(walls)
+    # (each piece listed under every pair of walls it touches both of, worked out from
+    # the walls round its corners: going through every feature for every pair of walls
+    # took 150 s on a part with 200 walls and 1,200 features)
+    wall_of = {}
+    for A in walls:
+        for v in np.unique(np.concatenate([mesh.fverts[a] for a in features[A].facets])).tolist():
+            wall_of.setdefault(v, []).append(A)
+    order = {A: i for i, A in enumerate(walls)}
+    by_pair = {}
+    for k, f in enumerate(features):
+        if k in wall_set or f.kind in ("ball", "wedge") or f.model.kind == "thread" or len(f.facets) > BETWEEN_PIECE_FACETS:
+            continue
+        near = sorted({A for v in np.unique(np.concatenate([mesh.fverts[a] for a in f.facets])).tolist()
+                       for A in wall_of.get(v, ())}, key=order.get)
+        for i, A in enumerate(near):
+            for B in near[i + 1:]:
+                by_pair.setdefault((A, B), []).append(k)
     used = set()
     out = []
     for i, A in enumerate(walls):
         for B in walls[i + 1:]:
-            pieces = [k for k in range(len(features))
-                      if k not in wall_set and k not in used and verts[k] & verts[A] and verts[k] & verts[B]
-                      and features[k].kind not in ("ball", "wedge") and features[k].model.kind != "thread"
-                      and len(features[k].facets) <= BETWEEN_PIECE_FACETS]
+            pieces = [k for k in by_pair.get((A, B), ()) if k not in used]
             if not pieces:
                 continue
             got = _rolled(mesh, features, (A, B), pieces)
