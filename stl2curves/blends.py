@@ -7,6 +7,7 @@ small mismatched pieces. Each such area becomes one smooth freeform face instead
 an N-sided patch spanning the area's outline (shared exactly with its neighbours) and
 passing through its mesh corners.
 """
+import copy
 import math
 from collections import deque
 
@@ -50,6 +51,7 @@ TRANSITION_RADII = 2.0       # ...its pieces' radii within this factor of theirs
 TRANSITION_ODD = 0.2         # ... all but this share of their facets
 TRANSITION_SLIVER = 2.0      # radii: no loose facet of one runs further than this
 TRANSITION_SPECK = 8         # facets: a piece this small may be part of one whatever its radius
+ISLAND_FACETS = 4     # facets: a group no patch has, closed in by one patch and on it, is the patch's
 
 
 class Blend:
@@ -185,7 +187,66 @@ def add_blends(mesh, features):
     out = [(_exact(mesh, f) or f) if f.kind == "blend" else f for f in out]
     out = _grow_exact(mesh, out)
     kept = [f for k, f in enumerate(features) if k not in dropped] + out
-    return _between_walls(mesh, kept)
+    return _islands(mesh, _between_walls(mesh, kept))
+
+
+def _islands(mesh, features):
+    """The features with each island taken in by the patch round it: a group of at most
+    ISLAND_FACETS facets no patch has, every edge of it shared with one patch, lying on
+    that patch's surface (corners and middles as near as its own facets), or for a
+    blend, needle-thin or meeting it smoothly. Such a hole in a patch broke its face:
+    a blend takes one outline only, and a cut face had a needle 0.004 mm wide to fit
+    inside it (Rak N-USB: 47 islands, mostly needles left out of curved patches because
+    a needle's facing means nothing; four freeform pieces and two fillets with one
+    failed, and their blends after them). Facing isn't asked."""
+    from .features import _tol
+    owner = np.full(len(mesh.farea), -1)
+    for k, f in enumerate(features):
+        owner[f.facets] = k
+    beside = {}
+    for (a, b), fs in mesh.edge_facets.items():
+        for x in fs:
+            beside.setdefault(x, []).extend((y, (a, b)) for y in fs if y != x)
+    grown, seen = {}, set()
+    for g0 in np.nonzero(owner < 0)[0].tolist():
+        if g0 in seen:
+            continue
+        group, stack, around = [], [g0], set()
+        seen.add(g0)
+        while stack and len(group) <= ISLAND_FACETS:
+            g = stack.pop()
+            group.append(g)
+            for h, _ in beside.get(g, ()):
+                if owner[h] >= 0:
+                    around.add(int(owner[h]))
+                elif h not in seen:
+                    seen.add(h)
+                    stack.append(h)
+        if stack or len(group) > ISLAND_FACETS or len(around) != 1:
+            continue
+        k = around.pop()
+        f = features[k]
+        if f.kind == "blend":
+            T = mesh.pts[mesh.tris[np.concatenate([mesh.ftris[g] for g in group])]]
+            long = np.linalg.norm(T - T[:, [1, 2, 0]], axis=2).max(axis=1)
+            height = 2 * np.linalg.norm(np.cross(T[:, 1] - T[:, 0], T[:, 2] - T[:, 0]), axis=1) / np.maximum(long, 1e-12)
+            smooth = all(_bend(mesh, g, h) < TANGENT_DEG for g in group for h, _ in beside.get(g, ()) if owner[h] == k)
+            if not (smooth or (height <= MAX_DEVIATION).all()):
+                continue
+        else:
+            V = np.unique(np.concatenate([mesh.fverts[g] for g in group]))
+            near = max(f.worst, _tol(f.model))
+            if (np.abs(f.model.signed(mesh.pts[V])).max() > near
+                    or np.abs(f.model.signed(mesh.fcent[group])).max() > near):
+                continue
+        grown.setdefault(k, []).extend(group)
+    out = list(features)
+    for k, extra in grown.items():
+        f = copy.copy(out[k])
+        f.__dict__.pop("_across", None)
+        f.facets = np.r_[f.facets, extra]
+        out[k] = f
+    return out
 
 
 def _transitions(mesh, features):

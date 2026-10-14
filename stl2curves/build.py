@@ -359,6 +359,8 @@ SHARED_TOLERANCE = 0.005    # mm: a flat face mended within this keeps its share
 SHARED_CROWD = 0.02     # mm: a mesh point this near another keeps corners of its own, for sewing to merge
 REJOIN_SNAP = 1e-7      # mm: corners this near one mesh point are that point (copies read back from files)
 MAX_FACE_TOL = 1.0      # mm: a patch's face whose corners or edges needed wider tolerances than this doesn't fit
+WIDE_FUZZ = 1.25        # a patch's last try splits its surface with a fuzzy value this many times
+                        # the furthest its outline corners are off it
 # Experiments, off unless named in the environment variable STL2CURVES_TRY (comma-separated),
 # so each can be tried on its own in full regressions: exact (and swap, see convert)
 TRYING = {x.strip() for x in os.environ.get("STL2CURVES_TRY", "").split(",") if x.strip()}
@@ -1195,7 +1197,14 @@ def _trimmed_cut(feature, bound, mesh, tools, loops, per_loop, tol):
         else:
             ways = (lambda: _split_face(feature, mesh, base, tools, loops, tol),
                     lambda: _outline_face(feature, mesh, base, loops, per_loop))
-        for way in ways + (lambda: _polygon_face(feature, mesh, base, loops),):
+        # (last, the split again with its fuzzy value as wide as the outline strays off the
+        # surface, within MAX_DEVIATION: a fitted fillet can pass a few hundredths off a
+        # corner where it meets the next, and a flat neighbour's chord runs straight past a
+        # curved strip, and the splitter then left the outline open: Rak N-USB's r 1.511
+        # fillets, corners 0.025 mm off, and a 58 mm freeform strip whose chords stray
+        # 0.05 mm mid-edge, came out as one or two pieces of the surface, back to triangles)
+        wide = (lambda: _split_face(feature, mesh, base, tools, loops, tol, WIDE_FUZZ * _off_surface(m, tools)),)
+        for way in ways + (lambda: _polygon_face(feature, mesh, base, loops),) + wide:
             face = way()
             # (a face whose edges needed tolerances of millimetres doesn't fit its outline:
             # on a ring-shaped surface an edge can be laid on the far side of the ring, a
@@ -1204,6 +1213,18 @@ def _trimmed_cut(feature, bound, mesh, tools, loops, per_loop, tol):
             if face is not None and _worst_tolerance(face) <= MAX_FACE_TOL:
                 return face
     return None
+
+
+def _off_surface(m, tools, samples=9):
+    """How far the outline edges stray from the patch's surface at most (sampled), or 0
+    past MAX_DEVIATION (an outline that far off isn't the patch's)."""
+    off = 0.0
+    for edge in tools:
+        c = BRepAdaptor_Curve(edge)
+        a, b = c.FirstParameter(), c.LastParameter()
+        P = np.array([[p.X(), p.Y(), p.Z()] for p in (c.Value(a + (b - a) * t) for t in np.linspace(0, 1, samples))])
+        off = max(off, float(np.abs(m.signed(P)).max()))
+    return off if off <= MAX_DEVIATION else 0.0
 
 
 def _cut_job(job):
@@ -1345,14 +1366,17 @@ def _polygon_face(feature, mesh, base, loops):
     return None
 
 
-def _split_face(feature, mesh, base, tools, loops, tol):
+def _split_face(feature, mesh, base, tools, loops, tol, fuzz=0.0):
     m = feature.model
+    fuzz_was = max(10 * tol, 1e-4, 2 * getattr(m, "rim_dev", 0.0))
+    if fuzz and fuzz <= fuzz_was:
+        return None             # (a retry no wider than the first try)
     splitter = BRepAlgoAPI_Splitter()
     splitter.SetArguments(_shapes([base]))
     splitter.SetTools(_shapes(tools))
     # (a fitted freeform surface passes a little off the outline's corners, which the
     # outline edges run through)
-    splitter.SetFuzzyValue(max(10 * tol, 1e-4, 2 * getattr(m, "rim_dev", 0.0)))
+    splitter.SetFuzzyValue(max(fuzz_was, fuzz))
     # (otherwise it widens the tolerances of the outline edges it is given, in place:
     # those are shared with the faces beside the patch, whose corners came out 8 mm
     # "wide" and then joined to anything)

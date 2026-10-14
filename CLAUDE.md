@@ -276,6 +276,18 @@ Local regression data on this machine (not in the repo):
    export can cut a gentle curve into a few big triangles slanting across it, whose normals
    send every axis guess astray (the gutter mount's r 21 slope). At 0.02 the GPS case
    back's tapped thread failed (1,502 -> 3,032 faces) though other parts gained.
+   Last, islands (`_islands`): a group of up to `ISLAND_FACETS` facets no patch has,
+   every edge of it shared with one patch, joins that patch if it lies on its surface
+   (corners and middles within the patch's own `worst`; facing not asked), or for a
+   blend if it is needle-thin (under `MAX_DEVIATION`) or meets it smoothly. Most are
+   needles a few microns wide lying on a curved patch, left out because a needle's
+   normal points anywhere; a patch with a hole cuts badly and a blend takes one outline
+   only, so each failed, its blends after it (Rak N-USB 47 islands, 4 freeform pieces
+   and 2 fillets failed). Quick set 2,611 -> 2,418 faces (N-USB 808 -> 717, case back
+   759 -> 657), nothing worse, deviation the same; with the wide split below, full
+   regression 10,969 -> 9,696 faces (Rak SMA-USB 1,271 -> 989, N 877 -> 726), 2,837 ->
+   2,674 s, no part worse, validity the same. `features._fill_pinholes` (before
+   blends exist, smooth neighbours only, facing asked) didn't catch them.
 6. **`build.py`** makes one face per feature plus a planar face per remaining flat facet,
    sharing each boundary edge between the two faces beside it (`Edges` cache), then
    sews. `convert._build`/`attempt` then checks the solid: valid, and volume equal to
@@ -287,6 +299,13 @@ Local regression data on this machine (not in the repo):
    facets) blamed for trouble gives up only its facets near it (`features.carve_exact`,
    as freeform patches and thread pieces do), and gets its second chance whole: quick set
    2,908 -> 2,754 faces (Rak N-USB 946 -> 830), full regression -3% faces, -11% time.
+   A trimmed face's last try (after split, outline and polygon) splits again with the
+   fuzzy value `WIDE_FUZZ` times as wide as its outline edges stray off its surface
+   (sampled, at most `MAX_DEVIATION`): a fitted fillet can pass a few hundredths off a
+   corner where it meets the next, a flat neighbour's chord runs straight past a curved
+   strip mid-edge, and the splitter left the outline open (Rak N-USB's two r 1.511
+   fillets, corners 0.025 mm off, now build; +4 faces nearby, deviation the same). Only
+   a last try, so faces that built before are unchanged.
    A single mesh edge along a trimmed outline gets an arc bowed onto the patch's surface
    only if the bow is possible on it (`_tightest_radius`), else the chord. After
    `TROUBLE_SECONDS` per body the drop loop "hurries": `culprits` blames every patch
