@@ -52,6 +52,8 @@ SAME_FACETS = 30            # a cylinder, torus or sphere found over this many f
 SAME_TOL = 0.003 * ACCURACY   # mm: ... takes in a strip beside it whose corners lie this near it,
 SAME_TILT_DEG = 10          # ... fitted as nearly the same surface: axes within this,
 SAME_SHARE = 0.15           # ... radii (and sphere centres) within this share
+JOINT_STRAY = 0.25          # two such pieces become one if a surface fitted to both holds all
+                            # their facets to the mesh tolerance but this share of the smaller's
 CORNER_FIT_FACETS = 8       # a smooth area of at least this many facets ...
 CORNER_FIT_DEV = 0.005 * ACCURACY  # mm: ... every corner this near a cylinder fitted to them is
                             # one (at 0.02 the GPS case back's tapped thread failed: 1,502 -> 3,032)
@@ -1826,6 +1828,7 @@ def _merge_same_surface(mesh, features):
     """Join neighbouring patches that lie on the same surface (a hole split in two by a
     seam in the mesh, say), so each becomes one face."""
     verts = [set(np.concatenate([mesh.fverts[f] for f in x.facets]).tolist()) for x in features]
+    failed = set()      # (pairs refused a joint surface: the loop starts over after each merge)
     merged = True
     while merged:
         merged = False
@@ -1850,30 +1853,100 @@ def _merge_same_surface(mesh, features):
                     if ok:
                         holder = x
                         break
-                if holder is None:
-                    continue
-                fids = np.concatenate([a.facets, b.facets])
-                if not _simple_outline(mesh, fids):
-                    continue                # outline touches itself (e.g. equal holes crossing)
-                # (the outline rules are waived for a sure holder, and for two pieces each
-                # lying on the other's surface: each passed them alone. A box's 63 mm r 2
-                # bottom fillet came as 26 and 12 facets of one cylinder, their long
-                # triangles interleaved, and together failed the outline rules; the 12,
-                # touching one another only at corners, then couldn't be cut)
-                other = b if holder is a else a
-                sure = _sure(holder) or (
-                    other.convex == holder.convex and _holds(mesh, other.model, holder.facets, _tol(), other.convex))
-                both = (_described if sure else _feature)(mesh, holder.model, fids, holder.convex)
+                both = None
+                if holder is not None:
+                    fids = np.concatenate([a.facets, b.facets])
+                    # (outline touching itself, e.g. equal holes crossing: no merge.) The
+                    # outline rules are waived for a sure holder, and for two pieces each
+                    # lying on the other's surface: each passed them alone. A box's 63 mm
+                    # r 2 bottom fillet came as 26 and 12 facets of one cylinder, their
+                    # long triangles interleaved, and together failed the outline rules;
+                    # the 12, touching one another only at corners, then couldn't be cut
+                    if _simple_outline(mesh, fids):
+                        other = b if holder is a else a
+                        sure = _sure(holder) or (
+                            other.convex == holder.convex and _holds(mesh, other.model, holder.facets, _tol(), other.convex))
+                        both = (_described if sure else _feature)(mesh, holder.model, fids, holder.convex)
+                    if both is not None:
+                        verts[i] |= verts.pop(j)
                 if both is None:
-                    continue
+                    # (neither holds the other, or one did but the pair failed the
+                    # outline rules on its surface: one surface fitted to both, if exact,
+                    # pins it down well enough to waive them)
+                    pair = (a.facets.tobytes(), b.facets.tobytes())
+                    if pair in failed:
+                        continue
+                    joint = _joint_surface(mesh, a, b)
+                    both = (_described(mesh, joint[0], joint[1], a.convex)
+                            if joint is not None and _simple_outline(mesh, joint[1]) else None)
+                    if both is None:
+                        failed.add(pair)
+                        continue
+                    verts.pop(j)
+                    verts[i] = set(np.concatenate([mesh.fverts[f] for f in both.facets]).tolist())
                 features[i] = both
-                verts[i] |= verts.pop(j)
                 features.pop(j)
                 merged = True
                 break
             if merged:
                 break
     return features
+
+
+def _joint_surface(mesh, a, b):
+    """One cylinder or torus through every corner of two neighbouring pieces fitted
+    as nearly the same surface (_strip_of), each corner within the mesh tolerance and each
+    facet facing along it; else None. Pieces grown from narrow strips get their surface
+    from those strips (a refit needs whole rings of corners round the axis), a few
+    hundredths off over a short arc, and so don't lie on each other's: a 23 mm ramp
+    whose sides flare (no two strip ends at one height) came out as five pieces, r 22.99
+    to 23.07, where every corner lay within 0.0003 mm of the one true cylinder."""
+    # (cylinders and tori only: over the small patches a sphere is found on, any radius
+    # within a percent fits as well, and two such pieces of the solar bracket, r 9.09
+    # and 9.19, joined as r 9.14 failed to build and took their neighbours with them)
+    if (a.convex != b.convex or not isinstance(a.model, Revolved) or not isinstance(b.model, Revolved)
+            or not _strip_of(a.model, b.model)):
+        return None
+    fids = np.concatenate([a.facets, b.facets])
+    big = a if len(a.facets) >= len(b.facets) else b
+    # (a piece fitted a little off can have taken in a facet or two of the round beside
+    # it, which the true surface leaves out: those are left out and fitted afresh)
+    stray = max(1, int(JOINT_STRAY * min(len(a.facets), len(b.facets))))
+
+    def fit(facets):
+        P = mesh.pts[np.unique(np.concatenate([mesh.fverts[f] for f in facets]))]
+        model = _tube_fit(P, big.model)
+        if model is None:
+            return None, None
+        off = np.array([np.abs(model.signed(mesh.pts[mesh.fverts[f]])).max() > _tol() for f in facets])
+        return model, off
+
+    model, off = fit(fids)
+    if model is None or off.sum() > stray or not _strip_of(big.model, model):
+        return None     # (over a short arc a far other radius fits too: 2.45 and 2.35 gave 1.52)
+    keep = fids
+    if off.any():
+        keep = fids[~off]
+        model, off = fit(keep)
+        if model is None or off.any() or not _strip_of(big.model, model):
+            return None
+    if not _holds(mesh, model, keep, _tol(), a.convex):
+        return None
+    # (and it must reach at least a radius along or round its surface, or the corners
+    # don't pin the radius down: specks of the latch's pocket corners, 0.13 mm of an
+    # r 0.5 round, r 0.57 and 0.50, joined as r 0.49, and their faces left gaps)
+    P = mesh.pts[np.unique(np.concatenate([mesh.fverts[f] for f in keep]))]
+    rho, z, w = model.local(P)
+    u = np.unwrap(np.sort(model.angle(w)))
+    if model.line:
+        reach, r = max(np.ptp(z), rho.mean() * min(np.ptp(u), TWO_PI)), model.line[0]
+    else:
+        rc, zc, r = model.circle
+        tube = np.arctan2(z - zc, rho - rc)
+        reach = max(rc * min(np.ptp(u), TWO_PI), r * np.ptp(np.unwrap(np.sort(tube))))
+    if reach < r:
+        return None
+    return model, keep
 
 
 def _absorb_straddlers(mesh, features):
@@ -1893,37 +1966,49 @@ def _absorb_straddlers(mesh, features):
     for k, f in enumerate(features):
         owner[f.facets] = k
 
-    for g in np.nonzero(owner < 0)[0]:
-        C = mesh.pts[mesh.tris[mesh.ftris[g]]]
-        mids = np.r_[((C + C[:, [1, 2, 0]]) / 2).reshape(-1, 3), C.mean(axis=1)]
-        V = mesh.pts[mesh.fverts[g]]
-        # (a needle-thin facet's own normal means nothing, as in Region)
-        needle = mesh.farea[g] < 0.05 * np.ptp(V, axis=0).max() ** 2
-        if len(mesh.ftris[g]) < 2 and not needle:
-            continue    # an ordinary curved facet the passes left: smooth blends see to those
-        for k in sorted({owner[h] for h in mesh.nbrs[g]} - {-1}):
-            f = features[k]
-            if not isinstance(f.model, (Revolved, Sphere)):
-                continue
-            if np.abs(f.model.signed(V)).max() > STRADDLE_STEPS * _tol(f.model):
-                continue
-            if not needle and abs(mesh.fn[g] @ f.model.normal(mesh.fcent[g][None])[0]) < math.cos(math.radians(NORMAL_DEG)):
-                continue
-            # it must bow off the surface no more than the patch's own facets do (a real
-            # flat, a D-flat on a shaft, has its corners on the surface too, but cuts deeper)
-            if np.abs(f.model.signed(mids)).max() > max(1.5 * f.worst, STRADDLE_STEPS * _tol(f.model)):
-                continue
-            wider = _feature(mesh, f.model, np.r_[f.facets, g], f.convex)
-            if wider is None:
-                _loose, _anchored = True, True
-                try:
-                    wider = _feature(mesh, f.model, np.r_[f.facets, g], f.convex)
-                finally:
-                    _loose, _anchored = False, False
-            if wider is not None:
-                features[k] = wider
-                owner[g] = k
-                break
+    # (again while any join, but then only facets every corner of which is the patch's
+    # already: a needle can have only leftovers beside it until they join their patch.
+    # A 53 mm needle 0.006 mm wide between a wall and its r 1.5 fillet, whose two strips
+    # beside it joined the fillet only after it was passed over, was left a face of its
+    # own, and the fillet blamed for the gap at it. Needles at a fillet's end, where
+    # another crosses it, joined on later passes too, ran it past its end and left a gap)
+    joined, again = True, None
+    while joined:
+        joined, again = False, again is not None
+        for g in np.nonzero(owner < 0)[0]:
+            C = mesh.pts[mesh.tris[mesh.ftris[g]]]
+            mids = np.r_[((C + C[:, [1, 2, 0]]) / 2).reshape(-1, 3), C.mean(axis=1)]
+            V = mesh.pts[mesh.fverts[g]]
+            # (a needle-thin facet's own normal means nothing, as in Region)
+            needle = mesh.farea[g] < 0.05 * np.ptp(V, axis=0).max() ** 2
+            if len(mesh.ftris[g]) < 2 and not needle:
+                continue    # an ordinary curved facet the passes left: smooth blends see to those
+            for k in sorted({owner[h] for h in mesh.nbrs[g]} - {-1}):
+                f = features[k]
+                if not isinstance(f.model, (Revolved, Sphere)):
+                    continue
+                if np.abs(f.model.signed(V)).max() > STRADDLE_STEPS * _tol(f.model):
+                    continue
+                if again and not set(mesh.fverts[g].tolist()) <= set(np.concatenate([mesh.fverts[a] for a in f.facets]).tolist()):
+                    continue
+                if not needle and abs(mesh.fn[g] @ f.model.normal(mesh.fcent[g][None])[0]) < math.cos(math.radians(NORMAL_DEG)):
+                    continue
+                # it must bow off the surface no more than the patch's own facets do (a real
+                # flat, a D-flat on a shaft, has its corners on the surface too, but cuts deeper)
+                if np.abs(f.model.signed(mids)).max() > max(1.5 * f.worst, STRADDLE_STEPS * _tol(f.model)):
+                    continue
+                wider = _feature(mesh, f.model, np.r_[f.facets, g], f.convex)
+                if wider is None:
+                    _loose, _anchored = True, True
+                    try:
+                        wider = _feature(mesh, f.model, np.r_[f.facets, g], f.convex)
+                    finally:
+                        _loose, _anchored = False, False
+                if wider is not None:
+                    features[k] = wider
+                    owner[g] = k
+                    joined = True
+                    break
     return features
 
 

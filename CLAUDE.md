@@ -188,6 +188,24 @@ Local regression data on this machine (not in the repo):
      other's surface at the mesh tolerance merge with the outline rules waived, however
      small (test7's 62 mm bottom fillet came as 26 and 12 facets of one cylinder, their
      triangles interleaved; the 12 couldn't be cut alone): GPS case back -32 faces.
+     Failing both, near-same neighbouring cylinders or tori (`_strip_of`) merge if one
+     surface least-squares fitted to all their corners (`_joint_surface`) holds every
+     facet to the mesh tolerance, leaving out up to `JOINT_STRAY` of the smaller's (a
+     facet of the round beside it), its radius still near the bigger's (2.45 and 2.35
+     fitted 1.52 over a short arc), and reaching a radius along or round its surface
+     (specks at the latch's pocket corners, r 0.57 and 0.50, joined as r 0.49 and left
+     gaps: obj_4 87 -> 100 faces). Not spheres: over the small patches a sphere is found
+     on any radius within a percent fits (the solar bracket's r 9.09 and 9.19 joined as
+     9.14, failed, and took their neighbours with them: +133 faces). Pieces grown from
+     narrow strips keep the strips' guess when no vertex rings allow a refit: the VB SMA
+     mount's ramp, an exact r 23 cylinder whose sides flare, came as 5 pieces of r
+     22.99-23.07 (223 -> 216 faces). Then
+     `_absorb_straddlers` (in snap) repeats its pass while anything joins, later passes
+     taking only facets whose corners are all the patch's: a 53 mm needle beside the
+     case back's r 1.5 fillet was visited before its neighbouring strips had joined the
+     fillet, and its gap got the fillet dropped; needles at a fillet's end, where
+     another crosses it, ran N-USB's r 2 fillet past its end when later passes took any.
+     Quick set 2,646 -> 2,611 faces (case back 795 -> 759).
 
    Thread features are appended after the merge: their models aren't surfaces of
    revolution.
