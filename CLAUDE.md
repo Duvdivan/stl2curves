@@ -591,6 +591,15 @@ Key contracts:
   `HURRY_ROUNDS`. Fresh: 65,175 -> 3,663 faces (unthinned 1,101 in 16 min vs 37: thinning
   hurt this fine CAD export, but helps toolbox.stl, 2,446 vs 5,801 faces; locking curved
   corners in the thinner gave 4,749 there, dropped).
+- The corners shared across a part's attempts (`build.Edges` pool) gather the small
+  widenings each flat face is allowed (`SHARED_TOLERANCE`), attempt after attempt, until
+  sewing loses edges between slivers a few microns apart: gaps near no patch, the same
+  ones whatever is left out, the bare facets included ("could not build a closed solid";
+  Rak Uni and SMA-USB with freeform-refitted blends, 2026-10-15; built bare first they
+  were fine). `attempt` then drops the pool and the face cache and builds once afresh
+  (`pool_tries`). Tried and dropped the same day: refitting blends whose fill fails as
+  freeform surfaces (best: 9,745 faces vs 9,696; a freeform patch beside another fails
+  with it, their shared edge on two fitted surfaces).
 - Big multi-body meshes sew into hundreds of zero-volume shells (coincident face pairs);
   `solids_from_shells` drops them (`EMPTY_SHELL`), or body counts and fuses go wrong.
 

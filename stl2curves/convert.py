@@ -523,6 +523,7 @@ def attempt(mesh, features, mesh_tol, tol, fuse, faceted_volume):
     attempt.blamed = False
     attempt.why = "ok"
     mesh.tries = mesh.__dict__.get("tries", 0) + 1
+    mesh.pool_tries = mesh.__dict__.get("pool_tries", 0) + 1
     progress.step(f"building the solid and checking it (try {mesh.tries}, {len(features)} curved areas)")
     comp, shells, failed = build_faces(mesh, features, mesh_tol)
     if failed:
@@ -535,7 +536,18 @@ def attempt(mesh, features, mesh_tol, tol, fuse, faceted_volume):
     if free:
         # patches whose faces left gaps: drop just those and try again
         attempt.why = "free"
-        return None, culprits(mesh, features, free)
+        blame = culprits(mesh, features, free)
+        if not blame and mesh.pool_tries > 1:
+            # Gaps near no patch: the corners shared across attempts (build.Edges) have
+            # gathered the small widenings each flat face is allowed (SHARED_TOLERANCE)
+            # attempt after attempt, until sewing lost edges between slivers a few
+            # microns apart (Rak Uni: the same 8 gaps whatever was left, even with no
+            # curves at all, and no solid; built bare first it was fine). Afresh, once.
+            mesh.__dict__.pop("corner_pool", None)
+            mesh.__dict__.pop("face_cache", None)
+            mesh.pool_tries = 0
+            return attempt(mesh, features, mesh_tol, tol, fuse, faceted_volume)
+        return None, blame
     try:
         shape, nb, nv, signed = solids_from_shells(sewn, inward_shells(mesh))
     except RuntimeError:
