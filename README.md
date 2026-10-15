@@ -139,7 +139,8 @@ choose it under Options instead.
 Small parts take seconds, typical printed parts of 5,000-15,000 triangles a minute or
 two, and very large ones (hundreds of thousands of triangles) about ten minutes. The
 slow steps run in parallel on all but two of the computer's cores (up to 16 worker
-processes). After the time limit, fitting further freeform faces and hunting down
+processes). After the time limit (counted from when building starts: finding the
+surfaces always runs to the end), fitting further freeform faces and hunting down
 patches that spoil the solid stop, and whatever has checked out by then is kept: the
 result is always a solid matching the mesh, with fewer curves rebuilt the earlier it
 had to stop.

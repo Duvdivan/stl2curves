@@ -578,6 +578,19 @@ Key contracts:
   hence as bodies of their own. Both failures blamed nothing, and the halving search
   then threw away half the part's curves or all of them (test12 of the STL2STEP set:
   42,925 -> 6,246 faces). Look for what blames nothing before tuning what blames.
+  Likewise a cavity let out by a stray face counts as an extra body with nothing invalid
+  and no loose edge: `attempt` blames the patches at the points where a shell lying in
+  a body's box classified as not inside it (`solids_from_shells.straying`) first. A
+  159k-triangle board with 12 cavities (compare/booster) failed that check twice with
+  nothing blamed; the halving search, its time eaten by analysis, then left every curve
+  of the part out (65,273 faces; with the blame 3,663). Two more things took that board
+  (its analysis on the thinned mesh 1,618 s) to all-faceted in a fresh run: the time limit
+  counted the analysis, so the build began out of time (no blends fitted, no search, no
+  second chances): `finish` now starts the clock; and hurry rounds widened four times
+  each round to 512 mm, the whole part: `_hurry_reach` holds at `HURRY_WIDEST` (8 mm) for
+  `HURRY_ROUNDS`. Fresh: 65,175 -> 3,663 faces (unthinned 1,101 in 16 min vs 37: thinning
+  hurt this fine CAD export, but helps toolbox.stl, 2,446 vs 5,801 faces; locking curved
+  corners in the thinner gave 4,749 there, dropped).
 - Big multi-body meshes sew into hundreds of zero-volume shells (coincident face pairs);
   `solids_from_shells` drops them (`EMPTY_SHELL`), or body counts and fuses go wrong.
 

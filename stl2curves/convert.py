@@ -86,9 +86,11 @@ from .read3mf import read_3mf
 
 SEARCH_SECONDS = 600    # time allowed for hunting down patches that spoil the solid
 TROUBLE_SECONDS = 600   # time for dropping troublemakers one by one, per body; then every patch
-HURRY_REACH = 0.5       # mm: this near trouble goes at once, four times as far each further round
+HURRY_REACH = 0.5       # mm: this near trouble goes at once, four times as far each further round ...
+HURRY_WIDEST = 3        # ... up to this round's reach (8 mm) ...
+HURRY_ROUNDS = 10       # ... for this many rounds; past them, wider again without end
 BLAME_TIE = 0.01        # mm: patches this much nearer trouble than another count as level with it
-TIME_LIMIT = 600        # seconds after which the optional refinements stop (--time-limit); see stl_to_solid
+TIME_LIMIT = 600        # seconds of building after which the optional refinements stop (--time-limit); see stl_to_solid
 SWAP_ROUNDS = 6        # STL2CURVES_TRY=swap: rounds of taking blamed patches out again
 FIX_PRECISIONS = (1e-5, 1e-4)   # mm: precisions ShapeFix tries on an invalid solid after its default
 EMPTY_SHELL = 1e-6      # closed shells with less volume than this share of the biggest are dropped
@@ -301,11 +303,17 @@ def solids_from_shells(sewn, inward=True, specks=False):
             return False
         if body[3] is None:
             body[3] = BRepClass3d_SolidClassifier(body[0])
+        out = []
         for p in pts:
             body[3].Perform(p, 1e-6)
             if body[3].State() != TopAbs_IN:
-                return False
-        return True
+                out.append((p.X(), p.Y(), p.Z()))
+        if out:
+            # (a shell wholly within a body's box but not wholly inside it: a cavity
+            # that a stray face let out, the likeliest culprit if it now counts as a
+            # body; see attempt)
+            straying.extend(out)
+        return not out
 
     def box(shape):
         b = Bnd_Box()
@@ -316,6 +324,7 @@ def solids_from_shells(sewn, inward=True, specks=False):
     # A cavity lies wholly inside its host; an overlapping body (a rib sunk into a
     # floor, say) has some corners outside, and gets fused on instead.
     bodies, cavities, total = [], [], 0.0      # bodies: [outer solid, [cavity solids], box, classifier]
+    straying = solids_from_shells.straying = []
     for shell, solid, v in shells:
         pts = points_of(shell) if bodies and inward else None
         host = next((b for b in bodies if inside(b, pts)), None) if pts else None
@@ -540,7 +549,12 @@ def attempt(mesh, features, mesh_tol, tol, fuse, faceted_volume):
         # its surface, not inside it). Blamed as for the volume; blaming nothing left the
         # halving search to throw away every curve of the part (53k triangles -> 42,925 faces).
         attempt.why = "bodies"
-        return None, _invalid_blame(mesh, features, shape, sewing)
+        # (first the patches where a shell inside a body's box came out of it: blaming
+        # only invalid faces and loose edges, a 159k-triangle board with 12 cavities had
+        # nothing to blame, and the halving search ran out of time with every curve of
+        # the part left out: 65,273 faces)
+        return None, (culprits(mesh, features, solids_from_shells.straying)
+                      or _invalid_blame(mesh, features, shape, sewing))
     change = sum(f.change for f in features)
     expected = faceted_volume + change
     allowed = sum(f.tolerance for f in features) + 1e-6 * abs(faceted_volume) + 1e-3
@@ -811,6 +825,17 @@ def _bare_ahead(mesh, tol):
             mesh.__dict__.pop("bare_ahead", None)
 
 
+def _hurry_reach(hurry):
+    """How near trouble a patch goes in hurry round `hurry` (mm; 0: not hurrying). The
+    reach grows only to HURRY_WIDEST's for HURRY_ROUNDS rounds: growing four times every
+    round, a 159k-triangle board whose trouble kept turning up somewhere new (one cavity
+    let out after another) lost 1,765 curved patches in three rounds, every curve of the
+    part (65,175 faces; capped, 48,044: the rest was the time limit, see finish)."""
+    if hurry <= 0:
+        return HURRY_REACH      # (what carving uses before any hurry)
+    return HURRY_REACH * 4 ** ((min(hurry, HURRY_WIDEST) if hurry <= HURRY_ROUNDS else hurry - HURRY_ROUNDS + HURRY_WIDEST) - 1)
+
+
 def culprits(mesh, features, points):
     """Which patches to drop for trouble at these points: the smooth blends right there if
     any (they give back the exact pieces they replaced), else just the patch nearest to
@@ -819,7 +844,7 @@ def culprits(mesh, features, points):
     mesh.trouble = points       # (a big freeform patch blamed gives up just its facets near them)
     hurry = mesh.__dict__.get("hurry", 0)
     if hurry:
-        return features_near(mesh, features, points, reach=HURRY_REACH * 4 ** (hurry - 1))
+        return features_near(mesh, features, points, reach=_hurry_reach(hurry))
     near = features_near(mesh, features, points)
     if not near:
         return []
@@ -1035,13 +1060,13 @@ def _build(mesh, features, mesh_tol, tol, fuse, info):
                     # facets there; one that won't build (or would lose half of itself)
                     # the smooth blends its area would have had otherwise
                     carved = attempt.blamed and carve(mesh, f, mesh.__dict__.get("trouble"),
-                                                      HURRY_REACH * 4 ** max(0, mesh.hurry - 1))
+                                                      _hurry_reach(mesh.hurry))
                     if carved:
                         back += carved
                         continue
                     halves = blend_fallback(mesh, f)
                 elif f.model.kind == "thread" and attempt.blamed and (carved := thread_carve(
-                        mesh, f, mesh.__dict__.get("trouble"), HURRY_REACH * 4 ** max(0, mesh.hurry - 1))):
+                        mesh, f, mesh.__dict__.get("trouble"), _hurry_reach(mesh.hurry))):
                     back += carved      # (a thread piece likewise: only its facets near the trouble)
                     # (and whole again in the second chance below, if the part builds
                     # with it then: dropped pieces often do, carved ones never got to)
@@ -1053,7 +1078,7 @@ def _build(mesh, features, mesh_tol, tol, fuse, info):
                 elif f.kind != "blend" and len(f.parts) == 1 and f.parts[0].model.kind == "pipe":
                     halves = list(f.parts)      # (a pipe found to be a cylinder or torus: the pipe again)
                 elif attempt.blamed and (carved := carve_exact(
-                        mesh, f, mesh.__dict__.get("trouble"), HURRY_REACH * 4 ** max(0, mesh.hurry - 1))):
+                        mesh, f, mesh.__dict__.get("trouble"), _hurry_reach(mesh.hurry))):
                     back += carved      # (a big exact patch likewise: only its facets near the trouble,
                     f.parts = tuple(carved)     # and whole again in the second chance if the part takes it)
                     blamed.append(f)
@@ -1165,8 +1190,9 @@ def _build(mesh, features, mesh_tol, tol, fuse, info):
 
 def stl_to_solid(*args, time_limit=TIME_LIMIT, **kwargs):
     """Convert one STL: (shape, info). See _stl_to_solid. time_limit (seconds, None for
-    none): fitting blends and hunting down troublemakers stop at their share of it, and
-    whatever has checked out by then is handed over."""
+    none, counted from the end of the analysis, see finish): fitting blends and hunting
+    down troublemakers stop at their share of it, and whatever has checked out by then is
+    handed over."""
     features_mod._budget = time_limit
     features_mod._deadline = time.time() + time_limit if time_limit else None
 
@@ -1289,6 +1315,12 @@ def _analyze_body(pts, tris, i, n):
 def finish(parts, info, part, tol, fuse=True):
     """The rest of a conversion, from prepare()'s parts (whose features may have been
     edited in between): each body built and checked, joined, tidied: (shape, info)."""
+    # The time limit counts from here: analysis always runs to the end, and counted
+    # against the limit it left a 159k-triangle board (1,618 s of analysis) no time to fit
+    # blends or search for culprits, every curve of the part then lost (65,175 faces;
+    # with the build's own time, 3,663)
+    if features_mod._budget:
+        features_mod._deadline = time.time() + features_mod._budget
     shapes, nb, nv = [], 0, 0
     info["used"] = []           # (each body's features as built, for stl2curves.studio)
     for i, (mesh, features, mesh_tol) in enumerate(parts):
@@ -1552,8 +1584,8 @@ def main():
                     help=f"thin out the mesh first, moving its surface by at most MM (0: never; default: "
                          f"{SIMPLIFY_ERROR} mm for meshes over {AUTO_SIMPLIFY:,} triangles)")
     ap.add_argument("--time-limit", type=float, metavar="SECONDS", default=TIME_LIMIT,
-                    help=f"stop fitting blends and hunting down troublemakers after about this long "
-                         f"and keep what checks out (0: no limit; default {TIME_LIMIT})")
+                    help=f"stop fitting blends and hunting down troublemakers after building for about "
+                         f"this long and keep what checks out (0: no limit; default {TIME_LIMIT})")
     ap.add_argument("--true-size", action="store_true",
                     help="rebuild at the apparent design size, with radii snapped to round values")
     ap.add_argument("--accuracy", type=float, metavar="MM", default=accuracy.mm(),
