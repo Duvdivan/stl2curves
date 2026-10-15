@@ -97,7 +97,11 @@ Local regression data on this machine (not in the repo):
 
 1. **`repair.py`** mends the mesh (duplicates, zero-thickness pairs, slivers, cracks,
    stray flaps on a still-open mesh, orientation, holes, small self-crossings). **`simplify.py`** thins meshes over
-   150k triangles with a strict error bound (vertices never move off the surface).
+   a million triangles with a strict error bound (vertices never move off the surface);
+   below that it costs curves and time (`convert.AUTO_SIMPLIFY`: 150k until 2026-10-15,
+   when nine meshes of ten, 89k-396k triangles, did better unthinned, test plates in
+   compare/thinmix; the toolbox did better thinned only because its dropped fillets
+   cost fewer faces).
 2. **`bodies.py`** splits bodies that only touch along an edge; each is built on its own
    and fused at the end. A 3MF object's parts (`read3mf` labels each triangle) are
    likewise repaired and built one by one and fused (`_repair_parts`): Bambu

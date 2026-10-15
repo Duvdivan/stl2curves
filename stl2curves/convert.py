@@ -31,7 +31,7 @@ Usage:
                    snapped to round values
   --details        list every rebuilt feature with its size
   --simplify MM    thin out an over-dense mesh first, moving its surface by at most MM
-                   (0: never; by default meshes over 150,000 triangles, at 0.005 mm)
+                   (0: never; by default meshes over 1,000,000 triangles, at 0.005 mm)
   --no-repair      don't mend mesh defects first
 """
 import argparse
@@ -119,7 +119,14 @@ UNIFY_TOL = 0.001       # mm: faces this close to one surface are merged at the 
 UNIFY_DEG = 0.1         # ... if their normals agree this closely
 UNIFY_VOLUME = 1e-3     # and kept if the volume stays this close (the integration itself
                         # wobbles by a few mm^3 on a big part)
-AUTO_SIMPLIFY = 150000  # meshes with more triangles than this are thinned out first ...
+AUTO_SIMPLIFY = 1000000 # meshes with more triangles than this are thinned out first ...
+                        # (only for memory and time: thinned, a fine CAD export's rows of corners
+                        # along each curve become slivers across it, which no surface is found on,
+                        # and analysis grinds; 2026-10-15, ten meshes of 89k-396k triangles each
+                        # converted both ways: unthinned did better in nine, mostly far better (a
+                        # 396k plate 13,476 faces in 1,366 s vs 29,968 in 3,661 s; a 159k board
+                        # 1,101 vs 3,663; the instrument body 205 vs 20,881), the tenth (the toolbox,
+                        # 2,446 thinned vs 5,801) only because its dropped fillets cost fewer faces)
 SIMPLIFY_ERROR = 0.005  # ... moving the surface by at most this (mm)
 
 

@@ -75,8 +75,8 @@ download (after `pip install -r requirements.txt` there) without installing the 
 Options: `--tol` sewing tolerance (mm), `--no-fuse` keep overlapping bodies separate,
 `--no-curves` flat faces only, `--no-blends` no smooth freeform faces (exact surfaces
 and flat facets only), `--no-repair` take the mesh as it is, `--simplify MM` thin out
-the mesh first (moving its surface by at most MM; meshes over 150,000 triangles are
-thinned by 0.005 mm automatically), `--time-limit SECONDS` (default 600, 0 for none),
+the mesh first (moving its surface by at most MM; meshes over 1,000,000 triangles are
+thinned by 0.005 mm automatically; thinning a fine export loses curves, so only for size), `--time-limit SECONDS` (default 600, 0 for none),
 `--accuracy MM` how far smooth surfaces, fillets on rough meshes and other fitted surfaces
 may stray from the mesh (default 0.1): a looser setting rebuilds more of the part as
 curves instead of leaving it as triangles, a tighter one keeps it closer to the mesh. At
@@ -161,7 +161,7 @@ Without it the size is left alone (a slight scale is often deliberate, for fit).
 1. **Facets** — the mesh is mended first (`repair.py`: duplicate and zero-thickness
    triangles, slivers, cracks, stray flaps, flipped triangles, holes and small
    self-crossings), and
-   meshes over 150,000 triangles are thinned out (`simplify.py`) without moving their
+   meshes over 1,000,000 triangles are thinned out (`simplify.py`) without moving their
    surface more than 0.005 mm. Triangles are then grouped into flat facets (coplanar
    pieces): sliver triangles (three corners in a line) are split away, and when the
    file rounded its coordinates (many exports write 0.001 mm steps) the rounding noise is
