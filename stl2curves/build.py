@@ -1470,6 +1470,7 @@ FINE_BLENDS = 150       # a part with more blends than this is mostly freeform: 
 PARALLEL_FILLS = 40     # without worker processes, more fills than this start them
 FILL_SECONDS = 5        # a fill in a worker process still running after this long counts as failed
 ASSESS_SECONDS = 60     # longest wait for the fit checks of a batch of fills (behind overrunning fills)
+ASSESS_RUN_SECONDS = 5  # a fit check still running after this long fails its blend
 BUILD_SHARE = 0.35      # of the conversion's time limit, what is kept back for building and checking
                         # the part (blends not fitted by then keep their exact pieces or facets)
 
@@ -1570,10 +1571,27 @@ def _fill_all(jobs):
             # to finish it, and the workers are restarted once the part is done. Checks
             # queued behind such fills are waited for only so long: unjudged, a face is
             # judged later, here)
-            wait(list(judged.values()), timeout=ASSESS_SECONDS)
+            # A check takes milliseconds; one still running after ASSESS_RUN_SECONDS is on a
+            # surface the projections can't settle on (Rak N-USB: a 6-facet blend's check
+            # ran 115 s, and the part waited 60 s for it, then 25 s for another): it fails.
+            began, pending, start = {}, set(judged.values()), time.time()
+            while pending:
+                _, pending = wait(pending, timeout=0.1, return_when=FIRST_COMPLETED)
+                now = time.time()
+                for f in pending:
+                    if f.running():
+                        began.setdefault(f, now)
+                overran = {f for f in pending if f in began and now - began[f] > ASSESS_RUN_SECONDS}
+                if now - start > ASSESS_SECONDS or (overran and all(
+                        f in overran or (f not in began and now - start > ASSESS_RUN_SECONDS) for f in pending)):
+                    break
+            now = time.time()
             for key, f in judged.items():
                 if f.done() and not f.cancelled() and f.exception() is None:
                     out[key] = (out[key][0], f.result())
+                elif f in began and now - began[f] > ASSESS_RUN_SECONDS:
+                    out[key] = (out[key][0], False)
+                    workers.abandoned()
         except Exception:
             out = {}                    # (the worker processes broke down: do them here)
             workers.broken()

@@ -162,6 +162,14 @@ def volume(shape):
 _volumes = []
 
 
+def _quick_volume(shape):
+    """OCC's volume with its default (fixed) integration: quick, but off on long spline
+    faces (see volume). For comparing a shape with a copy of itself."""
+    props = GProp_GProps()
+    BRepGProp.VolumeProperties_s(shape, props)
+    return props.Mass()
+
+
 def tessellated_volume(shape):
     """The volume a fine tessellation of the shape's faces encloses, or None if a face
     won't tessellate. OCC integrates face by face, each over its own surface; where the
@@ -695,6 +703,13 @@ def file_trouble(shape, allowed):
     check = BRepCheck_Analyzer(back, True, True)
     # (a reader may split a face in two: harmless, so faces aren't counted)
     if check.IsValid():
+        # (first OCC's quick integration on both: off on long spline faces, but the same
+        # way on a copy that came back the same, and a tenth of the time (Rak N-USB:
+        # 0.4 s, not 5, on each of its seven accepted tries); if they differ, as they do
+        # by more than the adaptive volumes where the reader lays out edges afresh, the
+        # adaptive ones decide)
+        if abs(_quick_volume(back) - _quick_volume(shape)) <= allowed:
+            return None
         if abs(volume(back) - volume(shape)) <= allowed:
             return None
         # OCC's integration goes astray on long helical spline faces, and differently in
