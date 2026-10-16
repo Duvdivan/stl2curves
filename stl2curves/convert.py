@@ -569,8 +569,12 @@ def attempt(mesh, features, mesh_tol, tol, fuse, faceted_volume):
     except RuntimeError:
         attempt.why = "nosolid"
         return None, []
-    _mesh_defective(mesh, tol, fuse)
-    if mesh.bare_bodies and nb > mesh.bare_bodies:
+    # (the bare facets' build is waited for only where its answer can matter: one body
+    # can't be more than the bare facets make, and on a big mesh that build takes a
+    # while: the instrument body's first try waited 69 s for it)
+    if nb > 1:
+        _mesh_defective(mesh, tol, fuse)
+    if nb > 1 and mesh.bare_bodies and nb > mesh.bare_bodies:
         # A body the bare facets don't make: a face ran off somewhere, or a cavity passed
         # for a body because edges beside it had their tolerance widened by millimetres
         # (20 mm on a part with six slots inside: every slot's corners classified as on
@@ -597,8 +601,8 @@ def attempt(mesh, features, mesh_tol, tol, fuse, faceted_volume):
         # a mesh whose bare facets already don't add up to its volume (it crosses itself,
         # or is many bodies touching at corners, some too thin to make a solid) is
         # measured against what the bare facets give instead
-        drift = abs(mesh.bare_volume - faceted_volume) if mesh.bare_volume is not None else None
         defective = _mesh_defective(mesh, tol, fuse)
+        drift = abs(mesh.bare_volume - faceted_volume) if mesh.bare_volume is not None else None
         # (a sound mesh only by what flattening its facets moves: anything more would be
         # the bare build itself going wrong, and is no reference)
         if drift is None or (not defective and drift > BARE_DRIFT * abs(faceted_volume) + 1e-3):
@@ -613,6 +617,7 @@ def attempt(mesh, features, mesh_tol, tol, fuse, faceted_volume):
             return None, _invalid_blame(mesh, features, shape, sewing)
     check = BRepCheck_Analyzer(shape, True, True)
     if not check.IsValid():
+        _mesh_defective(mesh, tol, fuse)        # (mesh.defective, below)
         mended = None
         # (zero-area specks that sewing left in a shell, joined to nothing: looked for only
         # now, finding them takes a second or so on a few thousand faces)
@@ -1229,6 +1234,9 @@ def _build(mesh, features, mesh_tol, tol, fuse, info):
             else:
                 info["skipped"] = skipped
     info["restored"] += used
+    ahead = mesh.__dict__.pop("bare_ahead", None)
+    if ahead is not None and not ahead.cancel() and not ahead.done():
+        workers.abandoned()     # (the bare facets' build, never needed, still running: see attempt)
     shape, nb, nv = result
     if fuse and nb > 1:
         shape = fuse_overlapping(shape)
