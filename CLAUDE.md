@@ -303,6 +303,13 @@ Local regression data on this machine (not in the repo):
    facets) blamed for trouble gives up only its facets near it (`features.carve_exact`,
    as freeform patches and thread pieces do), and gets its second chance whole: quick set
    2,908 -> 2,754 faces (Rak N-USB 946 -> 830), full regression -3% faces, -11% time.
+   Second chances are worth their time (without them the GPS case back 657 -> 1,067
+   faces), but each trial builds and sews the whole part: a failed trial's blame is
+   followed (`BLAME_GUIDED`: the rest of the group straight back in, then each blamed
+   patch alone) before halving (case back 165 -> 131 s, same faces; leaving the blamed
+   ones out for good lost 2% of the curves). The STEP read-back compares OCC's quick
+   volume integration of part and copy before the adaptive one (`_quick_volume`: off on
+   spline faces, the same way on both; 0.4 s instead of 5 on N-USB).
    A trimmed face's last try (after split, outline and polygon) splits again with the
    fuzzy value `WIDE_FUZZ` times as wide as its outline edges stray off its surface
    (sampled, at most `MAX_DEVIATION`): a fitted fillet can pass a few hundredths off a
@@ -330,7 +337,11 @@ Speed (`workers.py`): OpenCascade and small-array numpy hold the GIL, so paralle
 runs in a shared process pool (up to 16 workers, fewer if free memory is short: each
 holds its own copy of the mesh, ~1.5 KB a triangle, over a gigabyte on a 900k-triangle
 mesh), started in the background once a mesh has 3,000+ triangles and kept for further
-parts of the same run. Shapes cross processes
+parts of the same run. Launching a process takes a second or so on this machine however
+it is done (16 took 16-18 s, in parallel threads too), so the pool is handed out as soon
+as its first worker answers and the rest join as they come up (Python's own lazy
+launching, which would stall the submitting thread, is switched off): small parts lost
+up to 11 s of 30 waiting for all 16. Shapes cross processes
 as BRep files, the mesh once per pass via `workers.share`/`load`. What runs there:
 
 - The seed passes (pass 1, loose pass, axis passes: `features._seed_pass`), per region,
@@ -341,7 +352,9 @@ as BRep files, the mesh once per pass via `workers.share`/`load`. What runs ther
   in the main process in patch order (`_trimmed_outline`; a run two patches share is
   built once, by whichever comes first), the slow cut (`_trimmed_cut`) in the workers.
   The first build of the GPS case went from 148 s to 12 s.
-- Blend fills (each capped at `FILL_SECONDS`) and their fit checks (`_assess_blend`),
+- Blend fills (each capped at `FILL_SECONDS`) and their fit checks (`_assess_blend`, a
+  check still running after `ASSESS_RUN_SECONDS` fails its blend: Rak N-USB waited 60 s
+  for one 6-facet blend's check, which ran 115 s),
   the bare-facet build (`_bare_ahead`), and the final fuse (capped at `FUSE_SECONDS`).
 - `TIME_LIMIT` (`--time-limit`) only stops optional refinement (blends, culprit search,
   second chances); analysis always runs to the end (cutting it gave garbage).
@@ -527,7 +540,16 @@ Key contracts:
   that convert must have an `if __name__ == "__main__"` guard (workers re-import them).
 - Profiling: cProfile inflates small functions; py-spy on Windows hangs or samples the
   launcher. A sampling thread over `sys._current_frames()`, weighted by elapsed time
-  (long OCC calls hold the GIL), works well.
+  (long OCC calls hold the GIL), works well. `compare/timing/timeline.py PART OUT.json`
+  (2026-10-16) times a fresh conversion step by step (progress steps plus wrapped
+  functions; `summary.py` sums them); to speed up one function, pickle its inputs on a
+  real part and race old against new on them, checking the outputs are identical
+  (`compare/timing/bw`, `mg`, `th`). Measured then (10 parts, 2,472 s): rebuilds after
+  drops 37%, fillets between walls 17%, thread search 8%. Fixed: `_between_walls` tried
+  each radius alone, through numpy's pinv per point (toolbox 367 -> 35 s), and
+  `_merge_same_surface` re-tested every pair after every merge (toolbox 214 -> 7 s).
+  Compare times only between runs made the same day, back to back (`timing/ab.sh`):
+  the same code ran small parts twice as slow one day as the day before.
 - `repair` cuts out small self-crossing knots and patches the hole; on a fine mesh the
   "knot" can be thousands of triangles whose hole doesn't patch, which left a watertight
   900k-triangle mesh open and unbuildable. A cut is kept only if its patch closes.

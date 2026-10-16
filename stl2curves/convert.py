@@ -111,6 +111,7 @@ LOOSE_EDGE = 3.0        # an edge whose tolerance is this many times the sewing'
 FILE_VOLUME = 1e-3      # share of the volume a finished part's STEP file may read back off by
 FILE_MATCH = 0.05       # mm (and share): how far a face's middle or outline may move read back from the file
 FILE_AREA = 0.5         # mm^2 (plus half a percent): how much a face's area may change read back from the file
+BLAME_GUIDED = True     # second chances follow what a failed try blames, before halving the group
 FILE_ROUNDS = 3         # rounds of patches dropped for what their STEP file does, at most, per body
 FILE_CHECK_FACES = 50000    # a part of more faces (facets, while building) isn't written and read back:
                             # on 218k faces that took longer than the whole build
@@ -1160,8 +1161,21 @@ def _build(mesh, features, mesh_tol, tol, fuse, info):
                 result, subset = got, trial
                 info["skipped"] = [f for f in info["skipped"] if all(f is not b for b in group)]
             elif len(group) > 1:
-                again(group[:len(group) // 2])
-                again(group[len(group) // 2:])
+                # (the try names its culprits: the rest of the group goes straight back
+                # in, then each one named alone, as it may only clash with another.
+                # Halving blindly took more tries, each building and sewing the whole
+                # part: GPS case back 165 -> 131 s, Rak N-USB 173 -> 155 s, same faces;
+                # leaving the named ones out for good lost 2% of the curves)
+                named = {id(trial[k]) for k in drop if 0 <= k < len(trial)}
+                rest = [g for g in group if id(g) not in named]
+                if BLAME_GUIDED and 0 < len(rest) < len(group):
+                    again(rest)
+                    for g in group:
+                        if id(g) in named:
+                            again([g])
+                else:
+                    again(group[:len(group) // 2])
+                    again(group[len(group) // 2:])
 
         if result is not None:
             again(blamed)
