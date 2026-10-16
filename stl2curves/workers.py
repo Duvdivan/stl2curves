@@ -172,6 +172,25 @@ def stop():
 atexit.register(stop)
 
 
+def _stop_launching():
+    """At interpreter shutdown, before concurrent.futures' own handler: stop launching
+    workers (the one under way finished) and stop them. That handler tells the workers it knows of to
+    quit and waits for them all, so one launched after it looked never heard and the
+    program never ended (a part converted in 11 s, its workers still coming up, then
+    hung)."""
+    global _cancel
+    _cancel = True
+    if _starting is not None:
+        _starting.join()
+    # (and the workers stopped outright: told to quit, each still coming up finished
+    # loading first, 5 s on a small part's exit)
+    stop()
+
+
+# (threading's exit handlers run last-registered first: this one before the pool's)
+threading._register_atexit(_stop_launching)
+
+
 def _terminate(pool):
     for p in list((getattr(pool, "_processes", None) or {}).values()):
         p.terminate()
