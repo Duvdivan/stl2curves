@@ -454,17 +454,40 @@ def _grow_exact(mesh, out):
 
 def _onto_spine(P, walls, targets, steps=20):
     """The points P moved onto the curve where each wall's signed distance is its
-    target (least moves: Gauss-Newton on the two distances)."""
+    target (least moves: Gauss-Newton on the two distances). A target may be one value
+    per point, so many radii are tried in one go (_rolled)."""
     C = np.array(P, float)
+    T = [np.broadcast_to(np.asarray(t, float), (len(C),)) for t in targets]
+    live = np.arange(len(C))
     for _ in range(steps):
-        f = np.stack([w.signed(C) - t for w, t in zip(walls, targets)], axis=1)
-        J = np.stack([w.normal(C) for w in walls], axis=1)
-        step = np.einsum("nij,nj->ni", np.linalg.pinv(np.einsum("nij,nkj->nik", J, J)), f)
-        move = np.einsum("nij,ni->nj", J, step)
-        C = C - move
-        if not len(move) or np.abs(move).max() < 1e-10:
-            break       # (settled: Gauss-Newton gets there in a few steps; always 20 cost 70 s on a big part)
+        if not len(live):
+            break
+        X = C[live]
+        f = np.stack([w.signed(X) - t[live] for w, t in zip(walls, T)], axis=1)
+        J = np.stack([w.normal(X) for w in walls], axis=1)
+        move = np.einsum("nij,ni->nj", J, _solve2(J, f))
+        C[live] = X - move
+        # (each point stops once settled: Gauss-Newton gets there in a few steps; always
+        # 20 cost 70 s on a big part)
+        live = live[np.abs(move).max(axis=1) >= 1e-10]
     return C
+
+
+def _solve2(J, f):
+    """Per point, pinv(J J^T) f for the 2 x 2 matrix J J^T: in closed form, and by numpy's
+    pinv only where the two walls' normals are (nearly) parallel (pinv on every point was
+    most of the time _between_walls took: 367 s on the toolbox)."""
+    a = np.einsum("ni,ni->n", J[:, 0], J[:, 0])
+    b = np.einsum("ni,ni->n", J[:, 0], J[:, 1])
+    c = np.einsum("ni,ni->n", J[:, 1], J[:, 1])
+    det = a * c - b * b
+    ok = det > 1e-9 * np.maximum(a * c, 1e-300)
+    d = np.where(ok, det, 1.0)
+    out = np.stack([(c * f[:, 0] - b * f[:, 1]) / d, (a * f[:, 1] - b * f[:, 0]) / d], axis=1)
+    if not ok.all():
+        bad = ~ok
+        out[bad] = np.einsum("nij,nj->ni", np.linalg.pinv(np.einsum("nij,nkj->nik", J[bad], J[bad])), f[bad])
+    return out
 
 
 def _between_walls(mesh, features):
@@ -527,17 +550,25 @@ def _rolled(mesh, features, pair, pieces):
     def misfit(r, side):
         Q = _onto_spine(P, walls, [side * air[0] * r, side * air[1] * r])
         return np.abs(np.linalg.norm(P - Q, axis=1) - r)
+
+    def scores(rs, side):
+        """The median misfit at each radius of rs, all projected at once (one radius at
+        a time, the case back spent 47 s here)."""
+        R = np.repeat(rs, len(P))
+        Ps = np.tile(P, (len(rs), 1))
+        Q = _onto_spine(Ps, walls, [side * air[0] * R, side * air[1] * R])
+        return np.median(np.abs(np.linalg.norm(Ps - Q, axis=1) - R).reshape(len(rs), len(P)), axis=1)
     best = None
+    grid = np.geomspace(0.2, pipes.MAX_RADIUS, 60)
     for side in (1, -1):        # (the centre in the air: a fillet in a corner; in the material: a rounded edge)
-        for r in np.geomspace(0.2, pipes.MAX_RADIUS, 60):
-            score = float(np.median(misfit(r, side)))
+        for r, score in zip(grid, scores(grid, side)):
             if best is None or score < best[0]:
-                best = (score, r, side)
+                best = (float(score), r, side)
     _, r, side = best
-    for rr in np.linspace(0.9 * r, 1.1 * r, 41):
-        score = float(np.median(misfit(rr, side)))
+    fine = np.linspace(0.9 * r, 1.1 * r, 41)
+    for rr, score in zip(fine, scores(fine, side)):
         if score < best[0]:
-            best = (score, rr, side)
+            best = (float(score), rr, side)
     _, r, side = best
     off = dict(zip(V.tolist(), misfit(r, side)))
     on = np.array([max(off[v] for v in mesh.fverts[a]) <= BETWEEN_TOL for a in fac])
