@@ -1826,16 +1826,28 @@ def _sure(f):
 
 def _merge_same_surface(mesh, features):
     """Join neighbouring patches that lie on the same surface (a hole split in two by a
-    seam in the mesh, say), so each becomes one face."""
+    seam in the mesh, say), so each becomes one face. The loop starts over after each merge; pairs that touch are
+    found through their corners, and a pair found not to merge is skipped from then on
+    (its outcome depends only on the two features, the same objects until one merges):
+    trying every pair again after every merge took the toolbox 214 s, now 7."""
     verts = [set(np.concatenate([mesh.fverts[f] for f in x.facets]).tolist()) for x in features]
-    failed = set()      # (pairs refused a joint surface: the loop starts over after each merge)
+    failed = set()      # (pairs refused a joint surface)
+    refused = {}        # (id(a), id(b)) -> (a, b): pairs that didn't merge (kept alive, so ids stay theirs)
+    users = {}          # corner -> ids of the features using it
+    for x, vs in zip(features, verts):
+        for v in vs:
+            users.setdefault(v, set()).add(id(x))
     merged = True
     while merged:
         merged = False
+        index = {id(x): k for k, x in enumerate(features)}
         for i in range(len(features)):
-            for j in range(i + 1, len(features)):
+            near = set()
+            for v in verts[i]:
+                near |= users[v]
+            for j in sorted(index[q] for q in near if index.get(q, -1) > i):
                 a, b = features[i], features[j]
-                if not (verts[i] & verts[j]):
+                if (id(a), id(b)) in refused:
                     continue
                 # (one surface holding both is enough. And a cylinder found over
                 # SAME_FACETS facets or more, sure of itself, takes in a strip beside it
@@ -1868,22 +1880,32 @@ def _merge_same_surface(mesh, features):
                             other.convex == holder.convex and _holds(mesh, other.model, holder.facets, _tol(), other.convex))
                         both = (_described if sure else _feature)(mesh, holder.model, fids, holder.convex)
                     if both is not None:
-                        verts[i] |= verts.pop(j)
+                        new_verts = verts[i] | verts[j]
                 if both is None:
                     # (neither holds the other, or one did but the pair failed the
                     # outline rules on its surface: one surface fitted to both, if exact,
                     # pins it down well enough to waive them)
                     pair = (a.facets.tobytes(), b.facets.tobytes())
                     if pair in failed:
+                        refused[id(a), id(b)] = (a, b)
                         continue
                     joint = _joint_surface(mesh, a, b)
                     both = (_described(mesh, joint[0], joint[1], a.convex)
                             if joint is not None and _simple_outline(mesh, joint[1]) else None)
                     if both is None:
                         failed.add(pair)
+                        refused[id(a), id(b)] = (a, b)
                         continue
-                    verts.pop(j)
-                    verts[i] = set(np.concatenate([mesh.fverts[f] for f in both.facets]).tolist())
+                    new_verts = set(np.concatenate([mesh.fverts[f] for f in both.facets]).tolist())
+                # (both takes a's place, b goes)
+                for v in verts[i]:
+                    users[v].discard(id(a))
+                for v in verts[j]:
+                    users[v].discard(id(b))
+                for v in new_verts:
+                    users.setdefault(v, set()).add(id(both))
+                verts[i] = new_verts
+                verts.pop(j)
                 features[i] = both
                 features.pop(j)
                 merged = True
