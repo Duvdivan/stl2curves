@@ -1230,9 +1230,11 @@ def _off_surface(m, tools, samples=9):
 def _cut_job(job):
     """In a worker process: _trimmed_cut for one patch, its outline edges read from and
     its face written to BRep files."""
-    mesh_key, feature, tools_path, counts, loops, tol, face_path = job
+    mesh_key, feature, tools_path, counts, loops, tol, face_path, surface_path, has_surface = job
     from . import workers
     mesh = workers.load(mesh_key)
+    if has_surface:
+        _surface_from(feature.model, surface_path)
     comp = TopoDS_Shape()
     BRepTools.Read_s(comp, tools_path, BRep_Builder())
     tools, it = [], TopoDS_Iterator(comp)
@@ -1247,7 +1249,32 @@ def _cut_job(job):
         face = _trimmed_cut(feature, Boundary(feature, 10 * tol), mesh, tools, loops, per_loop, tol)
     except Exception:
         face = None
+    if not has_surface and getattr(feature.model, "_surface", None) is not None:
+        _surface_to(feature.model, surface_path)        # (fitted here: handed back, see _cut_all)
     return face is not None and BRepTools.Write_s(face, face_path)
+
+
+def _surface_to(model, path):
+    """Write a fitted model's surface (freeform, pipe, extrusion: see _cut_all) to a BRep file."""
+    try:
+        face = model.face()
+        if face is not None:
+            BRepTools.Write_s(face, path)
+    except Exception:
+        pass
+
+
+def _surface_from(model, path):
+    """Give a fitted model the surface in a BRep file (_surface_to), so it isn't fitted again."""
+    try:
+        if os.path.exists(path):
+            shape = TopoDS_Shape()
+            BRepTools.Read_s(shape, path, BRep_Builder())
+            ex = TopExp_Explorer(shape, TopAbs_FACE)
+            if ex.More():
+                model._surface = BRep_Tool.Surface_s(TopoDS.Face(ex.Current()))
+    except Exception:
+        pass
 
 
 def _cut_all(mesh, jobs, tol):
@@ -1262,7 +1289,7 @@ def _cut_all(mesh, jobs, tol):
     try:
         if "shared_as" not in mesh.__dict__:
             mesh.shared_as = workers.share(mesh)
-        futures = {}
+        futures, back = {}, []
         for i, (key, feature, tools, loops, per_loop) in enumerate(jobs):
             comp = TopoDS_Compound()
             builder = BRep_Builder()
@@ -1271,8 +1298,18 @@ def _cut_all(mesh, jobs, tol):
                 builder.Add(comp, edge)
             tools_path, face_path = os.path.join(tmp, f"{i}_in.brep"), os.path.join(tmp, f"{i}_out.brep")
             BRepTools.Write_s(comp, tools_path)
-            job = (mesh.shared_as, feature, tools_path, [len(x) for x in per_loop], loops, tol, face_path)
+            # (a freeform patch's or pipe's surface goes along once fitted: pickled without
+            # it, each worker fitted it again for every cut, and a big patch is cut afresh
+            # whenever a neighbour changes: 15 s a time for one of the toolbox's)
+            surface_path = os.path.join(tmp, f"{i}_surface.brep")
+            has_surface = getattr(feature.model, "_surface", None) is not None
+            if has_surface:
+                _surface_to(feature.model, surface_path)
+            job = (mesh.shared_as, feature, tools_path, [len(x) for x in per_loop], loops, tol, face_path,
+                   surface_path, has_surface)
             futures[pool.submit(_cut_job, job)] = (key, face_path)
+            if not has_surface and hasattr(feature.model, "_surface"):
+                back.append((feature.model, surface_path))
         for f, (key, face_path) in futures.items():
             if f.exception() is not None:
                 continue
@@ -1285,6 +1322,9 @@ def _cut_all(mesh, jobs, tol):
                 elif TopExp_Explorer(shape, TopAbs_FACE).More():
                     face = shape        # (a patch in several pieces: their compound)
             out[key] = face
+        for model, path in back:
+            if model._surface is None:
+                _surface_from(model, path)
     except Exception:
         out = {}                        # (the worker processes broke down: cut them here)
         workers.broken()
