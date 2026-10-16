@@ -85,15 +85,23 @@ def _start(n):
     try:
         pool = _launching = ProcessPoolExecutor(n, initializer=_watch_parent)
         # (on Windows a worker is only launched when a job finds none idle, one at a
-        # time, in the middle of sending work out: launch them all now, one by one,
-        # minding stop() meanwhile)
+        # time, in the middle of sending work out: they are all launched here instead,
+        # one by one, minding stop() meanwhile. Each launch takes a second or so, however
+        # it is done (16 took 16-18 s), so the pool is handed out as soon as its first
+        # worker answers and the rest join it as they come up: waiting for all of them,
+        # a 7,600-triangle part spent 11 of its 30 s waiting)
+        pool._adjust_process_count = lambda *args: None
         try:
             while len(pool._processes) < n and not _cancel:
                 pool._spawn_process()
+                _guard(pool)
+                if _pool is None and not _cancel:
+                    pool.submit(int).result()
+                    _pool = pool
         except Exception:
             pass
         _guard(pool)
-        if not _cancel:
+        if _pool is None and not _cancel and pool._processes:
             pool.submit(int).result()
             _pool = pool
     except Exception:
@@ -105,10 +113,13 @@ def get(wait=True):
     for it (wait True) or not (None: small jobs are quicker done in this process)."""
     global _starting
     if _starting is not None:
-        if not wait and _starting.is_alive():
-            return None
-        _starting.join()
-        _starting = None
+        # (usable once its first worker is up: see _start)
+        while _pool is None and _starting.is_alive():
+            if not wait:
+                return None
+            _starting.join(0.02)
+        if not _starting.is_alive():
+            _starting = None
     if _pool is not None:
         _guard(_pool)               # (the pool replaces a worker that died)
     return _pool
