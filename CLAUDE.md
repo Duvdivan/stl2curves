@@ -341,7 +341,10 @@ parts of the same run. Launching a process takes a second or so on this machine 
 it is done (16 took 16-18 s, in parallel threads too), so the pool is handed out as soon
 as its first worker answers and the rest join as they come up (Python's own lazy
 launching, which would stall the submitting thread, is switched off): small parts lost
-up to 11 s of 30 waiting for all 16. Shapes cross processes
+up to 11 s of 30 waiting for all 16. At exit the launching is stopped and the workers
+stopped before concurrent.futures' own handler runs (`_stop_launching`): that handler
+waits for every worker it told to quit, and one launched after it looked hung the
+program (a part done in 11 s, its workers still coming up). Shapes cross processes
 as BRep files, the mesh once per pass via `workers.share`/`load`. What runs there:
 
 - The seed passes (pass 1, loose pass, axis passes: `features._seed_pass`), per region,
@@ -355,7 +358,12 @@ as BRep files, the mesh once per pass via `workers.share`/`load`. What runs ther
 - Blend fills (each capped at `FILL_SECONDS`) and their fit checks (`_assess_blend`, a
   check still running after `ASSESS_RUN_SECONDS` fails its blend: Rak N-USB waited 60 s
   for one 6-facet blend's check, which ran 115 s),
-  the bare-facet build (`_bare_ahead`), and the final fuse (capped at `FUSE_SECONDS`).
+  the bare-facet build (`_bare_ahead`: waited for only when a try gives several bodies
+  or a check fails, see `attempt`; the instrument body waited 69 s for it), and the
+  final fuse (capped at `FUSE_SECONDS`). A freeform patch's or pipe's fitted surface
+  goes to the worker cutting it in a BRep file (`_surface_to`/`_surface_from`), and one
+  a worker fits comes back: pickled without it, every cut fitted it again (15 s a cut
+  for a big toolbox patch, recut whenever a neighbour changes).
 - `TIME_LIMIT` (`--time-limit`) only stops optional refinement (blends, culprit search,
   second chances); analysis always runs to the end (cutting it gave garbage).
 
@@ -549,7 +557,9 @@ Key contracts:
   each radius alone, through numpy's pinv per point (toolbox 367 -> 35 s), and
   `_merge_same_surface` re-tested every pair after every merge (toolbox 214 -> 7 s).
   Compare times only between runs made the same day, back to back (`timing/ab.sh`):
-  the same code ran small parts twice as slow one day as the day before.
+  the same code ran small parts twice as slow one day as the day before. A part that
+  hits `TIME_LIMIT` (the whole toolbox: its tries run ~600 s whatever) turns a quicker
+  try into more second chances, so fewer faces, not less time.
 - `repair` cuts out small self-crossing knots and patches the hole; on a fine mesh the
   "knot" can be thousands of triangles whose hole doesn't patch, which left a watertight
   900k-triangle mesh open and unbuildable. A cut is kept only if its patch closes.
