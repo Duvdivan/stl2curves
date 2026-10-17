@@ -26,6 +26,7 @@ TANGENT_DEG = 35      # a neighbour this close in direction is rolled into tange
 MIN_BEND_DEG = 2      # an unrecognised facet must turn at least this far against a neighbour
 MAX_FACETS = 60       # a bigger smooth area is covered by several blends (each a manageable fit)
 GROW_EXACT_FACETS = 40   # a cylinder fitted to a blend's corners takes in neighbouring patches up to this size
+PARALLEL_ROLLED = 8     # pairs of walls a fillet may roll between: this many go to the workers
 PARALLEL_EXACT = 8      # blends checked for a cylinder through their corners: this many go to the workers
 BETWEEN_WALL_FACETS = 10 # a cylinder or cone of this many facets is a wall a fillet can roll along ...
 BETWEEN_PIECE_FACETS = 400   # ... between it and another, over pieces of up to this many facets touching both ...
@@ -562,21 +563,64 @@ def _between_walls(mesh, features):
         for i, A in enumerate(near):
             for B in near[i + 1:]:
                 by_pair.setdefault((A, B), []).append(k)
+    # (every pair worked out ahead in the worker processes, from all its pieces; going
+    # through them in order here, a pair whose pieces an earlier one took is worked out
+    # again here: the same answers as one after another, which took the toolbox 35 s)
+    pairs = [((A, B), by_pair[A, B]) for i, A in enumerate(walls) for B in walls[i + 1:] if (A, B) in by_pair]
+    ahead = _rolled_ahead(mesh, features, pairs)
     used = set()
     out = []
-    for i, A in enumerate(walls):
-        for B in walls[i + 1:]:
-            pieces = [k for k in by_pair.get((A, B), ()) if k not in used]
-            if not pieces:
-                continue
-            got = _rolled(mesh, features, (A, B), pieces)
-            if got is None:
-                continue
-            pipe, rest = got
-            used.update(pieces)
-            out.append(pipe)
-            out += rest
+    for pair, all_pieces in pairs:
+        pieces = [k for k in all_pieces if k not in used]
+        if not pieces:
+            continue
+        got = ahead.get(pair) if pieces == all_pieces else None
+        if got is not None:
+            got = got[1]
+            if got is not None:
+                got[0].parts = tuple(features[k] for k in pieces)   # (this process's own pieces)
+        else:
+            got = _rolled(mesh, features, pair, pieces)
+        if got is None:
+            continue
+        pipe, rest = got
+        used.update(pieces)
+        out.append(pipe)
+        out += rest
     return [f for k, f in enumerate(features) if k not in used] + out
+
+
+def _rolled_ahead(mesh, features, pairs):
+    """{pair: (True, what _rolled gives)} for the pairs of walls with all their pieces,
+    worked out in the worker processes (empty without them, or for a few pairs)."""
+    from . import workers
+    from . import features as F
+    pool = workers.get() if len(pairs) >= PARALLEL_ROLLED else None
+    if pool is None:
+        return {}
+    try:
+        if "shared_as" not in mesh.__dict__:
+            mesh.shared_as = workers.share(mesh)
+        jobs = {pair: pool.submit(_rolled_job, (mesh.shared_as, {k: features[k] for k in pair + tuple(pieces)},
+                                                pair, pieces, F._mesh_tol))
+                for pair, pieces in pairs}
+        return {pair: (True, job.result()) for pair, job in jobs.items()}
+    except Exception:
+        workers.broken()                # (then each worked out here)
+        return {}
+
+
+def _rolled_job(job):
+    """In a worker: _rolled for one pair of walls (see _rolled_ahead)."""
+    from . import workers
+    from . import features as F
+    mesh_key, feats, pair, pieces, tol = job
+    mesh = workers.load(mesh_key)
+    saved, F._mesh_tol = F._mesh_tol, tol
+    try:
+        return _rolled(mesh, feats, pair, pieces)
+    finally:
+        F._mesh_tol = saved
 
 
 def _rolled(mesh, features, pair, pieces):
