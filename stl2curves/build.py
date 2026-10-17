@@ -1510,7 +1510,8 @@ FINE_BLENDS = 150       # a part with more blends than this is mostly freeform: 
 PARALLEL_FILLS = 40     # without worker processes, more fills than this start them
 FILL_SECONDS = 5        # a fill in a worker process still running after this long counts as failed
 ASSESS_SECONDS = 60     # longest wait for the fit checks of a batch of fills (behind overrunning fills)
-ASSESS_RUN_SECONDS = 5  # a fit check still running after this long fails its blend
+ASSESS_RUN_SECONDS = 1  # a fit check still running after this long fails its blend (passing ones
+                        # took at most 0.24 s on four parts, 191 of them; failing ones up to 46 s)
 BUILD_SHARE = 0.35      # of the conversion's time limit, what is kept back for building and checking
                         # the part (blends not fitted by then keep their exact pieces or facets)
 
