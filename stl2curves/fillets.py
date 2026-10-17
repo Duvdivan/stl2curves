@@ -112,6 +112,11 @@ def find(mesh, regions, taken=None, known=(), walls=()):
         square to it or (a cylinder) running along it; the biggest first (real faces
         before the strips of a fillet)."""
         pairs = set()
+        # (Python values for the walk, which looks at every facet within LINK_RINGS of
+        # every face: numpy's per-item look-ups were most of its 10 s on the instrument
+        # body. The tests are the same, in the same order)
+        face_ok, open_area = is_face.tolist(), np.where(used, np.inf, mesh.farea).tolist()
+        wall_at = wall_of.tolist() if wall_of is not None else None
         for A in faces:
             if used[A]:
                 continue
@@ -125,14 +130,14 @@ def find(mesh, regions, taken=None, known=(), walls=()):
                             continue
                         seen.add(h)
                         if wall_of is None:
-                            if is_face[h] and lo_c <= mesh.fn[A] @ mesh.fn[h] <= hi_c:
+                            if face_ok[h] and lo_c <= mesh.fn[A] @ mesh.fn[h] <= hi_c:
                                 pairs.add((min(A, h), max(A, h)))
-                        elif wall_of[h] >= 0:
-                            X = walls[wall_of[h]]
+                        elif wall_at[h] >= 0:
+                            X = walls[wall_at[h]]
                             along = abs(mesh.fn[A] @ X.model.d)
                             if along >= square or (along <= beside and X.model.line[1] == 0):
-                                pairs.add((A, -1 - int(wall_of[h])))
-                        if not used[h] and mesh.farea[h] <= small:
+                                pairs.add((A, -1 - int(wall_at[h])))
+                        if open_area[h] <= small:
                             step.append(h)      # (a band facet: the far face is further on)
                 frontier = step
                 if not frontier:
@@ -255,7 +260,7 @@ def _join_walls(mesh, walls, tol):
             Y = walls[b]
             if root(a) == root(b) or X.convex != Y.convex or abs(X.model.d @ Y.model.d) < parallel:
                 continue
-            if np.linalg.norm(np.cross(Y.model.a - X.model.a, X.model.d)) > 10 * tol:
+            if np.linalg.norm(_cross(Y.model.a - X.model.a, X.model.d)) > 10 * tol:
                 continue                    # (not on one axis)
             if (np.abs(X.model.signed(verts[b])).max() <= tol
                     and np.abs(Y.model.signed(verts[a])).max() <= tol):
@@ -266,6 +271,14 @@ def _join_walls(mesh, walls, tol):
     return [g[0] if len(g) == 1 else _Joined(g) for g in groups.values()]
 
 
+def _cross(a, b):
+    """np.cross of two 3-vectors: the same products and differences, without numpy's
+    overhead on so small a job (the instrument body made 830,000 of them here: 20 s)."""
+    a0, a1, a2 = map(float, a)
+    b0, b1, b2 = map(float, b)
+    return np.array([a1 * b2 - a2 * b1, a2 * b0 - a0 * b2, a0 * b1 - a1 * b0])
+
+
 def _could_join(mesh, A, B, plane_pt):
     """Could faces A and B be joined by a fillet, judged by the faces alone? A fillet of
     radius r touches each face r tan(theta/2) short of the line where they would meet
@@ -274,13 +287,13 @@ def _could_join(mesh, A, B, plane_pt):
     (A quick look, before the band between them is gathered: on a finely cut bore, every
     pair of its strips would otherwise be tried.)"""
     n1, n2 = mesh.fn[A], mesh.fn[B]
-    d = np.cross(n1, n2)
+    d = _cross(n1, n2)
     d /= np.linalg.norm(d)
     p = np.linalg.solve(np.array([n1, n2, d]), [n1 @ plane_pt[A], n2 @ plane_pt[B], 0.0])
     near, width, along = [], [], []
     for X, n in ((A, n1), (B, n2)):
         P = mesh.pts[mesh.fverts[X]] - p
-        across = P @ np.cross(n, d)
+        across = P @ _cross(n, d)
         near.append(float(np.abs(across).min()) if (across > 0).all() or (across < 0).all() else 0.0)
         width.append(float(np.ptp(across)))
         along.append((float((P @ d).min()), float((P @ d).max())))
@@ -445,11 +458,11 @@ class _Flat:
 
     def __init__(self, mesh, A, B, plane_pt, group_A, group_B):
         n1, n2 = mesh.fn[A], mesh.fn[B]
-        d = np.cross(n1, n2)
+        d = _cross(n1, n2)
         self.d = d / np.linalg.norm(d)
         self.origin = np.linalg.solve(np.array([n1, n2, self.d]), [n1 @ plane_pt[A], n2 @ plane_pt[B], 0.0])
         self.e1 = n1
-        self.e2 = np.cross(self.d, n1)
+        self.e2 = _cross(self.d, n1)
         self.n1, self.n2 = self.coords_of(n1, vector=True), self.coords_of(n2, vector=True)
         self.p = np.zeros(2)
         self.A, self.B = A, B
@@ -458,8 +471,8 @@ class _Flat:
         PB = mesh.pts[np.unique(np.concatenate([mesh.fverts[g] for g in group_B]))]
         tA, tB = self.along(PA), self.along(PB)
         self.t0, self.t1 = max(tA.min(), tB.min()), min(tA.max(), tB.max())
-        self.width_A = float(np.ptp(PA @ np.cross(n1, self.d)))
-        self.width_B = float(np.ptp(PB @ np.cross(n2, self.d)))
+        self.width_A = float(np.ptp(PA @ _cross(n1, self.d)))
+        self.width_B = float(np.ptp(PB @ _cross(n2, self.d)))
         self.area_A = float(mesh.farea[group_A].sum())
         self.area_B = float(mesh.farea[group_B].sum())
         self.a_mask = np.zeros(len(mesh.farea), bool)
@@ -499,7 +512,7 @@ class _Beside:
         d = X.model.d - (X.model.d @ nA) * nA
         self.d = d / np.linalg.norm(d)
         self.origin = plane_pt[A]
-        self.e1, self.e2 = nA, np.cross(self.d, nA)
+        self.e1, self.e2 = nA, _cross(self.d, nA)
         self.A, self.X = A, X
         self.normal_A = nA
         # the wall's circle in the section, from its own corners
