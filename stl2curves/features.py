@@ -214,6 +214,11 @@ def _merge_flat(pts, tris, tn, tarea, labels, t1, t2, noise, tol):
     return np.unique([root(int(f)) for f in labels], return_inverse=True)[1]
 
 
+# what the build keeps on a Mesh for itself, left out when it is pickled (Mesh.__getstate__)
+BUILD_ONLY = ("face_cache", "face_cache_features", "corner_pool", "blend_cache", "fills", "fill_jobs",
+              "bare_ahead", "file_dropped")
+
+
 class Mesh:
     """Triangles grouped into flat facets, with which facets meet at a gentle bend."""
 
@@ -271,6 +276,12 @@ class Mesh:
         # a saved stage taken up again went its own way)
         state = dict(self.__dict__)
         state["nbrs"] = [list(s) for s in self.nbrs]
+        # (nor what the build keeps on the mesh: OpenCascade faces and corners, which
+        # don't pickle, and work under way. Shared with the workers mid-build, the mesh
+        # failed to pickle, the pool was taken for broken, and the rest of the part was
+        # built here, every fill and cut in turn and without time limits)
+        for key in BUILD_ONLY:
+            state.pop(key, None)
         return state
 
     def smooth_regions(self):
