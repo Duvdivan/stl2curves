@@ -26,6 +26,7 @@ TANGENT_DEG = 35      # a neighbour this close in direction is rolled into tange
 MIN_BEND_DEG = 2      # an unrecognised facet must turn at least this far against a neighbour
 MAX_FACETS = 60       # a bigger smooth area is covered by several blends (each a manageable fit)
 GROW_EXACT_FACETS = 40   # a cylinder fitted to a blend's corners takes in neighbouring patches up to this size
+PARALLEL_EXACT = 8      # blends checked for a cylinder through their corners: this many go to the workers
 BETWEEN_WALL_FACETS = 10 # a cylinder or cone of this many facets is a wall a fillet can roll along ...
 BETWEEN_PIECE_FACETS = 400   # ... between it and another, over pieces of up to this many facets touching both ...
 BETWEEN_TOL = 0.01       # mm: ... a facet with every corner this near the rolling ball is the fillet's ...
@@ -184,7 +185,8 @@ def add_blends(mesh, features):
         dropped.update(parts)
     # (a blend's area may be one cylinder after all, cut into a few big slanting
     # triangles that no guess from their normals found: see features.corner_surface)
-    out = [(_exact(mesh, f) or f) if f.kind == "blend" else f for f in out]
+    found = iter(_exact_all(mesh, [f for f in out if f.kind == "blend"]))
+    out = [(next(found) or f) if f.kind == "blend" else f for f in out]
     out = _grow_exact(mesh, out)
     kept = [f for k, f in enumerate(features) if k not in dropped] + out
     return _islands(mesh, _between_walls(mesh, kept))
@@ -419,6 +421,46 @@ def _exact(mesh, blend):
         found.corner_fit = True
         found.parts = tuple(blend.parts)   # (put back if its face can't be built)
     return found
+
+
+def _exact_all(mesh, blends):
+    """_exact for each of the blends, in the worker processes when there are enough:
+    each depends only on its own facets, and one after another the toolbox's 222 took a
+    minute (twelve least-squares fits each)."""
+    from . import workers
+    from . import features as F
+    pool = workers.get() if len(blends) >= PARALLEL_EXACT else None
+    if pool is not None:
+        try:
+            if "shared_as" not in mesh.__dict__:
+                mesh.shared_as = workers.share(mesh)
+            jobs = [pool.submit(_exact_job, (mesh.shared_as, f.facets, F._mesh_tol)) for f in blends]
+            out = []
+            for blend, job in zip(blends, jobs):
+                found = job.result()
+                if found is not None:
+                    found.corner_fit = True
+                    found.parts = tuple(blend.parts)   # (put back if its face can't be built)
+                out.append(found)
+            return out
+        except Exception:
+            workers.broken()            # (then done here)
+    return [_exact(mesh, f) for f in blends]
+
+
+def _exact_job(job):
+    """In a worker: features.corner_surface for one blend's facets (see _exact_all)."""
+    from . import workers
+    from . import features as F
+    mesh_key, facets, tol = job
+    mesh = workers.load(mesh_key)
+    saved, F._mesh_tol = F._mesh_tol, tol
+    try:
+        return F.corner_surface(mesh, facets)
+    except Exception:
+        return None
+    finally:
+        F._mesh_tol = saved
 
 
 def _grow_exact(mesh, out):
