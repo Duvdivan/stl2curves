@@ -214,9 +214,12 @@ def _merge_flat(pts, tris, tn, tarea, labels, t1, t2, noise, tol):
     return np.unique([root(int(f)) for f in labels], return_inverse=True)[1]
 
 
-# what the build keeps on a Mesh for itself, left out when it is pickled (Mesh.__getstate__)
+# what a conversion keeps on a Mesh for itself, left out when it is pickled
+# (Mesh.__getstate__): the build's caches, and the file the mesh was shared with the
+# workers in, which is this run's own (a saved stage taken up again sent the workers
+# looking for a file long gone, and the pool was taken for broken)
 BUILD_ONLY = ("face_cache", "face_cache_features", "corner_pool", "blend_cache", "fills", "fill_jobs",
-              "bare_ahead", "file_dropped")
+              "bare_ahead", "file_dropped", "shared_as")
 
 
 class Mesh:
