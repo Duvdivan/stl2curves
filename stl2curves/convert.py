@@ -112,6 +112,7 @@ FILE_VOLUME = 1e-3      # share of the volume a finished part's STEP file may re
 FILE_MATCH = 0.05       # mm (and share): how far a face's middle or outline may move read back from the file
 FILE_AREA = 0.5         # mm^2 (plus half a percent): how much a face's area may change read back from the file
 BLAME_GUIDED = True     # second chances follow what a failed try blames, before halving the group
+FILE_SECOND_CHANCE = False    # patches dropped for what their STEP file does get no second chance
 FILE_ROUNDS = 3         # rounds of patches dropped for what their STEP file does, at most, per body
 FILE_CHECK_FACES = 50000    # a part of more faces (facets, while building) isn't written and read back:
                             # on 218k faces that took longer than the whole build
@@ -1149,7 +1150,11 @@ def _build(mesh, features, mesh_tol, tol, fuse, info):
                     back += list(f.parts)
                     if by_file:
                         mesh.__dict__.setdefault("file_dropped", []).append(f)
-                    if attempt.blamed:
+                    if attempt.blamed and not (by_file and not FILE_SECOND_CHANCE):
+                        # (a patch its STEP file broke goes without: what the file does
+                        # is the face's own, and back in it broke the file again, at the
+                        # end of a whole try each time; it comes back below if the file
+                        # stays broken without it)
                         blamed.append(f)
             subset = [f for k, f in enumerate(subset) if k not in failed] + back
             if attempt.blamed and time.time() > deadline:
