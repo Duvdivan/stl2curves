@@ -103,31 +103,27 @@ class Helical:
         P = self.profile
         n = len(z0)
         rows = np.arange(n)
-        best = np.full(n, np.inf)
-        sign = np.ones(n)
-        piece = np.zeros(n, int)
-        along = np.zeros(n)
-        wrap = np.zeros(n)
-        away = np.zeros((n, 2))
         q = np.c_[z0, rho]
-        for copy in (-1, 0, 1):
-            shift = copy * self.lead
-            A, B = P[:-1] + [shift, 0], P[1:] + [shift, 0]
-            ab = B - A
-            t = np.clip(((q[:, None] - A) * ab).sum(-1) / np.maximum((ab * ab).sum(-1), 1e-300), 0, 1)
-            foot = A + ab * t[..., None]
-            d = np.linalg.norm(q[:, None] - foot, axis=-1)
-            k = d.argmin(axis=1)
-            dk = d[rows, k]
-            # side: rho above the profile at that z is away from a bolt's material
-            above = rho - foot[rows, k, 1]
-            better = dk < best
-            best[better] = dk[better]
-            sign[better] = np.where(above[better] >= 0, 1.0, -1.0)
-            piece[better] = k[better]
-            along[better] = t[rows, k][better]
-            wrap[better] = copy
-            away[better] = (q - foot[rows, k])[better]
+        # (the profile and its copies a lead either side as one row of pieces, the nearest
+        # the first smallest: the earlier copy wins a tie, as when each copy was a pass of
+        # its own. Worked in z and rho apart, the same sums in the same order, without
+        # the arrays of points by pieces by two the passes made: the profile refits call
+        # this thousands of times)
+        m = len(P) - 1
+        A = np.concatenate([P[:-1] + [copy * self.lead, 0] for copy in (-1, 0, 1)])
+        B = np.concatenate([P[1:] + [copy * self.lead, 0] for copy in (-1, 0, 1)])
+        abz, abr = B[:, 0] - A[:, 0], B[:, 1] - A[:, 1]
+        qz, qr = z0[:, None], np.asarray(rho)[:, None]
+        t = np.clip(((qz - A[:, 0]) * abz + (qr - A[:, 1]) * abr) / np.maximum(abz * abz + abr * abr, 1e-300), 0, 1)
+        dz, dr = qz - (A[:, 0] + abz * t), qr - (A[:, 1] + abr * t)
+        k = np.sqrt(dz * dz + dr * dr).argmin(axis=1)
+        dzk, drk = dz[rows, k], dr[rows, k]
+        best = np.sqrt(dzk * dzk + drk * drk)
+        # side: rho above the profile at that z is away from a bolt's material
+        sign = np.where(drk >= 0, 1.0, -1.0)
+        piece, wrap = k % m, (k // m - 1).astype(float)
+        along = t[rows, k]
+        away = np.c_[dzk, drk]
         d = np.linalg.norm(away, axis=1)
         on = d < 1e-15
         away[~on] /= d[~on, None]
@@ -554,6 +550,7 @@ def _thread(mesh, pool, seed, c, a, pitch):
     X, N, W = mesh.fcent[pool], mesh.fn[pool], mesh.farea[pool]
     reach = 1.5 * _radius(mesh.fcent[seed], c, a).max()
     agree = seed
+    found = None
     for _ in range(6):                  # facets agreeing, the motion refitted to them, ...
         near = (misfit_deg(X, N, c, a, pitch) < AGREE_DEG) & (_radius(X, c, a) <= reach)
         if near.sum() < MIN_FACETS:
@@ -569,9 +566,13 @@ def _thread(mesh, pool, seed, c, a, pitch):
         # (fitted to only the facets agreeing so far, the axis can settle a degree or
         # so out and the pitch far out, keeping the rest out; the corners pull them back)
         c, a = _coaxial(_corners(mesh, agree), c, a)
-        pitch = _corner_pitch(_corners(mesh, agree), c, a) or pitch
+        found = (agree, c, a, _corner_pitch(_corners(mesh, agree), c, a))
+        pitch = found[3] or pitch
     P = _corners(mesh, agree)
-    pitch = _corner_pitch(P, c, a)
+    # (the loop settled on the facets and axis it last scanned for the pitch: that scan
+    # is the answer, not done again)
+    settled = found is not None and found[0] is agree and found[1] is c and found[2] is a
+    pitch = found[3] if settled else _corner_pitch(P, c, a)
     if pitch is None:
         return None, agree
     model = Helical(a, c, pitch, [[0, 1], [1, 1]], True)
@@ -810,10 +811,24 @@ def _refine(model, prof, P):
         closed = np.r_[corners, corners[:1] + [lead, 0]]
         return Helical(a, d, pitch, closed, True)
 
+    last = {}
+
+    def at(x):
+        """The model at x, its points' places and their nearest profile pieces, kept
+        for the Jacobian: scipy asks for it at the x it has just had the residual of,
+        and working them out twice was half of each refit (the gutter mount's screw
+        spent 80 of its 100 s of thread search refitting)."""
+        key = x.tobytes()
+        if last.get("key") != key:
+            m = build(x)
+            rho, z0, _ = m.local(P)
+            last.update(key=key, m=m, rho=rho, z0=z0, near=m._nearest(z0, rho))
+        return last["m"], last["rho"], last["z0"], last["near"]
+
     def residual(x):
-        m = build(x)
-        rho, z0, _ = m.local(P)
-        return np.r_[m._profile_distance(z0, rho), HOLD * x[5:]]
+        m, rho, z0, near = at(x)
+        best, sign = near[:2]
+        return np.r_[best * (sign if m.inside else -sign), HOLD * x[5:]]
 
     def jac(x):
         # Left to scipy, the whole residual was recomputed once per unknown: 30 s a
@@ -821,9 +836,7 @@ def _refine(model, prof, P):
         # distance moves with the point itself (its place in the profile's plane), and
         # with the two ends of the piece its foot is on, by how far along it the foot
         # is. Only the points' places are taken by differences, for the axis and pitch.
-        m = build(x)
-        rho, z0, _ = m.local(P)
-        best, sign, piece, along, wrap, away = m._nearest(z0, rho)
+        m, rho, z0, (best, sign, piece, along, wrap, away) = at(x)
         g = -sign[:, None] * away                   # d(distance)/d(foot) = -d/d(point)
         J = np.zeros((len(P) + 2 * k, len(x)))
         for i in range(5):
