@@ -559,7 +559,26 @@ Key contracts:
   Compare times only between runs made the same day, back to back (`timing/ab.sh`):
   the same code ran small parts twice as slow one day as the day before. A part that
   hits `TIME_LIMIT` (the whole toolbox: its tries run ~600 s whatever) turns a quicker
-  try into more second chances, so fewer faces, not less time.
+  try into more second chances, so fewer faces, not less time. With other programs busy
+  the same part varied 127-166 s within a day: decide on alternating runs (`timing/abab.sh`).
+  A profiling wrapper put on a function the workers are sent by name (`_fill_job`,
+  `_cut_job`) can't be pickled: the submit fails, the pool is taken for broken and
+  everything runs in the main process, so what is measured isn't the real run (wrap
+  what those jobs call instead). Watch for the pool going broken (`workers.broken`):
+  a mesh pickled with the build's caches (OpenCascade faces) or with its share file
+  name failed that way in real runs, silently (`features.BUILD_ONLY`).
+- Work redone on every try, found 2026-10-17: the gap rebuild (`attempt`, gaps near no
+  patch: corners and faces rebuilt afresh) fired on every other try on the solar
+  bracket for gaps that a fresh build kept, now remembered (`lasting_gaps`, 282 -> 210
+  s); patches whose STEP file broke were given second chances that broke it again at
+  the end of a whole try (`FILE_SECOND_CHANCE`: Rak SMA-USB 989 -> 933 faces, 265 ->
+  165 s). Passing blend fit checks take at most 0.24 s (`ASSESS_RUN_SECONDS` 1). Blends'
+  corner cylinders (`_exact_all`) and fillets between walls (`_rolled_ahead`, each pair
+  worked out ahead from all its pieces, redone here only if an earlier pair took one)
+  run in the workers. A thread profile refit kept its nearest-piece search from the
+  residual for the Jacobian (gutter screw 95 -> 54 s). Tried and dropped: an analytic
+  Jacobian for `corner_surface` (12 s on the toolbox, but its fits land on other
+  cylinders). `FILL_SECONDS` stays 5: passing fills take up to 4.2 s.
 - `repair` cuts out small self-crossing knots and patches the hole; on a fine mesh the
   "knot" can be thousands of triangles whose hole doesn't patch, which left a watertight
   900k-triangle mesh open and unbuildable. A cut is kept only if its patch closes.
