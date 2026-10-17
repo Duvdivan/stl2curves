@@ -553,7 +553,10 @@ def attempt(mesh, features, mesh_tol, tol, fuse, faceted_volume):
         # patches whose faces left gaps: drop just those and try again
         attempt.why = "free"
         blame = culprits(mesh, features, free)
-        if not blame and mesh.pool_tries > 1:
+        gaps = {tuple(np.round(p, 2)) for p in free}
+        mesh.last_gaps = gaps
+        known = mesh.__dict__.setdefault("lasting_gaps", set())
+        if not blame and mesh.pool_tries > 1 and not gaps <= known:
             # Gaps near no patch: the corners shared across attempts (build.Edges) have
             # gathered the small widenings each flat face is allowed (SHARED_TOLERANCE)
             # attempt after attempt, until sewing lost edges between slivers a few
@@ -562,7 +565,13 @@ def attempt(mesh, features, mesh_tol, tol, fuse, faceted_volume):
             mesh.__dict__.pop("corner_pool", None)
             mesh.__dict__.pop("face_cache", None)
             mesh.pool_tries = 0
-            return attempt(mesh, features, mesh_tol, tol, fuse, faceted_volume)
+            got = attempt(mesh, features, mesh_tol, tol, fuse, faceted_volume)
+            if attempt.why == "free" and not got[1]:
+                # (built afresh, the same gaps: the mesh's own, not the shared corners'.
+                # Not built afresh again for them: the solar bracket rebuilt every face
+                # 83 times, on every other try, for gaps that stayed)
+                known |= mesh.last_gaps
+            return got
         return None, blame
     try:
         shape, nb, nv, signed = solids_from_shells(sewn, inward_shells(mesh))
