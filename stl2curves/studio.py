@@ -100,7 +100,8 @@ class Session:
                                  for f in features],
                 })
             return {"bodies": bodies, "seconds": round(secs, 1), "triangles": info["triangles"],
-                    "repairs": info["repairs"], "cached": info.get("cached", [])}
+                    "repairs": info["repairs"], "mesh_left": info.get("mesh_left", []),
+                    "cached": info.get("cached", [])}
 
     def convert(self, req):
         with self.lock:

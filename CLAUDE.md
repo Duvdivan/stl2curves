@@ -96,7 +96,8 @@ Local regression data on this machine (not in the repo):
 `stl2curves/`):
 
 1. **`repair.py`** mends the mesh (duplicates, zero-thickness pairs, slivers, cracks,
-   stray flaps on a still-open mesh, orientation, holes, small self-crossings). **`simplify.py`** thins meshes over
+   stray flaps on a still-open mesh, knots of micron triangles, orientation, holes, small
+   self-crossings). **`simplify.py`** thins meshes over
    a million triangles with a strict error bound (vertices never move off the surface);
    below that it costs curves and time (`convert.AUTO_SIMPLIFY`: 150k until 2026-10-15,
    when nine meshes of ten, 89k-396k triangles, did better unthinned, test plates in
@@ -581,7 +582,27 @@ Key contracts:
   cylinders). `FILL_SECONDS` stays 5: passing fills take up to 4.2 s.
 - `repair` cuts out small self-crossing knots and patches the hole; on a fine mesh the
   "knot" can be thousands of triangles whose hole doesn't patch, which left a watertight
-  900k-triangle mesh open and unbuildable. A cut is kept only if its patch closes.
+  900k-triangle mesh open and unbuildable. A cut is kept only if its patch closes and
+  adds no edge of three or more triangles (hole patches never run an edge the mesh
+  already has: they did, on four meshes of 142). How far the patch moves the surface
+  (`_patch_shift`: volume between cut and patch over the area cut) picks the cut: the
+  whole cut if within `SPECK_SHIFT`, else per piece two rings of margin, or one ring if
+  that moves it under `NARROW_GAIN` as far, up to `SPECK_SHIFT_MOST`. With two rings of
+  big triangles a coarse mesh's "speck" was a whole region patched flat (a mount lost
+  213 mm^3 to a crossing of two pairs; one ring: 0.9 mm^3). But don't refuse cuts for
+  fidelity alone: a crossing left in the mesh costs far more (the GPS body, its 0.26 mm
+  cut refused: 7,836 faces -> 29,458, not valid), and a narrow patch right beside the
+  crossing can cost as much (its one-ring cut, 0.22 mm: curves round it left gaps every
+  try, 27,571 faces). Where only separate pieces cross, the cut lies inside the other
+  body and need only patch (refusing it cost the BambuTools assembly 45 faces); if the
+  joint patch is refused, each speck that patches alone is cut (companion cap: no solid).
+- Mesh defects that survive repair cost the build loop, not the repair: edges of four
+  triangles where an export left a knot of micron triangles (4-5 corners within 0.0014
+  mm) made the ratchet fail every try (99 tries, 223 of 295 s; result invalid). Repair
+  pulls such knots to a point (`_untie_knots`): 888 faces, valid, 121 s. Check a slow
+  or invalid part's mended mesh with `compare/timing/meshcheck.py` / `meshdeep.py` first.
+  Repair itself must stay cheap on big meshes: `_orient`'s cavity test asked 300,000
+  ray questions on the toolbox (25 of 35 s; now cached and filtered, under 1 s).
 - Splines through a run of mesh corners swing far out where the corners are unevenly
   spaced (dense round a bend, one 20 mm step on the straight: 0.57 mm off), and no
   surface then contains the edge; `build._even` adds points along long steps.

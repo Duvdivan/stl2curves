@@ -79,7 +79,7 @@ from .bodies import split_bodies
 from .threads import carve as thread_carve
 from .features import carve_exact
 from .blends import add_blends, split as split_blend, _blend as as_blend, fallback as blend_fallback, carve, pipe_fallback
-from .repair import repair
+from .repair import repair, leftovers
 from . import accuracy, progress, stages
 from .simplify import simplify
 from .read3mf import read_3mf
@@ -1313,13 +1313,14 @@ def prepare(path, tol, fuse=True, curves=True, true_size=False, blends=True, men
         if len(tris) >= WORKERS_FROM:
             workers.start(len(tris))    # (worker processes, started while the mesh is repaired)
         info = {"triangles": len(tris), "restored": [], "skipped": [], "size": None, "snapped": 0,
-                "repairs": [], "simplified": None}
+                "repairs": [], "simplified": None, "mesh_left": []}
         if mend:
             progress.step("mending the mesh")
             if part is None:
                 pts, tris, info["repairs"] = repair(pts, tris)
+                info["mesh_left"] = leftovers()
             else:
-                pts, tris, part, info["repairs"] = _repair_parts(pts, tris, part)
+                pts, tris, part, info["repairs"], info["mesh_left"] = _repair_parts(pts, tris, part)
         if simplify_to is None:
             simplify_to = SIMPLIFY_ERROR if len(tris) > AUTO_SIMPLIFY else 0
         if simplify_to:
@@ -1338,7 +1339,7 @@ def prepare(path, tol, fuse=True, curves=True, true_size=False, blends=True, men
         groups = (split_bodies(pts, tris) if part is None
                   else [g for p in np.unique(part) for g in split_bodies(pts, tris[part == p])])
         cache.save("mesh", (pts, tris, part, groups,
-                            {k: info[k] for k in ("triangles", "repairs", "simplified")}))
+                            {k: info[k] for k in ("triangles", "repairs", "simplified", "mesh_left")}))
     if curves:
         saved = cache.load("blends" if blends else "analysis")
         if saved is None and blends:
@@ -1580,8 +1581,8 @@ def _bad_merges(checked, unify):
 def _repair_parts(pts, tris, part):
     """repair() on each part of a 3MF object on its own (two parts pressed together are
     no wall of zero thickness to cut out, nor overlapping ones a mesh crossing itself):
-    (points, triangles, part of each triangle, what was done)."""
-    P, T, L, done = [], [], [], {}
+    (points, triangles, part of each triangle, what was done, what is still wrong)."""
+    P, T, L, done, left = [], [], [], {}, {}
     base = 0
     for p in np.unique(part):
         used, inv = np.unique(tris[part == p], return_inverse=True)
@@ -1590,15 +1591,15 @@ def _repair_parts(pts, tris, part):
         T.append(t + base)
         L.append(np.full(len(t), p))
         base += len(q)
-        for note in notes:
+        for said, note in [(done, n) for n in notes] + [(left, n) for n in leftovers()]:
             # (the same repair in two parts is reported once, with the counts added up)
             head, _, rest = note.partition(" ")
             if head.isdigit():
-                done[rest] = done.get(rest, 0) + int(head)
+                said[rest] = said.get(rest, 0) + int(head)
             else:
-                done[note] = None
-    notes = [note if n is None else f"{n} {note}" for note, n in done.items()]
-    return np.vstack(P), np.vstack(T), np.concatenate(L), notes
+                said[note] = None
+    notes, left = ([note if n is None else f"{n} {note}" for note, n in said.items()] for said in (done, left))
+    return np.vstack(P), np.vstack(T), np.concatenate(L), notes, left
 
 
 def write_step(shape, path):
@@ -1708,6 +1709,8 @@ def main():
               f"{time.time() - t:.1f}s -> {out}")
         if info["repairs"]:
             print("  mended the mesh: " + "; ".join(info["repairs"]))
+        if info.get("mesh_left"):
+            print("  not mended (the solid may be rough or invalid there): " + "; ".join(info["mesh_left"]))
         if info.get("cached"):
             print("  saved stages taken up: " + ", ".join(info["cached"]))
         if info["simplified"]:

@@ -247,6 +247,7 @@ $('analyze').onclick = async () => {
     for (const b of bodies) for (const f of b.features) counts[f.label] = (counts[f.label] || 0) + 1;
     status(`${j.triangles.toLocaleString()} triangles, ${bodies.length} bod${bodies.length > 1 ? 'ies' : 'y'}` +
            (j.repairs.length ? `\nmended: ${j.repairs.join('; ')}` : '') +
+           (j.mesh_left && j.mesh_left.length ? `\nnot mended: ${j.mesh_left.join('; ')}` : '') +
            `\nfound: ${Object.entries(counts).map(([k, n]) => `${k} x${n}`).join(', ') || 'nothing curved'}` +
            `\n${j.cached.length ? 'reused saved stages: ' + j.cached.join(', ') : 'analysis ' + j.seconds + ' s'}` +
            `\n(${((performance.now() - t) / 1000).toFixed(1)} s)`);

@@ -159,8 +159,10 @@ Without it the size is left alone (a slight scale is often deliberate, for fit).
 ## How it works
 
 1. **Facets** — the mesh is mended first (`repair.py`: duplicate and zero-thickness
-   triangles, slivers, cracks, stray flaps, flipped triangles, holes and small
-   self-crossings), and
+   triangles, slivers, cracks, stray flaps, knots of micron-sized triangles where
+   several surfaces meet, flipped triangles, holes and small self-crossings; what it
+   can't mend, edges of three or more triangles, crossings and open edges, is reported
+   as "not mended", since the solid can't come out clean there), and
    meshes over 1,000,000 triangles are thinned out (`simplify.py`) without moving their
    surface more than 0.005 mm. Triangles are then grouped into flat facets (coplanar
    pieces): sliver triangles (three corners in a line) are split away, and when the
