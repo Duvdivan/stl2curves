@@ -27,7 +27,7 @@ from scipy.spatial import cKDTree
 
 from . import freeform
 from .accuracy import scale
-from .features import Feature, Revolved, Sphere
+from .features import Feature, Revolved, Sphere, _right_vectors
 
 FIT_DEV = 0.002 * scale("pipes")  # mm: the tube passes this close to every mesh corner of its area
 MAX_RADIUS = 10.0               # mm: fillets up to this radius
@@ -605,7 +605,7 @@ def _spine_shape(Q, r):
     """Whether spine points Q lie on a line ("line") or a circle ("circle") within
     FIT_DEV, else None."""
     c = Q.mean(axis=0)
-    _, _, Vt = np.linalg.svd(Q - c)
+    Vt = _right_vectors(Q - c)
     X = Q - c
     if np.linalg.norm(X - np.outer(X @ Vt[0], Vt[0]), axis=1).max() <= FIT_DEV:
         return "line"
@@ -626,7 +626,7 @@ def _exact_fit(mesh, facets, r, Q, convex):
     from scipy.optimize import least_squares
     P = mesh.pts[np.unique(np.concatenate([mesh.fverts[a] for a in facets]))]
     c = Q.mean(axis=0)
-    _, _, Vt = np.linalg.svd(Q - c)
+    Vt = _right_vectors(Q - c)
 
     def direction(x):
         return np.array([math.sin(x[0]) * math.cos(x[1]), math.sin(x[0]) * math.sin(x[1]), math.cos(x[0])])

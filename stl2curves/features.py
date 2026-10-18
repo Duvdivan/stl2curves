@@ -178,6 +178,7 @@ def _uniq(a):
 MERGE_MAX_DEG = 1     # rounding noise never explains a bigger tilt than this
 AXIS_NOISE = 10       # on a known axis, corners may sit this many rounding steps off
 MIN_VOUCHED_CONE_DEG = 5    # ... but a cone found that way must taper at least this much
+PAIR_BLOCK = 512      # rows: facet normals compared a block at a time (_least_pair_dot)
 STRADDLE_STEPS = 5    # a leftover flat facet this many tolerances off a neighbouring patch's
                       # surface joins it (_absorb_straddlers)
 
@@ -560,7 +561,7 @@ def _rings_refit(model, P):
         if len(ring) < 3:
             continue
         mid = ring.mean(axis=0)
-        n = np.linalg.svd(ring - mid)[2][2]
+        n = _right_vectors(ring - mid)[2]
         _, e1, e2 = _frame(n)
         c = _circle2d((ring - mid) @ e1, (ring - mid) @ e2)
         if c is None:
@@ -828,6 +829,45 @@ def _fewer_distinct(rows, k):
     return False
 
 
+def _right_vectors(A):
+    """np.linalg.svd(A)[2], the right singular vectors, bit for bit, without the left
+    ones: for a tall A numpy's default works out all M by M of those only for them to be
+    thrown away (an outline of 10,000 points: an 800 MB matrix and half a second, for
+    every facet absorbed into a big patch). LAPACK takes both from the same QR factor."""
+    A = np.asarray(A)
+    return np.linalg.svd(A, full_matrices=A.shape[0] < A.shape[1])[2]
+
+
+def _least_pair_dot(n, near):
+    """The smallest dot product between any two rows of n (unit facet normals),
+    (n @ n.T).min(), as the caller needs it: compared with `near`. A small n gets exactly
+    that. A big one gets a value
+    on the same side of `near` as it, without the rows-by-rows matrix (a 16,570-facet
+    patch's was 2.2 GB, built for every facet absorbed into it: a 920k-triangle mesh
+    spent the best part of an hour so in _absorb_straddlers): a pair of rows already
+    below `near` (the row farthest from their mean, and the row farthest from that one),
+    or a bound above it (every row within some angle of their mean, no two are more
+    than twice that apart), or failing both the minimum a block of rows at a time;
+    within a hair of `near` the whole matrix after all, so every decision is as before."""
+    if len(n) <= PAIR_BLOCK:
+        return (n @ n.T).min()
+    mean = n.sum(axis=0)
+    a = int(np.argmin(n @ mean))
+    dots = n @ n[a]
+    pair = float(dots.min())
+    if pair < near - 1e-9:
+        return pair
+    size = float(np.linalg.norm(mean))
+    if size > 0:
+        closest = float((n @ (mean / size)).min())
+        if closest > 0 and 2 * closest * closest - 1 > near + 1e-9:
+            return 2 * closest * closest - 1
+    least = min(float((n[i:i + PAIR_BLOCK] @ n.T).min()) for i in range(0, len(n), PAIR_BLOCK))
+    if abs(least - near) <= 1e-9:
+        return (n @ n.T).min()
+    return least
+
+
 def _best(candidates):
     """The candidate covering the most area; among those covering about as much, the one
     fitting its facets far more closely (two rings of points lie on a cone and on a
@@ -878,7 +918,7 @@ def _seed_candidates(mesh, region, i, j):
         # (the loose pass meets most of the same neighbourhoods again: fitted once)
         fits = region.__dict__.setdefault("tube_fits", {})
         if tuple(near) not in fits:
-            axis = np.linalg.svd(region.n[near])[2][2]
+            axis = _right_vectors(region.n[near])[2]
             cyl = _cylinder(axis, near_pts)
             fits[tuple(near)] = None if cyl is None else _tube_fit(near_pts, cyl)
         cyl = copy.deepcopy(fits[tuple(near)])      # (a model may be changed later on)
@@ -1256,7 +1296,7 @@ def _band_tori(mesh, regions, features):
         C = np.array([small[k][1] for k in ks])
         r = float(np.mean([small[k][0] for k in ks]))
         mid = C.mean(axis=0)
-        vt = np.linalg.svd(C - mid)[2]
+        vt = _right_vectors(C - mid)
         guesses = [Revolved(mid, vt[0], line=(r, 0))]           # a straight fillet
         if len(ks) >= 3:
             _, e1, e2 = _frame(vt[2])
@@ -2114,24 +2154,34 @@ def _absorb_straddlers(mesh, features):
     # beside it joined the fillet only after it was passed over, was left a face of its
     # own, and the fillet blamed for the gap at it. Needles at a fillet's end, where
     # another crosses it, joined on later passes too, ran it past its end and left a gap)
+    # (a patch's corners as a set, kept for as long as the patch is the same: worked out
+    # afresh for every leftover beside it, they made this quadratic on a fine mesh)
+    corners = {}
+
+    def corners_of(k):
+        got = corners.get(k)
+        if got is None or got[0] is not features[k]:
+            got = corners[k] = (features[k], set(np.concatenate([mesh.fverts[a] for a in features[k].facets]).tolist()))
+        return got[1]
+
     joined, again = True, None
     while joined:
         joined, again = False, again is not None
         for g in np.nonzero(owner < 0)[0]:
-            C = mesh.pts[mesh.tris[mesh.ftris[g]]]
-            mids = np.r_[((C + C[:, [1, 2, 0]]) / 2).reshape(-1, 3), C.mean(axis=1)]
             V = mesh.pts[mesh.fverts[g]]
             # (a needle-thin facet's own normal means nothing, as in Region)
             needle = mesh.farea[g] < 0.05 * np.ptp(V, axis=0).max() ** 2
             if len(mesh.ftris[g]) < 2 and not needle:
                 continue    # an ordinary curved facet the passes left: smooth blends see to those
+            C = mesh.pts[mesh.tris[mesh.ftris[g]]]
+            mids = np.r_[((C + C[:, [1, 2, 0]]) / 2).reshape(-1, 3), C.mean(axis=1)]
             for k in sorted({owner[h] for h in mesh.nbrs[g]} - {-1}):
                 f = features[k]
                 if not isinstance(f.model, (Revolved, Sphere)):
                     continue
                 if np.abs(f.model.signed(V)).max() > STRADDLE_STEPS * _tol(f.model):
                     continue
-                if again and not set(mesh.fverts[g].tolist()) <= set(np.concatenate([mesh.fverts[a] for a in f.facets]).tolist()):
+                if again and not set(mesh.fverts[g].tolist()) <= corners_of(k):
                     continue
                 if not needle and abs(mesh.fn[g] @ f.model.normal(mesh.fcent[g][None])[0]) < math.cos(math.radians(NORMAL_DEG)):
                     continue
@@ -2216,13 +2266,13 @@ def corner_surface(mesh, facets):
     if len(fac) < CORNER_FIT_FACETS:
         return None
     N = mesh.fn[fac]
-    if math.degrees(math.acos(max(-1.0, min(1.0, float((N @ N.T).min()))))) < MIN_SPAN_DEG:
+    if math.degrees(math.acos(max(-1.0, min(1.0, float(_least_pair_dot(N, math.cos(math.radians(MIN_SPAN_DEG)))))))) < MIN_SPAN_DEG:
         return None
     P = mesh.pts[_uniq(np.concatenate([mesh.fverts[f] for f in fac]))]
     c0 = P.mean(axis=0)
     out_n = N.mean(axis=0)
     out_n /= max(np.linalg.norm(out_n), 1e-12)
-    guesses = [np.linalg.eigh(N.T @ N)[1][:, 0], np.linalg.svd(P - c0)[2][0]]
+    guesses = [np.linalg.eigh(N.T @ N)[1][:, 0], _right_vectors(P - c0)[0]]
     best = None
     for g in guesses:
         d, e1, e2 = _frame(g)
@@ -2402,7 +2452,7 @@ def _feature(mesh, model, fids, convex):
             label = "ball" if convex else "spherical cavity"
             return Feature(model, label, f"dia {2 * model.r:.3f}", kind="ball", **base)
         mid = rim.mean(axis=0)
-        n = np.linalg.svd(rim - mid)[2][2]
+        n = _right_vectors(rim - mid)[2]
         if np.abs((rim - mid) @ n).max() <= _tol(model):
             # Flat circular edge: a dome, dimple or hemispherical tip, handled as a revolved cap.
             if ((P - mid) @ n).mean() < 0:
@@ -2431,7 +2481,7 @@ def _loose_support(mesh, fids, kind):
     n = mesh.fn[fids]
     if _fewer_distinct(np.round(n, 3), LOOSE_MIN_FACETS[kind]):
         return False
-    return (n @ n.T).min() <= math.cos(math.radians(LOOSE_MIN_TURN_DEG[kind]))
+    return _least_pair_dot(n, math.cos(math.radians(LOOSE_MIN_TURN_DEG[kind]))) <= math.cos(math.radians(LOOSE_MIN_TURN_DEG[kind]))
 
 
 def _enough_for_trimmed(mesh, fids, P, free_edges):
@@ -2445,7 +2495,7 @@ def _enough_for_trimmed(mesh, fids, P, free_edges):
     if len(P) < TRIMMED_MIN_CORNERS or len(fids) < TRIMMED_MIN_FACETS:
         return False
     n = mesh.fn[fids]
-    if (n @ n.T).min() > math.cos(math.radians(TRIMMED_MIN_TURN_DEG)):
+    if _least_pair_dot(n, math.cos(math.radians(TRIMMED_MIN_TURN_DEG))) > math.cos(math.radians(TRIMMED_MIN_TURN_DEG)):
         return False
     # (Mostly, anyway: two equal holes crossing are tangent at a couple of points.)
     inside = set(np.asarray(fids).tolist())
@@ -2473,6 +2523,10 @@ def _great_circles(model, P, pts, rim_edges):
         m /= np.linalg.norm(m)
         if not any(abs(m @ q) > math.cos(math.radians(1)) for q in normals):
             normals.append(m)
+            if len(normals) > 8:
+                # (no simple corner, as below: said at once, not after comparing every
+                # outline edge with every plane so far, minutes on a big sphere patch)
+                return None
     if not 1 <= len(normals) <= 8:
         return None
     # both ends of every outline edge must lie on the same plane

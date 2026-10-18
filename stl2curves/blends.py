@@ -18,7 +18,7 @@ from . import freeform
 from . import pipes
 from .accuracy import scale
 ACCURACY = scale("blends")
-from .features import Feature, Revolved, Sphere
+from .features import Feature, Revolved, Sphere, _least_pair_dot, _right_vectors
 
 SMOOTH_DEG = 50       # facets bending less than this meet smoothly
 SPREAD_DEG = 40       # one blend face turns at most this far from its first facet and its mean direction
@@ -90,7 +90,7 @@ def _scrap(mesh, f, any_count=False):
     if r is None or f.kind in ("ball", "wedge") or (len(f.facets) >= 40 and not any_count) or f.__dict__.get("vouched"):
         return False
     N = mesh.fn[f.facets]
-    turn = math.degrees(math.acos(float(np.clip((N @ N.T).min(), -1, 1))))
+    turn = math.degrees(math.acos(float(np.clip(_least_pair_dot(N, math.cos(math.radians(45))), -1, 1))))
     return turn < 45 and float(mesh.farea[f.facets].sum()) < r * r
 
 
@@ -958,7 +958,7 @@ def split(mesh, blend):
     if blend.depth >= MAX_SPLITS or len(blend.facets) < 8:
         return None
     C = mesh.fcent[blend.facets]
-    axis = np.linalg.svd(C - C.mean(axis=0))[2][0]
+    axis = _right_vectors(C - C.mean(axis=0))[0]
     t = (C - C.mean(axis=0)) @ axis
     cut = np.median(t)
     side = {int(f): bool(x > cut) for f, x in zip(blend.facets, t)}

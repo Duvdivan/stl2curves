@@ -732,6 +732,18 @@ Key contracts:
   1.35 GB with the tables, the same values, types and order (`compare/timing/packcheck.py`).
   Watch memory on big meshes (`compare/timing/memwatch.ps1`), and never run a big mesh
   beside other conversions.
+- Hidden squares in small-looking code (2026-10-18, the fidget's `snap`: over an hour,
+  now 76 s, same features): `_absorb_straddlers` describes a patch afresh for every
+  facet it takes in, and three things in `_feature` grew with the square of a big
+  patch: `(n @ n.T).min()` over its facet normals (a 2.2 GB matrix at 16,570 facets;
+  `_least_pair_dot` decides against the caller's threshold from one pass, blocks only
+  if unsure, the whole matrix only within 1e-9 of it), `np.linalg.svd` of its outline
+  points with numpy's default full matrices (M x M left vectors thrown away;
+  `_right_vectors`: reduced, the same right vectors bit for bit, 3,000 random tests), and
+  `_great_circles` comparing every outline edge with every plane so far though more than
+  8 means no answer anyway. The same matrix/svd patterns ran in the workers' seed
+  passes, hence some of their memory peaks. Look for n x n intermediates before
+  blaming the algorithm.
 - Big multi-body meshes sew into hundreds of zero-volume shells (coincident face pairs);
   `solids_from_shells` drops them (`EMPTY_SHELL`), or body counts and fuses go wrong.
 

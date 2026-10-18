@@ -27,7 +27,7 @@ import math
 
 import numpy as np
 
-from .features import grid_noise
+from .features import grid_noise, _right_vectors
 
 CRACK = 1e-3            # mm (and a small share of the part's size): open edges this close are joined
 SPECK = 0.1             # a self-crossing cluster smaller than this share of the part is cut out
@@ -646,7 +646,7 @@ def _triangulate(pts, loop, taken=frozenset()):
         return np.array(out) if np.isfinite(best[0, k - 1]) else None
     # large loop: ear clipping in the best-fit plane
     mid = P.mean(axis=0)
-    _, _, V = np.linalg.svd(P - mid)
+    V = _right_vectors(P - mid)
     xy = (P - mid) @ V[:2].T
     signed = 0.5 * np.sum(xy[:, 0] * np.roll(xy[:, 1], -1) - np.roll(xy[:, 0], -1) * xy[:, 1])
     idx = list(range(k)) if signed > 0 else list(range(k))[::-1]

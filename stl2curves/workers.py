@@ -26,10 +26,11 @@ WORKERS = max(1, min(16, (os.cpu_count() or 2) - 2))     # processes working at 
 # (measured 2026-10-18 on a 920k-triangle mesh, every triangle nearly a facet of its
 # own: the mesh read back in a worker 3.2 GB, 0.6 GB once packed, 1.35 GB with its edge
 # tables rebuilt, see features.Mesh.__getstate__; at 1.5 KB a triangle and unpacked, 16
-# workers took 5-7 GB each, and the machine ran out of memory and page file):
+# workers took 5-7 GB each, and the machine ran out of memory and page file; packed,
+# each peaked at 2.34 GB in its seed passes):
 WORKER_MB = 300             # MB a worker takes besides the mesh (its working set, imports done)
-WORKER_KB = 2.0             # KB a worker takes per triangle of the part
-MAIN_KB = 4.0               # KB this process takes per triangle
+WORKER_KB = 2.6             # KB a worker takes per triangle of the part (2.34 GB seen at 920k)
+MAIN_KB = 6.0               # KB this process takes per triangle (4.6 GB seen at 920k)
 MEMORY_SHARE = 0.75         # share of the free memory the conversion may take
 
 _pool = None                        # the pool, once its workers are all up
