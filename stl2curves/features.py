@@ -244,6 +244,51 @@ BUILD_ONLY = ("face_cache", "face_cache_features", "corner_pool", "blend_cache",
               "bare_ahead", "file_dropped", "shared_as")
 
 
+class _Packed:
+    """A list of small arrays, of lists of numbers, or a dict of number pairs to such
+    lists, held as a few flat arrays for pickling (see Mesh.__getstate__); unpack() gives
+    back the same values, of the same types, in the same order."""
+
+    def __init__(self, kind, *parts):
+        self.kind, self.parts = kind, parts
+
+    @staticmethod
+    def _offsets(lengths):
+        return np.cumsum(np.asarray(lengths, np.int64))
+
+    @classmethod
+    def arrays(cls, items):
+        if not items:
+            return items
+        return cls("arrays", np.concatenate(items), cls._offsets([len(a) for a in items])[:-1])
+
+    @classmethod
+    def lists(cls, items, dtype):
+        flat = np.fromiter((x for l in items for x in l), dtype, sum(len(l) for l in items))
+        return cls("lists", flat, cls._offsets([len(l) for l in items]))
+
+    @classmethod
+    def table(cls, d):
+        keys = np.array(list(d.keys())) if d else np.zeros((0, 2), np.int64)
+        values = list(d.values())
+        lengths = [len(v) for v in values]
+        flat = [x for v in values for x in v]
+        return cls("table", keys, cls._offsets(lengths), np.array(flat) if flat else np.zeros(0, np.int64))
+
+    def unpack(self):
+        if self.kind == "arrays":
+            flat, cuts = self.parts
+            return np.split(flat, cuts)
+        if self.kind == "lists":
+            flat, ends = self.parts
+            starts = np.r_[0, ends[:-1]]
+            return [list(flat[a:b]) for a, b in zip(starts.tolist(), ends.tolist())]
+        keys, ends, flat = self.parts
+        starts = np.r_[0, ends[:-1]]
+        # (keys as pairs of numpy numbers and values as numpy numbers or rows, as built)
+        return {(a, b): list(flat[lo:hi]) for (a, b), lo, hi in zip(keys, starts.tolist(), ends.tolist())}
+
+
 class Mesh:
     """Triangles grouped into flat facets, with which facets meet at a gentle bend."""
 
@@ -300,14 +345,42 @@ class Mesh:
         # come out in another order, and the order decides what is tried, so a worker or
         # a saved stage taken up again went its own way)
         state = dict(self.__dict__)
-        state["nbrs"] = [list(s) for s in self.nbrs]
+        state["nbrs"] = _Packed.lists([list(s) for s in self.nbrs], self.facet_of.dtype)
         # (nor what the build keeps on the mesh: OpenCascade faces and corners, which
         # don't pickle, and work under way. Shared with the workers mid-build, the mesh
         # failed to pickle, the pool was taken for broken, and the rest of the part was
         # built here, every fill and cut in turn and without time limits)
         for key in BUILD_ONLY:
             state.pop(key, None)
+        # The per-facet lists and the edge tables go as a few flat arrays, the tables to
+        # be rebuilt only where they are asked for. Pickled as they are, as millions of
+        # small objects (a numpy scalar or array is a few hundred bytes read back), a
+        # 920k-triangle mesh came back 3.2 GB in each worker, where it had taken 1.4 GB
+        # here, and 16 workers ran the machine out of memory; most workers never look at
+        # the edge tables at all. Read back, everything is as it was: the same values,
+        # types and order (the lists' arrays are views of one array, as ftris's are here).
+        for key in ("fverts", "ftris"):
+            state[key] = _Packed.arrays(state[key])
+        lazy = dict(state.pop("_lazy", {}))
+        for key in ("edge_facets", "shared"):
+            if key in state:
+                lazy[key] = _Packed.table(state.pop(key))
+        state["_lazy"] = lazy
         return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        for key in ("fverts", "ftris", "nbrs"):
+            if isinstance(self.__dict__.get(key), _Packed):
+                self.__dict__[key] = self.__dict__[key].unpack()
+
+    def __getattr__(self, name):
+        # (an edge table read back from a pickle, rebuilt the first time it is asked for)
+        lazy = self.__dict__.get("_lazy")
+        if lazy and name in lazy:
+            value = self.__dict__[name] = lazy.pop(name).unpack()
+            return value
+        raise AttributeError(name)
 
     def smooth_regions(self):
         nf = len(self.fn)

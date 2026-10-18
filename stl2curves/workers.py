@@ -22,9 +22,13 @@ from concurrent.futures import ProcessPoolExecutor
 
 WORKERS = max(1, min(16, (os.cpu_count() or 2) - 2))     # processes working at once, at most
 # Each worker holds its own copy of the mesh and what is worked out from it; on a big
-# mesh that is over a gigabyte apiece. They are only as many as the free memory takes:
-WORKER_MB = 150             # MB a worker takes besides the mesh
-WORKER_KB = 1.5             # KB a worker takes per triangle of the part
+# mesh that is gigabytes apiece. They are only as many as the free memory takes
+# (measured 2026-10-18 on a 920k-triangle mesh, every triangle nearly a facet of its
+# own: the mesh read back in a worker 3.2 GB, 0.6 GB once packed, 1.35 GB with its edge
+# tables rebuilt, see features.Mesh.__getstate__; at 1.5 KB a triangle and unpacked, 16
+# workers took 5-7 GB each, and the machine ran out of memory and page file):
+WORKER_MB = 300             # MB a worker takes besides the mesh (its working set, imports done)
+WORKER_KB = 2.0             # KB a worker takes per triangle of the part
 MAIN_KB = 4.0               # KB this process takes per triangle
 MEMORY_SHARE = 0.75         # share of the free memory the conversion may take
 
@@ -82,6 +86,12 @@ def _free_memory():
 
 def _start(n):
     global _pool, _launching
+    # (one BLAS thread in each worker: the parallel work is the processes themselves, and
+    # OpenBLAS sets aside buffers for a thread per core as numpy loads, 1.5 GB of
+    # committed memory per worker that was never touched, which with 16 workers on a big
+    # mesh ran Windows out of page file. Read by the workers as they start; numpy here
+    # in this process has loaded already and keeps its own threads)
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
     try:
         pool = _launching = ProcessPoolExecutor(n, initializer=_watch_parent)
         # (on Windows a worker is only launched when a job finds none idle, one at a

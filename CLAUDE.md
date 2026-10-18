@@ -336,8 +336,8 @@ Local regression data on this machine (not in the repo):
 
 Speed (`workers.py`): OpenCascade and small-array numpy hold the GIL, so parallel work
 runs in a shared process pool (up to 16 workers, fewer if free memory is short: each
-holds its own copy of the mesh, ~1.5 KB a triangle, over a gigabyte on a 900k-triangle
-mesh), started in the background once a mesh has 3,000+ triangles and kept for further
+holds its own copy of the mesh, sized at `WORKER_KB` 2 KB a triangle, 0.6-1.35 GB on a
+900k-triangle mesh; see the worker-memory lesson below), started in the background once a mesh has 3,000+ triangles and kept for further
 parts of the same run. Launching a process takes a second or so on this machine however
 it is done (16 took 16-18 s, in parallel threads too), so the pool is handed out as soon
 as its first worker answers and the rest join as they come up (Python's own lazy
@@ -718,6 +718,20 @@ Key contracts:
   time, but on the GPS case back left 7-14 free edges in every one of 19 tries where one
   pass left 0-5 (`compare/timing/sewcmp.py`): the tight pass pairs edges the wide one
   can't undo. Not a general replacement.
+- Worker memory (2026-10-18): a 920k-triangle mesh (the fidget, nearly every triangle a
+  facet of its own) started 16 workers, each grew to 5-7 GB, and Windows ran out of
+  memory and page file (64 GB RAM, 131 GB commit; `WinError 1450`; a run timed out at
+  2.5 h, its timings worthless, as were those of runs beside it). Three causes: OpenBLAS
+  commits buffers for a thread per core as numpy and scipy load, 1.5 GB per process
+  never touched (`workers._start` sets `OPENBLAS_NUM_THREADS=1` for the workers: 22 MB;
+  fingerprints and alternating timings the same); the pool was sized at 1.5 KB a
+  triangle; and the pickled Mesh read back as millions of small objects (numpy scalars
+  in dict keys, one array per facet: 3.2 GB in each worker for 1.4 GB here).
+  `Mesh.__getstate__` packs the per-facet lists and edge tables into flat arrays
+  (`_Packed`) and a worker rebuilds the tables only if asked (`__getattr__`): 0.6 GB,
+  1.35 GB with the tables, the same values, types and order (`compare/timing/packcheck.py`).
+  Watch memory on big meshes (`compare/timing/memwatch.ps1`), and never run a big mesh
+  beside other conversions.
 - Big multi-body meshes sew into hundreds of zero-volume shells (coincident face pairs);
   `solids_from_shells` drops them (`EMPTY_SHELL`), or body counts and fuses go wrong.
 
