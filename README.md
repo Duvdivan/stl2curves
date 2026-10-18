@@ -253,7 +253,11 @@ Without it the size is left alone (a slight scale is often deliberate, for fit).
    Each try builds and sews the whole part, minutes on a mesh of a quarter million
    triangles, so after ten minutes of this every patch near a problem is dropped at
    once, reaching four times further each round (0.5 mm, 2 mm, 8 mm...): a few more
-   tries at most, losing curves only round the trouble, rather than hours of them. A
+   tries at most, losing curves only round the trouble, rather than hours of them. The
+   part is sewn at 1.5 times its loosest patch's distance from the mesh, at most 0.2 mm
+   and at most twice the mesh's median edge: on a very fine mesh a wider sewing tears
+   flat areas far from any curve, so the few patches that would need more are left
+   faceted from the start. A
    big freeform surface blamed for a problem at its edge gives up only its facets near
    the problem; one that fails outright gives way to the smaller blends its area would
    have had. A

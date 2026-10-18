@@ -101,9 +101,7 @@ class Helical:
         1 leads on), and the unit direction from the foot to the point (what moving the
         point or the piece's ends does to the distance)."""
         P = self.profile
-        n = len(z0)
-        rows = np.arange(n)
-        q = np.c_[z0, rho]
+        rho = np.asarray(rho)
         # (the profile and its copies a lead either side as one row of pieces, the nearest
         # the first smallest: the earlier copy wins a tie, as when each copy was a pass of
         # its own. Worked in z and rho apart, the same sums in the same order, without
@@ -113,16 +111,33 @@ class Helical:
         A = np.concatenate([P[:-1] + [copy * self.lead, 0] for copy in (-1, 0, 1)])
         B = np.concatenate([P[1:] + [copy * self.lead, 0] for copy in (-1, 0, 1)])
         abz, abr = B[:, 0] - A[:, 0], B[:, 1] - A[:, 1]
-        qz, qr = z0[:, None], np.asarray(rho)[:, None]
-        t = np.clip(((qz - A[:, 0]) * abz + (qr - A[:, 1]) * abr) / np.maximum(abz * abz + abr * abr, 1e-300), 0, 1)
-        dz, dr = qz - (A[:, 0] + abz * t), qr - (A[:, 1] + abr * t)
-        k = np.sqrt(dz * dz + dr * dr).argmin(axis=1)
-        dzk, drk = dz[rows, k], dr[rows, k]
+        ab2 = np.maximum(abz * abz + abr * abr, 1e-300)
+
+        def nearest(cols, qz, qr):
+            t = np.clip(((qz[:, None] - A[cols, 0]) * abz[cols] + (qr[:, None] - A[cols, 1]) * abr[cols])
+                        / ab2[cols], 0, 1)
+            dz, dr = qz[:, None] - (A[cols, 0] + abz[cols] * t), qr[:, None] - (A[cols, 1] + abr[cols] * t)
+            dist = np.sqrt(dz * dz + dr * dr)
+            j = dist.argmin(axis=1)
+            r = np.arange(len(qz))
+            return j, dist[r, j], t[r, j], dz[r, j], dr[r, j]
+
+        # (the profile's own copy first, then all three only for the points a copy could
+        # be as near to: no nearer than the gap in z to the span that copy covers. Twice
+        # as quick, the same answers)
+        j, dist, along, dzk, drk = nearest(np.arange(m, 2 * m), z0, rho)
+        k = j + m
+        slack = dist * (1 + 1e-9) + 1e-12
+        lo, hi = P[:, 0].min(), P[:, 0].max()
+        before = np.maximum(0.0, np.maximum(lo - self.lead - z0, z0 - (hi - self.lead)))
+        after = np.maximum(0.0, np.maximum(lo + self.lead - z0, z0 - (hi + self.lead)))
+        redo = np.flatnonzero((before <= slack) | (after <= slack))
+        if len(redo):
+            k[redo], _, along[redo], dzk[redo], drk[redo] = nearest(np.arange(3 * m), z0[redo], rho[redo])
         best = np.sqrt(dzk * dzk + drk * drk)
         # side: rho above the profile at that z is away from a bolt's material
         sign = np.where(drk >= 0, 1.0, -1.0)
         piece, wrap = k % m, (k // m - 1).astype(float)
-        along = t[rows, k]
         away = np.c_[dzk, drk]
         d = np.linalg.norm(away, axis=1)
         on = d < 1e-15
@@ -468,18 +483,46 @@ def _angle_fit(X, N, w, c, a, pitch):
     from scipy.optimize import least_squares
     d0, e1, e2 = _frame(c)
     scale = np.sqrt(w / w.mean())
+    X0, X1, X2 = (np.ascontiguousarray(X[:, j]) for j in range(3))
+    N0, N1, N2 = (np.ascontiguousarray(N[:, j]) for j in range(3))
 
     def unpack(x):
         d = d0 + x[0] * e1 + x[1] * e2
         return d / np.linalg.norm(d), a + x[2] * e1 + x[3] * e2, pitch + x[4]
 
     def residual(x):
+        # (v = d x (X - p) + k d, its dot with N and its length, written out coordinate
+        # by coordinate in the order np.cross, einsum and norm take them: the same values,
+        # without their overheads)
         d, p, k = unpack(x)
-        v = np.cross(d, X - p) + k * d
-        s = np.einsum("ij,ij->i", v, N) / np.maximum(np.linalg.norm(v, axis=1), 1e-12)
+        V0, V1, V2 = X0 - p[0], X1 - p[1], X2 - p[2]
+        kd = k * d
+        v0 = (d[1] * V2 - d[2] * V1) + kd[0]
+        v1 = (d[2] * V0 - d[0] * V2) + kd[1]
+        v2 = (d[0] * V1 - d[1] * V0) + kd[2]
+        s = ((v0 * N0 + v2 * N2) + v1 * N1) / np.maximum(np.sqrt(v0 * v0 + v1 * v1 + v2 * v2), 1e-12)
         return np.degrees(np.arcsin(np.clip(s, -1, 1))) * scale
 
-    fit = least_squares(residual, np.zeros(5), loss="soft_l1", f_scale=1.0, x_scale="jac", max_nfev=100)
+    last = {}
+
+    def fun(x):
+        last["x"], last["f"] = x.copy(), residual(x)
+        return last["f"]
+
+    def jac(x):
+        # scipy's own two-point differences (its steps, order and arithmetic: see
+        # scipy.optimize._numdiff), from the residual already worked out at x: left to
+        # scipy, half the thread search went on them (the instrument body, no threads)
+        f0 = last["f"] if np.array_equal(last.get("x"), x) else residual(x)
+        h = (EPS_STEP * ((x >= 0).astype(x.dtype) * 2 - 1) * np.maximum(1.0, np.abs(x))).astype(x.dtype)
+        JT = np.empty((len(x), len(f0)))
+        for i in range(len(x)):
+            x1 = np.copy(x)
+            x1[i] = x[i] + h[i]
+            JT[i] = (residual(x1) - f0) / ((x[i] + h[i]) - x[i])
+        return JT.T
+
+    fit = least_squares(fun, np.zeros(5), jac=jac, loss="soft_l1", f_scale=1.0, x_scale="jac", max_nfev=100)
     return unpack(fit.x)
 
 
@@ -691,12 +734,20 @@ def _lines(z, u, radius):
     def scan(leads, hands, bins, top):
         best = (0.0, None)
         for hand in hands:
+            ht = hand * turn
             for chunk in np.array_split(leads, max(1, len(leads) // 200)):
-                phase = np.mod(z[None, :] / chunk[:, None] - hand * turn[None, :], 1.0)
-                cells = np.minimum((phase * bins).astype(int), bins - 1)
-                cells += bins * np.arange(len(chunk))[:, None]
+                # (in place, and q - floor(q) for np.mod(q, 1): the same values, a
+                # quarter of the time; this scan was half the thread search)
+                q = z[None, :] / chunk[:, None]
+                q -= ht
+                q -= np.floor(q)
+                q *= bins
+                cells = q.astype(np.intp)
+                np.minimum(cells, bins - 1, out=cells)
+                cells += (bins * np.arange(len(chunk)))[:, None]
                 hist = np.bincount(cells.ravel(), minlength=bins * len(chunk)).reshape(len(chunk), bins)
-                share = np.sort(hist, axis=1)[:, -top:].sum(axis=1) / len(z)
+                hist.sort(axis=1)
+                share = hist[:, -top:].sum(axis=1) / len(z)
                 k = int(np.argmax(share))
                 if share[k] > best[0]:
                     best = (float(share[k]), hand * float(chunk[k]))

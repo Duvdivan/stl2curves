@@ -91,6 +91,10 @@ HURRY_WIDEST = 3        # ... up to this round's reach (8 mm) ...
 HURRY_ROUNDS = 10       # ... for this many rounds; past them, wider again without end
 BLAME_TIE = 0.01        # mm: patches this much nearer trouble than another count as level with it
 TIME_LIMIT = 600        # seconds of building after which the optional refinements stop (--time-limit); see stl_to_solid
+SEW_PER_WORST = 1.5     # a part is sewn at this many times its loosest patch's distance off the mesh ...
+SEW_MOST = 0.2          # mm: ... but never wider than this ...
+SEW_EDGE = 2.0          # ... nor than this many times the mesh's median edge (see sewing_cap)
+LOOSE_ROUNDS = 3        # out of time with nothing blamed: tries without the loosest patches before none
 SWAP_ROUNDS = 6        # STL2CURVES_TRY=swap: rounds of taking blamed patches out again
 FIX_PRECISIONS = (1e-5, 1e-4)   # mm: precisions ShapeFix tries on an invalid solid after its default
 EMPTY_SHELL = 1e-6      # closed shells with less volume than this share of the biggest are dropped
@@ -257,21 +261,28 @@ def mesh_volume(mesh):
 def solids_from_shells(sewn, inward=True, specks=False):
     """Turn sewn shells into solids. A shell inside another is a cavity, the rest are bodies
     (inward False: the mesh has no inward-facing shell, so every shell is a body;
-    specks True: each shell less its specks, see _without_specks).
+    specks True: each shell less its specks, see _without_specks; None if no shell
+    has any, the solids then being the same as without).
 
     Returns (shape, number of bodies, number of cavities, total volume of material).
     """
-    shells = []
-    ex = TopExp_Explorer(sewn, TopAbs_SHELL)
+    found, ex = [], TopExp_Explorer(sewn, TopAbs_SHELL)
     while ex.More():
-        shell = TopoDS.Shell(ex.Current())
-        if specks:
-            shell = _without_specks(shell)
+        found.append(TopoDS.Shell(ex.Current()))
+        ex.Next()
+    if specks:
+        trimmed = [_without_specks(shell) for shell in found]
+        if all(t is s for t, s in zip(trimmed, found)):
+            # (nothing to leave out: made again, the solid would only be the same one,
+            # at the cost of a whole part's solids and volumes, 45 s on 46,000 faces)
+            return None
+        found = trimmed
+    shells = []
+    for shell in found:
         solid = fixed(BRepBuilderAPI_MakeSolid(shell).Solid())   # oriented outwards
         if solid.ShapeType() != TopAbs_SOLID:
             ex2 = TopExp_Explorer(solid, TopAbs_SOLID)
             if not ex2.More():
-                ex.Next()
                 continue                    # not a closed piece: ignore it
             solid = TopoDS.Solid(ex2.Current())
         solid = _without_empty_shells(solid)
@@ -280,7 +291,6 @@ def solids_from_shells(sewn, inward=True, specks=False):
             solid = TopoDS.Solid(solid.Reversed())
             v = -v
         shells.append((shell, solid, v))
-        ex.Next()
     if not shells:
         raise RuntimeError("no closed body found")
     # (a closed shell with next to no volume is two faces lying on each other, where the
@@ -548,7 +558,7 @@ def attempt(mesh, features, mesh_tol, tol, fuse, faceted_volume):
         return None, failed
     attempt.blamed = True
     worst = max((f.worst for f in features), default=0.0)
-    sewing = max(tol, min(0.2, 1.5 * worst))
+    sewing = max(tol, min(SEW_PER_WORST * worst, sewing_cap(mesh, tol)))
     sewn, free = sew(comp, sewing, shells, mesh.pts)
     if free:
         # patches whose faces left gaps: drop just those and try again
@@ -1064,6 +1074,53 @@ def _swap_build(mesh, features, mesh_tol, tol, info, faceted_volume):
     return None
 
 
+def sewing_cap(mesh, tol):
+    """The widest the part may be sewn (mm): SEW_MOST, and no more than SEW_EDGE times
+    the mesh's middling edge. Sewing merges the ends of edges shorter than its tolerance
+    and pairs edges up that far apart: on a fine mesh (a 189k-triangle frame, its
+    median edge 0.075 mm, sewn at 0.2 mm: two edges in three shorter than that) it tore
+    flat areas far from any curve, until a try failed with nothing to blame and every
+    curve of the part was dropped. One 4-facet freeform patch 0.29 mm off at its edges'
+    middles had set that 0.2: without it the same try sewed at 0.14 with no such gap;
+    at 0.1 or 0.075, more patches left gaps beside them, to be dropped."""
+    if "sew_cap" not in mesh.__dict__:
+        T = mesh.tris
+        e = np.linalg.norm(mesh.pts[T[:, [1, 2, 0]]] - mesh.pts[T], axis=2)
+        mesh.sew_cap = max(tol, min(SEW_MOST, SEW_EDGE * float(np.median(e))))
+    return mesh.sew_cap
+
+
+def _within_sewing(mesh, features, tol, info):
+    """On a mesh fine enough for sewing_cap to bite, the features less those whose
+    sewing would need more (an attempt sews at SEW_PER_WORST times its loosest patch's
+    worst): left faceted, the pieces they replaced tried in their place. Left to fail,
+    each would cost a try of the whole part (half a minute or more on such a mesh)."""
+    cap = sewing_cap(mesh, tol)
+    if cap >= SEW_MOST:
+        return features     # (as ever: a patch a little looser than that may still sew)
+    kept, back = [], []
+
+    def take(f, into):
+        if SEW_PER_WORST * f.worst <= cap:
+            into.append(f)
+        else:
+            info["skipped"].append(f)
+            for p in f.parts:
+                take(p, back)
+    for f in features:
+        take(f, kept)
+    return kept + back
+
+
+def _loosest(features, tol):
+    """The patches setting the sewing tolerance (those within a hair of the loosest), if
+    it is any wider than the bare facets'."""
+    worst = max((f.worst for f in features), default=0.0)
+    if SEW_PER_WORST * worst <= tol:
+        return []
+    return [f for f in features if f.worst >= 0.999 * worst]
+
+
 def _build(mesh, features, mesh_tol, tol, fuse, info):
     """Build and check one group of bodies, leaving faceted any feature that spoils it.
     Returns (shape, bodies, cavities)."""
@@ -1072,6 +1129,7 @@ def _build(mesh, features, mesh_tol, tol, fuse, info):
     faceted_volume = mesh_volume(mesh)
     _bare_ahead(mesh, tol)
     features = settle_blends(mesh, features, mesh_tol, split_blend, info["skipped"])
+    features = _within_sewing(mesh, features, tol, info)
     if "swap" in TRYING:
         got = _swap_build(mesh, features, mesh_tol, tol, info, faceted_volume)
         if got is not None:
@@ -1228,7 +1286,22 @@ def _build(mesh, features, mesh_tol, tol, fuse, info):
         search(used)
         used = accepted
     elif result is None:
-        info["skipped"] += used         # (out of time: the patches left stay faceted)
+        # Out of time, and the last try blamed nothing. If it left gaps near no patch
+        # (built afresh too), the loosest patches may be what widened the sewing that
+        # tore them: tried without those first, as all that is left to lose is every
+        # curve of the part (a 189k-triangle frame did, for one gap 8 mm from any patch,
+        # its sewing widened to 0.2 mm by a single 4-facet patch; without it, 0.14 and
+        # no such gap)
+        for _ in range(LOOSE_ROUNDS):
+            loose = _loosest(used, tol) if attempt.why == "free" else []
+            if not loose:
+                break
+            info["skipped"] += loose
+            result, used = good([f for f in used if all(f is not g for g in loose)])
+            if result is not None:
+                break
+        if result is None:
+            info["skipped"] += used     # (the patches left stay faceted)
     if result is None:
         result, used = good([])
     if result is None:

@@ -580,6 +580,21 @@ Key contracts:
   residual for the Jacobian (gutter screw 95 -> 54 s). Tried and dropped: an analytic
   Jacobian for `corner_surface` (12 s on the toolbox, but its fits land on other
   cylinders). `FILL_SECONDS` stays 5: passing fills take up to 4.2 s.
+- Thread search (2026-10-18), same threads on five searches (md5 of axis, pitch,
+  profile, facets): the instrument body (no threads) spent half its 55 s in `_lines`'
+  lead scan and most of the rest in `_angle_fit`'s scipy differences. The scan works in
+  place with `q - floor(q)` for `np.mod` (the same values, 4x quicker); the fit writes
+  out `np.cross`/`einsum`/`norm` coordinate by coordinate (einsum sums x, z, then y:
+  matched, else 662 of 681 fits drift) and does scipy's own two-point differences
+  (steps from `_numdiff`), reusing the residual at x; `Helical._nearest` tries the
+  profile's other copies only for points within reach of them. Instrument ~55 -> ~27 s,
+  gutter screw 65 -> ~45 s. A cheap bound to skip hopeless scans skipped 2 of 1,012
+  (the bands do gather on helix lines, 236 scans past MIN_GATHER, all then refused).
+  `features_near` keeps each patch's corner box (`_corner_box`): 79 s of test14's blame.
+  OCC's volume: per face it is taken from the shape's rough barycentre (mean of its
+  vertices as explored), and flat faces are already cheap from there; the quick
+  integration on flat faces with curved edges is 0.1 mm^3 off; from the origin the
+  adaptive one is 60 mm^3 off on the case back. Don't split the volume by face type.
 - `repair` cuts out small self-crossing knots and patches the hole; on a fine mesh the
   "knot" can be thousands of triangles whose hole doesn't patch, which left a watertight
   900k-triangle mesh open and unbuildable. A cut is kept only if its patch closes and
@@ -676,6 +691,22 @@ Key contracts:
   (`pool_tries`). Tried and dropped the same day: refitting blends whose fill fails as
   freeform surfaces (best: 9,745 faces vs 9,696; a freeform patch beside another fails
   with it, their shared edge on two fitted surfaces).
+- The sewing tolerance is one number for the whole part (1.5 x the loosest patch's
+  `worst`, at most 0.2), and on a fine mesh a wide one tears flat areas far from any
+  patch. test14 of the STL2STEP set (189k triangles, median edge 0.075 mm, two edges
+  in three shorter than 0.2) was sewn at 0.2 because of one 4-facet freeform patch
+  0.29 mm off at its edges' middles (`worst` is the sag at edge midpoints); after the
+  time limit a hurried try left a gap 8 mm from every patch, nothing was blamed, and
+  `_build` dropped all 709 curves left (46,711 faces). Replayed, the same try sewn at
+  0.14 had no such gap (at 0.1 / 0.075: 7 / 16 gaps, all beside patches). Now
+  `sewing_cap` holds the sewing to 2 x the median edge (only meshes under 0.1 mm median
+  are affected: none of the regression set) and `_within_sewing` leaves faceted up
+  front the patches that would need more; and out of time with nothing blamed, `_build`
+  tries without the loosest patches (`_loosest`, `LOOSE_ROUNDS`) before dropping every
+  curve. test14: 31,872 faces, 714 curves kept, 1,002 s (thinned to 66k triangles,
+  as on 2026-10-12: 13,632 faces in 29 min; its build runs out of time unthinned).
+  On it ShapeFix mended none of 9 invalid solids (11 s each); on nine Rak/GPS parts 13
+  of 61 (2 only at 1e-4), under 11 s a part: kept as it is.
 - Big multi-body meshes sew into hundreds of zero-volume shells (coincident face pairs);
   `solids_from_shells` drops them (`EMPTY_SHELL`), or body counts and fuses go wrong.
 

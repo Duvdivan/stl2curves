@@ -2359,14 +2359,30 @@ def point_facet_distance(mesh, facets, points):
 
 def features_near(mesh, features, points, reach=0.5):
     """Indices of the features whose facets come within `reach` mm of any of the points."""
-    if not points:
+    if not points or not features:
         return []
     points = np.asarray(points)
+    # (each patch's box kept on it, and all boxes tested at once: worked out afresh for
+    # every patch on every call, this took 79 s of a 2,000-patch part's blame)
+    boxes = np.array([_corner_box(mesh, f) for f in features])         # (patches, 2, 3)
+    lo, hi = boxes[:, 0] - reach, boxes[:, 1] + reach
+    hit = np.zeros(len(features), bool)
+    for i in range(0, len(points), 500):
+        p = points[i:i + 500][None]
+        hit |= np.any(np.all((p >= lo[:, None]) & (p <= hi[:, None]), axis=2), axis=1)
     out = []
-    for k, f in enumerate(features):
-        P = mesh.pts[np.unique(np.concatenate([mesh.fverts[x] for x in f.facets]))]
-        lo, hi = P.min(axis=0) - reach, P.max(axis=0) + reach
-        near = points[np.all((points >= lo) & (points <= hi), axis=1)]
-        if len(near) and point_facet_distance(mesh, f.facets, near).min() <= reach:
-            out.append(k)
+    for k in np.flatnonzero(hit):
+        near = points[np.all((points >= lo[k]) & (points <= hi[k]), axis=1)]
+        if point_facet_distance(mesh, features[k].facets, near).min() <= reach:
+            out.append(int(k))
     return out
+
+
+def _corner_box(mesh, f):
+    """The lowest and highest corner coordinates of a patch's facets (kept on the patch,
+    for as long as its facets are the same)."""
+    got = f.__dict__.get("_corner_box")
+    if got is None or got[0] is not f.facets:
+        P = mesh.pts[np.unique(np.concatenate([mesh.fverts[x] for x in f.facets]))]
+        got = f._corner_box = (f.facets, (P.min(axis=0), P.max(axis=0)))
+    return got[1]
