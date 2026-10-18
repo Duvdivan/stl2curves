@@ -713,7 +713,11 @@ Key contracts:
   curve. test14: 31,872 faces, 714 curves kept, 1,002 s (thinned to 66k triangles,
   as on 2026-10-12: 13,632 faces in 29 min; its build runs out of time unthinned).
   On it ShapeFix mended none of 9 invalid solids (11 s each); on nine Rak/GPS parts 13
-  of 61 (2 only at 1e-4), under 11 s a part: kept as it is.
+  of 61 (2 only at 1e-4), under 11 s a part: kept as it is. Two-pass sewing (0.01, then
+  the wide tolerance on the result) closed test14's far gap at 0.2 and took half the
+  time, but on the GPS case back left 7-14 free edges in every one of 19 tries where one
+  pass left 0-5 (`compare/timing/sewcmp.py`): the tight pass pairs edges the wide one
+  can't undo. Not a general replacement.
 - Big multi-body meshes sew into hundreds of zero-volume shells (coincident face pairs);
   `solids_from_shells` drops them (`EMPTY_SHELL`), or body counts and fuses go wrong.
 

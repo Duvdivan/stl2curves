@@ -137,7 +137,7 @@ choose it under Options instead.
 ### Time
 
 Small parts take seconds, typical printed parts of 5,000-15,000 triangles a minute or
-two, and very large ones (hundreds of thousands of triangles) about ten minutes. The
+two, and very large ones (hundreds of thousands of triangles) ten to thirty minutes. The
 slow steps run in parallel on all but two of the computer's cores (up to 16 worker
 processes). After the time limit (counted from when building starts: finding the
 surfaces always runs to the end), fitting further freeform faces and hunting down
