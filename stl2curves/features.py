@@ -153,6 +153,28 @@ def _edges(tris):
     return np.sort(tris[:, [0, 1, 1, 2, 2, 0]].reshape(-1, 2), axis=1)
 
 
+def _edge_counts(tris, npts):
+    """np.unique(_edges(tris), axis=0, return_counts=True), by one integer key per edge:
+    the same rows in the same order (lowest corner, then highest), without sorting the
+    rows as records (a good part of a big mesh's analysis)."""
+    E = _edges(tris)
+    m = np.int64(npts) + 1
+    key, counts = np.unique(E[:, 0].astype(np.int64) * m + E[:, 1], return_counts=True)
+    return np.stack([key // m, key % m], axis=1).astype(E.dtype), counts
+
+
+def _uniq(a):
+    """np.unique of a 1-d integer array (sorted, each value once), at a third of its
+    cost on big arrays and half on the small ones analysis asks for by the million."""
+    a = np.sort(a)
+    if len(a) < 2:
+        return a
+    keep = np.empty(len(a), bool)
+    keep[0] = True
+    np.not_equal(a[1:], a[:-1], out=keep[1:])
+    return a[keep]
+
+
 MERGE_MAX_DEG = 1     # rounding noise never explains a bigger tilt than this
 AXIS_NOISE = 10       # on a known axis, corners may sit this many rounding steps off
 MIN_VOUCHED_CONE_DEG = 5    # ... but a cone found that way must taper at least this much
@@ -256,7 +278,7 @@ class Mesh:
         fc = np.zeros((nf, 3))
         np.add.at(fc, self.facet_of, self.pts[self.tris].mean(axis=1) * self.tarea[:, None])
         self.fcent = fc / self.farea[:, None]
-        self.fverts = [np.unique(self.tris[t]) for t in self.ftris]
+        self.fverts = [_uniq(self.tris[t].ravel()) for t in self.ftris]
 
         f1, f2 = self.facet_of[t1[~flat]], self.facet_of[t2[~flat]]
         ends = edges[shared[~flat]]
@@ -546,7 +568,7 @@ class Region:
         self.reads = self.marks = None  # (while trying pairs ahead in a worker: see _pairs_slice)
 
     def points(self, idx):
-        return self.P[np.unique(np.concatenate([self.fv[i] for i in idx]))]
+        return self.P[_uniq(np.concatenate([self.fv[i] for i in idx]))]
 
     def _test(self, model, idx):
         """For facets idx: does each lie on the surface, which way does it face, surface normals."""
@@ -706,7 +728,7 @@ def _candidate(mesh, region, model, seeds, axis_fixed=False):
     result = None
     min_facets = 2 if _loose else 3
     for m, ids in options:
-        if len(ids) < min_facets or len(np.unique(np.round(region.n[ids], 3), axis=0)) < min_facets:
+        if len(ids) < min_facets or _fewer_distinct(np.round(region.n[ids], 3), min_facets):
             continue
         feature = _feature(mesh, m, region.facets[ids], convex)
         if feature is None:
@@ -720,6 +742,17 @@ def _candidate(mesh, region, model, seeds, axis_fixed=False):
         if region.marks is not None:
             region.marks.append(idx)                # (see _pairs_slice)
     return result
+
+
+def _fewer_distinct(rows, k):
+    """Whether rows has fewer than k distinct rows, as np.unique(rows, axis=0) counts
+    them (which sorts them all as records: most of the loose pass's time on a big mesh)."""
+    rest = rows
+    for _ in range(k):
+        if not len(rest):
+            return True
+        rest = rest[1:][(rest[1:] != rest[0]).any(axis=1)]
+    return False
 
 
 def _best(candidates):
@@ -876,7 +909,7 @@ def _whole_despite_seams(mesh, region, model):
     if on.mean() < WHOLE_ON_SURFACE or off.max() > WHOLE_STRAY:
         return None
     T = mesh.tris[np.concatenate([mesh.ftris[f] for f in region.facets])]
-    uniq, counts = np.unique(_edges(T), axis=0, return_counts=True)
+    uniq, counts = _edge_counts(T, len(mesh.pts))
     if not set(region.vids[~on].tolist()) <= set(uniq[counts == 1].ravel().tolist()):
         return None
     ok, out, surface_n = region._test(model, idx)
@@ -1101,7 +1134,7 @@ def _band_tori(mesh, regions, features):
         """(radius, point on the tube's centre line) for a small piece, else None."""
         m = f.model
         if isinstance(m, Sphere):
-            P = mesh.pts[np.unique(np.concatenate([mesh.fverts[x] for x in f.facets]))]
+            P = mesh.pts[_uniq(np.concatenate([mesh.fverts[x] for x in f.facets]))]
             return (m.r, m.c) if np.ptp(P, axis=0).max() <= 2.5 * m.r else None
         if isinstance(m, Revolved) and m.line and m.line[1] == 0 and f.span < TWO_PI:
             if f.hi - f.lo <= 4 * m.line[0]:
@@ -1143,7 +1176,7 @@ def _band_tori(mesh, regions, features):
         return out
 
     def points(ks):
-        return mesh.pts[np.unique(np.concatenate([mesh.fverts[x] for k in ks for x in features[k].facets]))]
+        return mesh.pts[_uniq(np.concatenate([mesh.fverts[x] for k in ks for x in features[k].facets]))]
 
     def tube(ks):
         """The torus or cylinder through these pieces, if their mesh corners lie on it."""
@@ -1494,7 +1527,7 @@ def _seed_slice(job):
                         continue
                     region.reads, region.marks = [], []
                     best = _seed_try(mesh, region, i, j, how)
-                    out.append((i, j, best, np.unique(np.concatenate(region.reads)).astype(np.int32), region.marks))
+                    out.append((i, j, best, _uniq(np.concatenate(region.reads)).astype(np.int32), region.marks))
                     if best:
                         region.free[best[1]] = False
                         break
@@ -1559,7 +1592,7 @@ def _pair_seed(mesh, region, i, j, axes=None):
 def _simple_outline(mesh, fids):
     """True if no vertex appears more than once on the patch's outline loops."""
     T = np.concatenate([mesh.tris[mesh.ftris[f]] for f in fids])
-    uniq, counts = np.unique(_edges(T), axis=0, return_counts=True)
+    uniq, counts = _edge_counts(T, len(mesh.pts))
     rim = uniq[counts == 1].ravel()
     return len(rim) == 0 or np.bincount(rim).max() <= 2
 
@@ -1663,7 +1696,7 @@ def snap(mesh, features, round_unit=None):
     only if the patch's mesh corners still lie on the surface; otherwise it is undone."""
     from .sizing import roundness, INCH
     tol = 2 * _tol()
-    points = [mesh.pts[np.unique(np.concatenate([mesh.fverts[f] for f in x.facets]))] for x in features]
+    points = [mesh.pts[_uniq(np.concatenate([mesh.fverts[f] for f in x.facets]))] for x in features]
     changed = 0
 
     def fits(model, P):
@@ -1743,7 +1776,7 @@ def _strip_of(model, other):
 def _holds(mesh, model, facets, tol, convex):
     """Do these facets' corners all lie within tol of the model's surface, each facet
     facing along it (within NORMAL_DEG) the way a patch of it that is convex (or not) does?"""
-    P = mesh.pts[np.unique(np.concatenate([mesh.fverts[f] for f in facets]))]
+    P = mesh.pts[_uniq(np.concatenate([mesh.fverts[f] for f in facets]))]
     if np.abs(model.signed(P)).max() > tol:
         return False
     facing = np.einsum("ij,ij->i", mesh.fn[facets], model.normal(mesh.fcent[facets]))
@@ -1950,7 +1983,7 @@ def _joint_surface(mesh, a, b):
     stray = max(1, int(JOINT_STRAY * min(len(a.facets), len(b.facets))))
 
     def fit(facets):
-        P = mesh.pts[np.unique(np.concatenate([mesh.fverts[f] for f in facets]))]
+        P = mesh.pts[_uniq(np.concatenate([mesh.fverts[f] for f in facets]))]
         model = _tube_fit(P, big.model)
         if model is None:
             return None, None
@@ -1971,7 +2004,7 @@ def _joint_surface(mesh, a, b):
     # (and it must reach at least a radius along or round its surface, or the corners
     # don't pin the radius down: specks of the latch's pocket corners, 0.13 mm of an
     # r 0.5 round, r 0.57 and 0.50, joined as r 0.49, and their faces left gaps)
-    P = mesh.pts[np.unique(np.concatenate([mesh.fverts[f] for f in keep]))]
+    P = mesh.pts[_uniq(np.concatenate([mesh.fverts[f] for f in keep]))]
     rho, z, w = model.local(P)
     u = np.unwrap(np.sort(model.angle(w)))
     if model.line:
@@ -2112,7 +2145,7 @@ def corner_surface(mesh, facets):
     N = mesh.fn[fac]
     if math.degrees(math.acos(max(-1.0, min(1.0, float((N @ N.T).min()))))) < MIN_SPAN_DEG:
         return None
-    P = mesh.pts[np.unique(np.concatenate([mesh.fverts[f] for f in fac]))]
+    P = mesh.pts[_uniq(np.concatenate([mesh.fverts[f] for f in fac]))]
     c0 = P.mean(axis=0)
     out_n = N.mean(axis=0)
     out_n /= max(np.linalg.norm(out_n), 1e-12)
@@ -2167,7 +2200,7 @@ def _distinct_axes(features, mesh=None):
             found.append((m.a, m.d, size))
         elif isinstance(m, Sphere) and mesh is not None:
             inside = set(f.facets.tolist())
-            P = mesh.pts[np.unique(np.concatenate([mesh.fverts[x] for x in f.facets]))]
+            P = mesh.pts[_uniq(np.concatenate([mesh.fverts[x] for x in f.facets]))]
             if np.ptp(P, axis=0).max() < m.r:
                 continue                      # a small piece of something else
             border = {g for x in f.facets for g in mesh.nbrs[x] if g not in inside}
@@ -2271,10 +2304,10 @@ class Feature:
 def _feature(mesh, model, fids, convex):
     tids = np.concatenate([mesh.ftris[f] for f in fids])
     T = mesh.tris[tids]
-    P = mesh.pts[np.unique(T)]
-    uniq, counts = np.unique(_edges(T), axis=0, return_counts=True)
+    P = mesh.pts[_uniq(T.ravel())]
+    uniq, counts = _edge_counts(T, len(mesh.pts))
     rim_edges = uniq[counts == 1]
-    rim = mesh.pts[np.unique(rim_edges)]
+    rim = mesh.pts[_uniq(rim_edges.ravel())]
 
     # How far each facet sits from the true surface, sampled at its edge midpoints
     # (exact for the near-parabolic gap between a flat facet and a curved surface).
@@ -2323,7 +2356,7 @@ def _feature(mesh, model, fids, convex):
 def _loose_support(mesh, fids, kind):
     """stlToSolid-style minimum evidence: enough facets, turning through enough angle."""
     n = mesh.fn[fids]
-    if len(np.unique(np.round(n, 3), axis=0)) < LOOSE_MIN_FACETS[kind]:
+    if _fewer_distinct(np.round(n, 3), LOOSE_MIN_FACETS[kind]):
         return False
     return (n @ n.T).min() <= math.cos(math.radians(LOOSE_MIN_TURN_DEG[kind]))
 

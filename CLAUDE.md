@@ -595,6 +595,13 @@ Key contracts:
   vertices as explored), and flat faces are already cheap from there; the quick
   integration on flat faces with curved edges is 0.1 mm^3 off; from the origin the
   adaptive one is 60 mm^3 off on the case back. Don't split the volume by face type.
+  Analysis on test14 (sampled, `compare/timing/sampler.py`): np.unique 26 s of "finding
+  what is left", mostly `Region.points`, `_holds`, `_feature`; `features._uniq` (sort
+  and mask) and `_edge_counts` (one int64 key per edge instead of np.unique(axis=0)'s
+  record sort) give the same arrays, but the sorting itself was most of it: test14
+  306 -> 299 s, toolbox 174 -> 172 (fingerprints the same on five parts). Blends'
+  `corner_surface` (65 s on test14, from `_grow_exact`) is scipy's trust-region
+  machinery on tiny problems, 12 fits a call: not to be sped up without other fits.
 - `repair` cuts out small self-crossing knots and patches the hole; on a fine mesh the
   "knot" can be thousands of triangles whose hole doesn't patch, which left a watertight
   900k-triangle mesh open and unbuildable. A cut is kept only if its patch closes and
