@@ -355,7 +355,11 @@ as BRep files, the mesh once per pass via `workers.share`/`load`. What runs ther
 - Cutting trimmed faces from their surfaces (`build._cut_all`): outlines are worked out
   in the main process in patch order (`_trimmed_outline`; a run two patches share is
   built once, by whichever comes first), the slow cut (`_trimmed_cut`) in the workers.
-  The first build of the GPS case went from 148 s to 12 s.
+  The first build of the GPS case went from 148 s to 12 s. Once only overrunning cuts
+  are left, any past `CUT_SECONDS` (60) counts as failed (the fidget's first build was
+  one torus patch's 360 s cut, its 4,526 outline edges every way tried, failing anyway;
+  every other cut took under 8 s), and a patch with `LONG_OUTLINE` edges goes to a
+  worker even alone, so the cap holds for it.
 - Blend fills (each capped at `FILL_SECONDS`) and their fit checks (`_assess_blend`, a
   check still running after `ASSESS_RUN_SECONDS` fails its blend: Rak N-USB waited 60 s
   for one 6-facet blend's check, which ran 115 s),

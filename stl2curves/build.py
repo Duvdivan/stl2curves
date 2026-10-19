@@ -354,6 +354,8 @@ class Edges:
 
 LONG_STEP = 3.0     # a step this many times the run's typical one gets points along it
 PARALLEL_CUTS = 8   # patches: this many faces to cut at once go to the worker processes
+CUT_SECONDS = 60    # a cut in a worker still running after this long, with nothing else left, counts as failed
+LONG_OUTLINE = 1000  # edges: a patch with an outline this long is cut in a worker even alone (so CUT_SECONDS holds)
 OUTLINE_FIRST = 300     # facets: a freeform patch this big gets its face from its outline first
 SHARED_TOLERANCE = 0.005    # mm: a flat face mended within this keeps its shared edges and corners
 SHARED_CROWD = 0.02     # mm: a mesh point this near another keeps corners of its own, for sewing to merge
@@ -1286,7 +1288,7 @@ def _cut_all(mesh, jobs, tol):
     they broke down) are left for the caller to cut here."""
     out = {}
     pool = workers.get()
-    if pool is None or len(jobs) < PARALLEL_CUTS:
+    if pool is None or (len(jobs) < PARALLEL_CUTS and all(len(tools) < LONG_OUTLINE for _, _, tools, _, _ in jobs)):
         return out
     tmp = tempfile.mkdtemp(prefix="stl2curves_")
     try:
@@ -1310,10 +1312,32 @@ def _cut_all(mesh, jobs, tol):
                 _surface_to(feature.model, surface_path)
             job = (mesh.shared_as, feature, tools_path, [len(x) for x in per_loop], loops, tol, face_path,
                    surface_path, has_surface)
-            futures[pool.submit(_cut_job, job)] = (key, face_path)
+            future = pool.submit(_cut_job, job)
+            futures[future] = (key, face_path)
             if not has_surface and hasattr(feature.model, "_surface"):
-                back.append((feature.model, surface_path))
+                back.append((feature.model, surface_path, future))
+        # (cuts take seconds, but one with an outline of thousands of edges can grind on
+        # for minutes and fail anyway: a 920k-triangle mesh's first build was one torus
+        # patch's 360 s cut, its 4,526 edges every way tried. Once only overrunning cuts
+        # are left, they count as failed; their workers are left to finish them, and are
+        # restarted once the part is done, as for blend fills)
+        # (looked at twice a second, not at every answer: waiting on thousands of cuts
+        # at once costs a pass over all of them each time)
+        from concurrent.futures import wait
+        started, pending = {}, set(futures)
+        while pending:
+            _, pending = wait(pending, timeout=0.5)
+            now = time.time()
+            for f in pending:
+                if f.running():
+                    started.setdefault(f, now)
+            if pending and all(f in started and now - started[f] > CUT_SECONDS for f in pending):
+                workers.abandoned()
+                break
         for f, (key, face_path) in futures.items():
+            if not f.done():
+                out[key] = None         # (overran: failed, not left to be cut here)
+                continue
             if f.exception() is not None:
                 continue
             face = None
@@ -1325,8 +1349,8 @@ def _cut_all(mesh, jobs, tol):
                 elif TopExp_Explorer(shape, TopAbs_FACE).More():
                     face = shape        # (a patch in several pieces: their compound)
             out[key] = face
-        for model, path in back:
-            if model._surface is None:
+        for model, path, future in back:
+            if model._surface is None and future.done() and os.path.exists(path):
                 _surface_from(model, path)
     except Exception:
         out = {}                        # (the worker processes broke down: cut them here)

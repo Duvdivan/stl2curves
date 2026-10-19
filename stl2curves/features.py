@@ -458,7 +458,21 @@ class Revolved:
         return np.hypot(rho - rc, z - zc) - r
 
     def normal(self, p):
+        return self._normal(*self.local(p))
+
+    def signed_normal(self, p):
+        """signed(p) and normal(p) at once, the points placed round the axis only once
+        (the same numbers: Region._test asks for both, millions of times)."""
         rho, z, w = self.local(p)
+        if self.line:
+            c0, k = self.line
+            signed = (rho - c0 - k * z) / math.hypot(1, k)
+        else:
+            rc, zc, r = self.circle
+            signed = np.hypot(rho - rc, z - zc) - r
+        return signed, self._normal(rho, z, w)
+
+    def _normal(self, rho, z, w):
         radial = w / np.maximum(rho, 1e-12)[:, None]
         radial[rho < 1e-9] = 0
         if self.line:
@@ -488,6 +502,12 @@ class Sphere:
     def normal(self, p):
         v = np.atleast_2d(p) - self.c
         return v / np.maximum(np.linalg.norm(v, axis=1), 1e-12)[:, None]
+
+    def signed_normal(self, p):
+        """signed(p) and normal(p) at once (as Revolved.signed_normal)."""
+        v = np.atleast_2d(p) - self.c
+        d = np.linalg.norm(v, axis=1)
+        return d - self.r, v / np.maximum(d, 1e-12)[:, None]
 
 
 _mesh_tol = TOL
@@ -653,20 +673,35 @@ class Region:
         """For facets idx: does each lie on the surface, which way does it face, surface normals."""
         idx = np.asarray(idx, dtype=np.intp)
         verts, heads, lens = self._corners(idx)
-        worst = np.maximum.reduceat(np.abs(model.signed(self.P[verts])), heads)
-        surface_n = model.normal(self.c[idx])
+        # (distance and normal together where both are wanted: a few microseconds a
+        # call, but grow asks millions of times)
+        both = getattr(model, "signed_normal", None)
+        if both is not None:
+            centre_d, surface_n = both(self.c[idx])
+        else:
+            centre_d, surface_n = model.signed(self.c[idx]), model.normal(self.c[idx])
+        if _loose and both is not None:
+            corner_d, corner_n = both(self.P[verts])
+        else:
+            corner_d = model.signed(self.P[verts])
+        worst = np.maximum.reduceat(np.abs(corner_d), heads)
         facing = np.einsum("ij,ij->i", self.n[idx], surface_n)
         if _loose:
             # the surface normal's own spread over the facet is allowed on top: the
             # widest angle between the surface normals at its corners, worked out for
             # all the facets at once (facets of each corner count together; one facet
             # at a time it was most of the loose pass on a 900k-triangle mesh)
-            corner_n = model.normal(self.P[verts])
-            least = np.empty(len(idx))
-            for count in np.unique(lens).tolist():
-                at = np.flatnonzero(lens == count)
-                S = corner_n[(heads[at, None] + np.arange(count)).ravel()].reshape(len(at), count, 3)
-                least[at] = (S @ S.transpose(0, 2, 1)).min(axis=(1, 2))
+            if both is None:
+                corner_n = model.normal(self.P[verts])
+            if (lens == lens[0]).all():
+                S = corner_n.reshape(len(idx), int(lens[0]), 3)
+                least = (S @ S.transpose(0, 2, 1)).min(axis=(1, 2))
+            else:
+                least = np.empty(len(idx))
+                for count in np.unique(lens).tolist():
+                    at = np.flatnonzero(lens == count)
+                    S = corner_n[(heads[at, None] + np.arange(count)).ravel()].reshape(len(at), count, 3)
+                    least[at] = (S @ S.transpose(0, 2, 1)).min(axis=(1, 2))
             spread = np.array([math.acos(max(-1.0, min(1.0, x))) for x in least.tolist()])
             aligned = np.abs(facing) >= np.cos(np.minimum(np.radians(LOOSE_NORMAL_DEG) + spread,
                                                           np.radians(60)))
@@ -674,7 +709,7 @@ class Region:
         else:
             aligned = (np.abs(facing) >= math.cos(math.radians(NORMAL_DEG))) | self.sliver[idx]
             gap = MAX_SAG
-        on = (worst <= _tol(model)) & (np.abs(model.signed(self.c[idx])) <= gap) & aligned
+        on = (worst <= _tol(model)) & (np.abs(centre_d) <= gap) & aligned
         if self.reads is not None:
             # (see _seed_slice: only the facets whose answer turned on whether they were
             # free. One off the surface is refused either way; counted, every facet

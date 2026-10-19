@@ -1215,7 +1215,8 @@ def _build(mesh, features, mesh_tol, tol, fuse, info):
                         # end of a whole try each time; it comes back below if the file
                         # stays broken without it)
                         blamed.append(f)
-            subset = [f for k, f in enumerate(subset) if k not in failed] + back
+            gone = set(failed)      # (a set: thousands blamed at once in a hurry round)
+            subset = [f for k, f in enumerate(subset) if k not in gone] + back
             if attempt.blamed and time.time() > deadline:
                 # (a whole build and sew is at stake each time: blame widely from now on)
                 mesh.hurry += 1
@@ -1227,7 +1228,10 @@ def _build(mesh, features, mesh_tol, tol, fuse, info):
             nonlocal result, subset
             if not group or time_left() < 0:
                 return
-            trial = [f for f in subset if all(f is not p for b in group for p in b.parts)] + group
+            # (by identity, through a set of ids: a hurry round's group of hundreds,
+            # each checked against every patch of the part, grew with their product)
+            pieces = {id(p) for b in group for p in b.parts}
+            trial = [f for f in subset if id(f) not in pieces] + group
             # (the STEP file checked whatever rounds are left: a patch dropped for it must
             # not come back unchecked)
             mesh.file_trial = True
@@ -1237,7 +1241,8 @@ def _build(mesh, features, mesh_tol, tol, fuse, info):
                 mesh.file_trial = False
             if got is not None and not drop:
                 result, subset = got, trial
-                info["skipped"] = [f for f in info["skipped"] if all(f is not b for b in group)]
+                back_in = {id(b) for b in group}
+                info["skipped"] = [f for f in info["skipped"] if id(f) not in back_in]
             elif len(group) > 1:
                 # (the try names its culprits: the rest of the group goes straight back
                 # in, then each one named alone, as it may only clash with another.
