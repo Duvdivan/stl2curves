@@ -911,7 +911,8 @@ def culprits(mesh, features, points):
     P = np.asarray(points)
     dist = {}
     for k in near:
-        dist[k] = point_facet_distance(mesh, features[k].facets, P)     # per trouble spot
+        # (per trouble spot; only distances up to 0.5 mm and a tie count below)
+        dist[k] = point_facet_distance(mesh, features[k].facets, P, within=0.5 + BLAME_TIE)
     # blends are the likeliest cause and the cheapest loss: blame one nearby first
     blends = [k for k in near if features[k].kind == "blend"]
     out = set()

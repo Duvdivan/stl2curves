@@ -744,6 +744,22 @@ Key contracts:
   8 means no answer anyway. The same matrix/svd patterns ran in the workers' seed
   passes, hence some of their memory peaks. Look for n x n intermediates before
   blaming the algorithm.
+- Whole-region and one-at-a-time work (2026-10-18, the fidget's analysis and blame;
+  same features, same faces): `_trim` placed every corner of the region (most of the
+  part) on each candidate's profile, and the loose pass's `_test` took each facet's
+  corner normals one facet at a time; both now work on the patch's own corners, all at
+  once (`Region._corners`). A seed try in a worker records only the facets whose answer
+  turned on being free (those passing the geometric tests): recording every facet tested,
+  any neighbouring patch found since made the replay redo the try here (the fidget's
+  main process redid most of its loose pass, 1,080 of 1,184 s, the workers idle).
+  `_merge_same_surface` goes on after a merge instead of starting over (everything before
+  the merged patch had been refused already: only the patches before it that touch it
+  are tried with it). The blame measured every triangle of each nearby patch against
+  every trouble point (293 s of one try): `point_facet_distance(within=)` measures each
+  triangle only against the points within reach of the ball round it (KD tree), the
+  distances up to `within` the same. Rewrites like these are checked with a snapshot
+  running old and new side by side on every call (`compare/timing/tst/chkrun.py`,
+  `fullrun.py`, snap_chk*), then fingerprints.
 - Big multi-body meshes sew into hundreds of zero-volume shells (coincident face pairs);
   `solids_from_shells` drops them (`EMPTY_SHELL`), or body counts and fuses go wrong.
 

@@ -613,11 +613,6 @@ def _on_axis(axis, P):
 
 # ---------------------------------------------------------------- growing patches
 
-def _normal_spread(model, pts):
-    n = model.normal(pts)
-    return math.acos(max(-1.0, min(1.0, float((n @ n.T).min()))))
-
-
 class Region:
     """A set of smoothly connected facets, with fast "which facets lie on this surface" tests."""
 
@@ -628,6 +623,7 @@ class Region:
         lists = [mesh.fverts[f] for f in self.facets]
         lens = np.array([len(l) for l in lists])
         self.vids, self.vinv = np.unique(np.concatenate(lists), return_inverse=True)
+        self.lens = lens
         self.starts = np.r_[0, np.cumsum(lens)[:-1]]
         self.fv = np.split(self.vinv, np.cumsum(lens)[:-1])
         self.P = mesh.pts[self.vids]
@@ -639,31 +635,54 @@ class Region:
         self.sliver = mesh.farea[self.facets] < 0.05 * self.size ** 2
         self.free = np.ones(len(self.facets), bool)
         self.explored = np.zeros(len(self.facets), bool)
-        self.reads = self.marks = None  # (while trying pairs ahead in a worker: see _pairs_slice)
+        self.reads = self.marks = None  # (while trying pairs ahead in a worker: see _seed_slice)
 
     def points(self, idx):
         return self.P[_uniq(np.concatenate([self.fv[i] for i in idx]))]
 
+    def _corners(self, idx):
+        """The corners of facets idx (positions in self.P), facet after facet, where each
+        facet's corners begin among them, and how many each has. Gathered in one go: a
+        list of each facet's corner array, joined, cost more than the tests on them."""
+        lens = self.lens[idx]
+        ends = np.cumsum(lens)
+        heads = ends - lens
+        return self.vinv[np.repeat(self.starts[idx] - heads, lens) + np.arange(ends[-1])], heads, lens
+
     def _test(self, model, idx):
         """For facets idx: does each lie on the surface, which way does it face, surface normals."""
-        lens = np.array([len(self.fv[i]) for i in idx])
-        verts = np.concatenate([self.fv[i] for i in idx])
-        worst = np.maximum.reduceat(np.abs(model.signed(self.P[verts])), np.r_[0, np.cumsum(lens)[:-1]])
+        idx = np.asarray(idx, dtype=np.intp)
+        verts, heads, lens = self._corners(idx)
+        worst = np.maximum.reduceat(np.abs(model.signed(self.P[verts])), heads)
         surface_n = model.normal(self.c[idx])
         facing = np.einsum("ij,ij->i", self.n[idx], surface_n)
         if _loose:
-            # the surface normal's own spread over the facet is allowed on top
-            spread = np.array([_normal_spread(model, self.P[self.fv[i]]) for i in idx])
+            # the surface normal's own spread over the facet is allowed on top: the
+            # widest angle between the surface normals at its corners, worked out for
+            # all the facets at once (facets of each corner count together; one facet
+            # at a time it was most of the loose pass on a 900k-triangle mesh)
+            corner_n = model.normal(self.P[verts])
+            least = np.empty(len(idx))
+            for count in np.unique(lens).tolist():
+                at = np.flatnonzero(lens == count)
+                S = corner_n[(heads[at, None] + np.arange(count)).ravel()].reshape(len(at), count, 3)
+                least[at] = (S @ S.transpose(0, 2, 1)).min(axis=(1, 2))
+            spread = np.array([math.acos(max(-1.0, min(1.0, x))) for x in least.tolist()])
             aligned = np.abs(facing) >= np.cos(np.minimum(np.radians(LOOSE_NORMAL_DEG) + spread,
                                                           np.radians(60)))
             gap = LOOSE_MAX_GAP
         else:
             aligned = (np.abs(facing) >= math.cos(math.radians(NORMAL_DEG))) | self.sliver[idx]
             gap = MAX_SAG
+        on = (worst <= _tol(model)) & (np.abs(model.signed(self.c[idx])) <= gap) & aligned
         if self.reads is not None:
-            self.reads.append(np.asarray(idx))      # (see _pairs_slice)
-        ok = ((worst <= _tol(model)) & (np.abs(model.signed(self.c[idx])) <= gap)
-              & aligned & self.free[idx])
+            # (see _seed_slice: only the facets whose answer turned on whether they were
+            # free. One off the surface is refused either way; counted, every facet
+            # round a patch's edge, often a neighbouring patch's, made the replay redo
+            # the try here once that neighbour was found: a 900k-triangle mesh redid
+            # most of its loose pass in this process, the workers idle)
+            self.reads.append(idx[on])
+        ok = on & self.free[idx]
         return ok, facing > 0, surface_n
 
     def grow(self, model, seeds):
@@ -760,8 +779,11 @@ def _trim(region, model, idx):
     tol = _tol(model)
     for _ in range(3):
         verts = [region.fv[i] for i in idx]
-        t, scale = _profile_param(model, region.P)
         used = np.unique(np.concatenate(verts))
+        # (only the patch's own corners placed: the whole region's took most of the
+        # loose pass's time on a 900k-triangle mesh, a region being most of the part)
+        t = np.empty(len(region.P))
+        t[used], scale = _profile_param(model, region.P[used])
         levels, counts = np.unique(np.round(t[used] * scale / tol), return_counts=True)
         busy = levels[counts >= max(4, 0.2 * counts.max())] * tol / scale
         if len(busy) == 0:
@@ -814,7 +836,7 @@ def _candidate(mesh, region, model, seeds, axis_fixed=False):
     if result is None and len(idx) >= 6:
         region.explored[idx] = True
         if region.marks is not None:
-            region.marks.append(idx)                # (see _pairs_slice)
+            region.marks.append(idx)                # (see _seed_slice)
     return result
 
 
@@ -1986,10 +2008,15 @@ def _sure(f):
 
 def _merge_same_surface(mesh, features):
     """Join neighbouring patches that lie on the same surface (a hole split in two by a
-    seam in the mesh, say), so each becomes one face. The loop starts over after each merge; pairs that touch are
-    found through their corners, and a pair found not to merge is skipped from then on
-    (its outcome depends only on the two features, the same objects until one merges):
-    trying every pair again after every merge took the toolbox 214 s, now 7."""
+    seam in the mesh, say), so each becomes one face. Pairs are tried in order (each
+    patch with those after it that share a corner, the first merge taking the first
+    patch's place); pairs that touch are found through their corners, and a pair found
+    not to merge is skipped from then on (its outcome depends only on the two features,
+    the same objects until one merges): trying every pair again after every merge took
+    the toolbox 214 s, now 7. After a merge the order goes on as if started over, which
+    it once was: every pair before the merged patch has been refused already, so only
+    the patches before it that touch it are tried with it (starting over and skipping
+    the refused pairs took a 23,000-patch mesh 2 minutes of looking up corners)."""
     verts = [set(np.concatenate([mesh.fverts[f] for f in x.facets]).tolist()) for x in features]
     failed = set()      # (pairs refused a joint surface)
     refused = {}        # (id(a), id(b)) -> (a, b): pairs that didn't merge (kept alive, so ids stay theirs)
@@ -1997,82 +2024,102 @@ def _merge_same_surface(mesh, features):
     for x, vs in zip(features, verts):
         for v in vs:
             users.setdefault(v, set()).add(id(x))
-    merged = True
-    while merged:
-        merged = False
-        index = {id(x): k for k, x in enumerate(features)}
-        for i in range(len(features)):
-            near = set()
-            for v in verts[i]:
-                near |= users[v]
-            for j in sorted(index[q] for q in near if index.get(q, -1) > i):
-                a, b = features[i], features[j]
-                if (id(a), id(b)) in refused:
-                    continue
-                # (one surface holding both is enough. And a cylinder found over
-                # SAME_FACETS facets or more, sure of itself, takes in a strip beside it
-                # fitted as nearly the same cylinder if its corners lie within SAME_TOL:
-                # a bore cut across by another had the corners along the crossing up to
-                # 12 um off, and held to the mesh tolerance came out as 44 strips, each a
-                # cylinder 0.02-0.3 mm off over its narrow arc. Only such strips: taking
-                # whatever lay that near cost the gutter mount 47 faces)
-                holder = None
-                for x, y in sorted(((a, b), (b, a)), key=lambda xy: -len(xy[0].facets)):
-                    if _sure(x) and _strip_of(x.model, y.model):
-                        ok = _holds(mesh, x.model, y.facets, max(SAME_TOL, _tol()), x.convex)
-                    else:
-                        ok = x.convex == y.convex and _holds(mesh, x.model, y.facets, _tol(), x.convex)
-                    if ok:
-                        holder = x
-                        break
-                both = None
-                if holder is not None:
-                    fids = np.concatenate([a.facets, b.facets])
-                    # (outline touching itself, e.g. equal holes crossing: no merge.) The
-                    # outline rules are waived for a sure holder, and for two pieces each
-                    # lying on the other's surface: each passed them alone. A box's 63 mm
-                    # r 2 bottom fillet came as 26 and 12 facets of one cylinder, their
-                    # long triangles interleaved, and together failed the outline rules;
-                    # the 12, touching one another only at corners, then couldn't be cut
-                    if _simple_outline(mesh, fids):
-                        other = b if holder is a else a
-                        sure = _sure(holder) or (
-                            other.convex == holder.convex and _holds(mesh, other.model, holder.facets, _tol(), other.convex))
-                        both = (_described if sure else _feature)(mesh, holder.model, fids, holder.convex)
-                    if both is not None:
-                        new_verts = verts[i] | verts[j]
-                if both is None:
-                    # (neither holds the other, or one did but the pair failed the
-                    # outline rules on its surface: one surface fitted to both, if exact,
-                    # pins it down well enough to waive them)
-                    pair = (a.facets.tobytes(), b.facets.tobytes())
-                    if pair in failed:
-                        refused[id(a), id(b)] = (a, b)
-                        continue
-                    joint = _joint_surface(mesh, a, b)
-                    both = (_described(mesh, joint[0], joint[1], a.convex)
-                            if joint is not None and _simple_outline(mesh, joint[1]) else None)
-                    if both is None:
-                        failed.add(pair)
-                        refused[id(a), id(b)] = (a, b)
-                        continue
-                    new_verts = set(np.concatenate([mesh.fverts[f] for f in both.facets]).tolist())
-                # (both takes a's place, b goes)
-                for v in verts[i]:
-                    users[v].discard(id(a))
-                for v in verts[j]:
-                    users[v].discard(id(b))
-                for v in new_verts:
-                    users.setdefault(v, set()).add(id(both))
-                verts[i] = new_verts
-                verts.pop(j)
-                features[i] = both
-                features.pop(j)
-                merged = True
+    index = {id(x): k for k, x in enumerate(features)}     # (merged-away patches leave a None)
+    features = list(features)
+
+    def near(i, before):
+        """Positions of the patches sharing a corner with patch i, after it or before it."""
+        ids = set()
+        for v in verts[i]:
+            ids |= users[v]
+        if before:
+            return sorted(index[q] for q in ids if index.get(q, i) < i)
+        return sorted(index[q] for q in ids if index.get(q, -1) > i)
+
+    def merge(i, j):
+        """Try patches i < j as one; if they merge, the joint patch takes i's place."""
+        a, b = features[i], features[j]
+        if (id(a), id(b)) in refused:
+            return False
+        # (one surface holding both is enough. And a cylinder found over
+        # SAME_FACETS facets or more, sure of itself, takes in a strip beside it
+        # fitted as nearly the same cylinder if its corners lie within SAME_TOL:
+        # a bore cut across by another had the corners along the crossing up to
+        # 12 um off, and held to the mesh tolerance came out as 44 strips, each a
+        # cylinder 0.02-0.3 mm off over its narrow arc. Only such strips: taking
+        # whatever lay that near cost the gutter mount 47 faces)
+        holder = None
+        for x, y in sorted(((a, b), (b, a)), key=lambda xy: -len(xy[0].facets)):
+            if _sure(x) and _strip_of(x.model, y.model):
+                ok = _holds(mesh, x.model, y.facets, max(SAME_TOL, _tol()), x.convex)
+            else:
+                ok = x.convex == y.convex and _holds(mesh, x.model, y.facets, _tol(), x.convex)
+            if ok:
+                holder = x
                 break
-            if merged:
+        both = None
+        if holder is not None:
+            fids = np.concatenate([a.facets, b.facets])
+            # (outline touching itself, e.g. equal holes crossing: no merge.) The
+            # outline rules are waived for a sure holder, and for two pieces each
+            # lying on the other's surface: each passed them alone. A box's 63 mm
+            # r 2 bottom fillet came as 26 and 12 facets of one cylinder, their
+            # long triangles interleaved, and together failed the outline rules;
+            # the 12, touching one another only at corners, then couldn't be cut
+            if _simple_outline(mesh, fids):
+                other = b if holder is a else a
+                sure = _sure(holder) or (
+                    other.convex == holder.convex and _holds(mesh, other.model, holder.facets, _tol(), other.convex))
+                both = (_described if sure else _feature)(mesh, holder.model, fids, holder.convex)
+            if both is not None:
+                new_verts = verts[i] | verts[j]
+        if both is None:
+            # (neither holds the other, or one did but the pair failed the
+            # outline rules on its surface: one surface fitted to both, if exact,
+            # pins it down well enough to waive them)
+            pair = (a.facets.tobytes(), b.facets.tobytes())
+            if pair in failed:
+                refused[id(a), id(b)] = (a, b)
+                return False
+            joint = _joint_surface(mesh, a, b)
+            both = (_described(mesh, joint[0], joint[1], a.convex)
+                    if joint is not None and _simple_outline(mesh, joint[1]) else None)
+            if both is None:
+                failed.add(pair)
+                refused[id(a), id(b)] = (a, b)
+                return False
+            new_verts = set(np.concatenate([mesh.fverts[f] for f in both.facets]).tolist())
+        # (both takes a's place, b goes)
+        for v in verts[i]:
+            users[v].discard(id(a))
+        for v in verts[j]:
+            users[v].discard(id(b))
+        for v in new_verts:
+            users.setdefault(v, set()).add(id(both))
+        del index[id(a)], index[id(b)]
+        index[id(both)] = i
+        verts[i], verts[j] = new_verts, None
+        features[i], features[j] = both, None
+        return True
+
+    i = 0
+    while i < len(features):
+        if features[i] is None:
+            i += 1
+            continue
+        for j in near(i, False):
+            if merge(i, j):
+                # (started over, the order would come to this patch again only after
+                # trying each patch before it that touches it with it, in order)
+                k = 0
+                while k is not None:
+                    k = next((k for k in near(i, True) if merge(k, i)), None)
+                    if k is not None:
+                        i = k
                 break
-    return features
+        else:
+            i += 1
+    return [x for x in features if x is not None]
 
 
 def _joint_surface(mesh, a, b):

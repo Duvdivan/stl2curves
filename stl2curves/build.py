@@ -757,9 +757,12 @@ def _plane_face(mesh, fid, tris, owner, bounds, edge_tri, edges):
     pts = mesh.pts
     # outer boundary first: the loop enclosing the most area
     normal = mesh.fn[fid]
-    area = lambda loop: abs(np.cross(pts[loop], pts[np.roll(loop, -1)]).sum(axis=0) @ normal)
-    loops.sort(key=area, reverse=True)
-    if area(loops[-1]) < 1e-9 * area(loops[0]) + 1e-9:
+    # (each loop's area worked out once: three times over, for 300,000 facets, it was a
+    # minute of a big mesh's first build)
+    areas = [abs(np.cross(pts[loop], pts[np.roll(loop, -1)]).sum(axis=0) @ normal) for loop in loops]
+    order = sorted(range(len(loops)), key=areas.__getitem__, reverse=True)
+    loops = [loops[k] for k in order]
+    if areas[order[-1]] < 1e-9 * areas[order[0]] + 1e-9:
         return None     # a slit (an outline enclosing nothing): left as triangles
     wires = []
     for loop in loops:
@@ -2328,24 +2331,40 @@ def _without_collapsed(shape, tol):
     return shape if bare is None else bare.Apply(shape)
 
 
-def point_facet_distance(mesh, facets, points):
+PAIRS_AT_ONCE = 1_000_000  # point-triangle pairs measured in one go by point_facet_distance(within=...)
+
+
+def point_facet_distance(mesh, facets, points, within=None):
     """Distance from each point to the nearest of the facets' triangles, (len(points),).
     (Not to their corners: a gap along a long straight edge has its middle far from
-    every corner, though it lies right on the facets.)"""
+    every corner, though it lies right on the facets.) With `within` (mm): the distances
+    up to that, the same; a point farther than that from every triangle gets inf or some
+    distance over it. Then each point is measured only against the triangles that could
+    be that near: measured against all of them, a big patch's thousands of triangles
+    against a few thousand trouble points, a 900k-triangle mesh spent minutes of each
+    blame here."""
     points = np.asarray(points, float)
+    if within is not None:
+        return _distance_within(mesh, facets, points, within)
     if len(points) > 32:        # (a few at a time: points x triangles arrays)
         return np.concatenate([point_facet_distance(mesh, facets, points[k:k + 32])
                                for k in range(0, len(points), 32)])
     T = mesh.tris[np.concatenate([mesh.ftris[x] for x in facets])]
     A, B, C = (mesh.pts[T[:, i]][None] for i in range(3))
-    P = points[:, None]
+    return _triangle_distance(points[:, None], A, B, C).min(axis=1)
+
+
+def _triangle_distance(P, A, B, C):
+    """Distance from points P to triangles ABC, element by element (broadcast: points
+    against triangles, or matching rows of pairs; each pair's distance comes out the
+    same bit for bit either way)."""
     # nearest point of each triangle's plane, kept only if it falls inside the triangle
     ab, ac = B - A, C - A
     n = np.cross(ab, ac)
     nn = np.maximum((n * n).sum(-1), 1e-300)
     h = ((P - A) * n).sum(-1) / nn
     Q = P - h[..., None] * n
-    inside = np.ones(Q.shape[:2], bool)
+    inside = np.ones(Q.shape[:-1], bool)
     for X, Y in ((A, B), (B, C), (C, A)):
         inside &= (np.cross(Y - X, Q - X) * n).sum(-1) >= 0
     d = np.where(inside, np.abs(h) * np.sqrt(nn), np.inf)
@@ -2354,7 +2373,36 @@ def point_facet_distance(mesh, facets, points):
         e = Y - X
         t = np.clip(((P - X) * e).sum(-1) / np.maximum((e * e).sum(-1), 1e-300), 0, 1)
         d = np.minimum(d, np.linalg.norm(P - (X + t[..., None] * e), axis=-1))
-    return d.min(axis=1)
+    return d
+
+
+def _distance_within(mesh, facets, points, within):
+    """point_facet_distance up to `within`: each triangle measured only against the
+    points within `within` of the ball round it (centred on its middle, through its
+    farthest corner), which holds every point that near it."""
+    from scipy.spatial import cKDTree
+    d = np.full(len(points), np.inf)
+    if not len(points):
+        return d
+    T = mesh.tris[np.concatenate([mesh.ftris[x] for x in facets])]
+    A, B, C = (mesh.pts[T[:, i]] for i in range(3))
+    mid = (A + B + C) / 3
+    ball = np.sqrt(np.max([((X - mid) ** 2).sum(axis=1) for X in (A, B, C)], axis=0))
+    # (a hair wider, for rounding: one point too many costs nothing)
+    reach = (within + ball) * (1 + 1e-6) + 1e-9
+    tree = cKDTree(points)
+    counts = tree.query_ball_point(mid, reach, return_length=True)
+    some = np.flatnonzero(counts)
+    start = 0
+    while start < len(some):
+        stop = start + max(1, int(np.searchsorted(np.cumsum(counts[some[start:]]), PAIRS_AT_ONCE)))
+        tris = some[start:stop]
+        lists = tree.query_ball_point(mid[tris], reach[tris])
+        which = np.concatenate([np.asarray(x, dtype=np.intp) for x in lists])
+        tri = np.repeat(tris, [len(x) for x in lists])
+        np.minimum.at(d, which, _triangle_distance(points[which], A[tri], B[tri], C[tri]))
+        start = stop
+    return d
 
 
 def features_near(mesh, features, points, reach=0.5):
@@ -2373,7 +2421,7 @@ def features_near(mesh, features, points, reach=0.5):
     out = []
     for k in np.flatnonzero(hit):
         near = points[np.all((points >= lo[k]) & (points <= hi[k]), axis=1)]
-        if point_facet_distance(mesh, features[k].facets, near).min() <= reach:
+        if point_facet_distance(mesh, features[k].facets, near, within=reach).min() <= reach:
             out.append(int(k))
     return out
 
