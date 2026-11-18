@@ -1,4 +1,67 @@
-# stl2curves
+# stl2curves is now Mesh Mix-S2C
+
+**stl2curves has merged with [Manifold Mesh Mix](https://github.com/TUNA-THE-FIRST/Manifold-Mesh-Mix). The result is one program, Mesh Mix-S2C:**
+
+## 👉 https://github.com/STL2CURVES-MMM/Mesh-Mix-S2C
+
+New work, releases and support all happen there. This repository stays online under its MIT licence as the original stl2curves.
+
+---
+
+## Why the merge
+
+The two projects were attacking the same problem from opposite ends: turning a printable mesh back into a solid you can edit in CAD.
+
+- **stl2curves** was good at *reading* a mesh. It found the fillets, screw threads, holes, bosses and freeform blends a designer drew, and rebuilt them as true planes, cylinders, cones, spheres, tori and smooth surfaces.
+- **Manifold Mesh Mix** was good at *finishing* the job. It is a polished desktop app with installers and self-update, mesh checking and repair, sew-free assembly of the solid, per-face fallbacks, and a check of the result against the mesh before anything is saved.
+
+Mesh Mix-S2C puts stl2curves' feature finding in front of Manifold Mesh Mix's engine. stl2curves names what it recognises and locks those surfaces in place, and Manifold Mesh Mix covers everything else, assembles the solid, judges it and saves a checked STEP file.
+
+## What you get
+
+- **A real desktop app** for Windows, macOS and Linux, with installers and automatic updates. No Python setup needed.
+- **STL, 3MF, OBJ and PLY in; STEP out.** The curved areas are true surfaces, so the part opens in Fusion, FreeCAD, SolidWorks and other CAD programs as faces you can select, fillet, offset, move and measure.
+- **CAD and smooth presets.** Use CAD for designed parts, and smooth for organic shapes.
+- **Honest results.** Every file is checked against the mesh before it is saved, and the app tells you what it is doing and why a file takes longer.
+
+## Already strong: the 2.0 release line
+
+On our benchmark of 98 real-world printable parts (brackets, enclosures, gears, threaded parts, printer parts), the released engine (2.0.1) saves every one as a STEP solid, and 97 of the 98 pass our validity check.
+
+## What's coming: design intent
+
+The next step, now in development, is a change of goal. We want to rebuild the shape the **designer drew**, not just a surface that fits the triangles. In practice:
+
+- **The designer's dimensions.** A 6 mm hole should come out as 6.000 mm, not 5.9987 mm. In development, **79%** of the rebuilt radii now equal the designer's own value, checked against the designers' original STEP files.
+- **The designer's surfaces, exactly.** On one heat-sink spacer, all **52 of 52** of the designer's surfaces are recovered exactly, with no freeform patches left. The released engine leaves 12 freeform patches on that part.
+- **Cleaner faces.** A wall the designer drew as a cylinder comes back as a cylinder, not a rough freeform patch, and a rounded edge along a curve becomes one smooth face. The part in the second picture below goes from 135 faces to 71.
+- **Helical gears understood as gears.** Each tooth flank is rebuilt as one face swept along the gear's screw motion.
+- **Failures you can see.** When part of a conversion fails, the good work is kept, and a data file records exactly which face failed, where and why. That record has already pointed us to several fixes: one of them cut the faces whose outline crosses itself by a third.
+
+**Before and after** (colours show surface types: grey flat, blue cylinder, green torus, purple sphere, red freeform):
+
+| Released engine (2.0.1) | Design intent (in development) |
+|---|---|
+| ![heat-sink spacer, 2.0.1: 64 faces, 12 of them freeform](images/heatsink_2.0.png) | ![heat-sink spacer, design intent: flat faces and cylinders only](images/heatsink_design_intent.png) |
+| A heat-sink spacer: its flat top rebuilt as freeform patches | The same part: flat faces and cylinders only, as it was drawn |
+| ![rounded block, 2.0.1: 135 faces](images/fillets_2.0.png) | ![rounded block, design intent: 71 faces](images/fillets_design_intent.png) |
+| The curved inner walls are rough freeform patches (135 faces) | The walls are true cylinders, with smooth faces along the rounded edges (71 faces) |
+
+The design-intent engine is tested on every one of our test files before anything ships. Progress is reported openly as it happens.
+
+## Follow along and get involved
+
+- **Downloads:** [releases](https://github.com/STL2CURVES-MMM/Mesh-Mix-S2C/releases)
+- **Progress reports:** [issue #12](https://github.com/STL2CURVES-MMM/Mesh-Mix-S2C/issues/12)
+- **Bugs, questions and problem files:** [Mesh-Mix-S2C issues](https://github.com/STL2CURVES-MMM/Mesh-Mix-S2C/issues)
+
+The Studio page (paint the areas a conversion missed), the FreeCAD add-on and design-size snapping are being carried over from stl2curves. Mesh Mix-S2C is open source under AGPL-3.0.
+
+---
+
+# The original stl2curves
+
+Everything below describes the original stl2curves, as it stays in this repository.
 
 Convert STL meshes and 3MF projects (3D-printing downloads, slicer projects, exports
 from other programs) into solid STEP files with **true curved surfaces**, so they can
